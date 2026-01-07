@@ -150,6 +150,32 @@ sequenceDiagram
 
 ---
 
+## 🌐 Web Interface & API
+The Digital Librarian features a robust web server for remote management. Access it via `http://digitallibrarian.local` or the device's IP address.
+
+### 📱 User Pages
+| Route | Feature | Description |
+|:---|-:|-:|
+| `/` | **Dashboard** | Overview of library stats and system health. |
+| `/browse` | **Remote Control** | Browse library, search, and trigger LEDs from your phone. |
+| `/scan` | **Batch Scanner** | Use your phone/computer to scan multiple barcodes into the library. |
+| `/link` | **Art Manager** | Manually link high-resolution cover art URLs to items. |
+| `/backup` | **Data Safety** | Export full library as `.jsonl` or restore from a backup file. |
+| `/manual` | **User Guide** | Integrated technical manual and hardware guide. |
+| `/errors` | **Diagnostics** | Real-time memory monitoring and system error logs. |
+
+### 🛠️ Core API Endpoints (POST/GET)
+| Endpoint | Method | Params | Description |
+|:---|-:|-:|-:|
+| `/api/status` | GET | - | Returns JSON with item counts, heap, and uptime. |
+| `/api/control` | ANY | `action`, `pin`, `id` | Remote hardware control (LEDs, navigation). |
+| `/api/lookup` | GET | `barcode`, `pin` | Fetches metadata from MusicBrainz/Google Books. |
+| `/api/setcover` | GET | `url`, `id`, `pin` | Downloads and attaches cover art to an item. |
+| `/api/export_backup`| GET | `pin` | Downloads the entire database in JSONL format. |
+| `/api/errors` | GET | - | Detailed diagnostic dump of recent system errors. |
+
+---
+
 ## 📜 License
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
