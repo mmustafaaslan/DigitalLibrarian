@@ -4,7 +4,7 @@
 [![UI: LVGL](https://img.shields.io/badge/UI-LVGL%208.3-blue.svg)](https://lvgl.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Digital Librarian** is a high-performance, physical media management system running on the **Waveshare 7" ESP32-S3 Touch LCD**. It bridges the gap between your physical collection (CDs, Books) and the digital world by providing instant metadata lookups and a visual shelf-locator system.
+**Digital Librarian** is a smart physical media management system running on the **Waveshare 7" ESP32-S3 Touch LCD**. It acts as a "physical search engine" for your library: simply search for an item on the screen or your phone, and an **addressable LED strip** will instantly light up its exact location on your shelf.
 
 ---
 
