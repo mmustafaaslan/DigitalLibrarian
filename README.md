@@ -123,6 +123,27 @@ sequenceDiagram
     Core->>User: LED Blinks Green
 ```
 
+### "Search & Locate" Workflow
+```mermaid
+sequenceDiagram
+    participant User
+    participant Web as Web Interface
+    participant ESP as ESP32 Core
+    participant LED as Addressable Strip
+
+    Note over User, Web: User searches for "Pink Floyd"
+    User->>Web: Type "Pink Floyd"
+    Web->>ESP: GET /api/search?q=Pink
+    ESP-->>Web: JSON [Results List]
+    
+    User->>Web: Select "Dark Side of the Moon"
+    Web->>ESP: POST /api/locate {id: 123}
+    ESP->>LED: Set Pixel #123 to CYAN
+    ESP->>LED: Pulse Effect
+    ESP-->>Web: 200 OK
+    Web->>User: "Item Located!"
+```
+
 ---
 
 ## 📜 License
