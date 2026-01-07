@@ -1,13 +1,18 @@
-#include <Arduino.h>
-#include <ArduinoJson.h> // v6.x
-#include <ESPmDNS.h>
-#include <FastLED.h> // v3.6.0
-#include <HTTPClient.h>
-#include <SD.h>
-#include <Waveshare_ST7262_LVGL.h> // LVGL v8.3
-#include <WebServer.h>
-#include <WiFi.h>
-#include <esp_heap_caps.h> // For detailed heap analysis
+#include "waveshare_sd_card.h" // Custom header for SD card pin definitions
+#include <Arduino.h>           // Core Arduino Library
+#include <ArduinoJson.h>       // v6.21.x (StaticJsonDocument usage) - NOT v7.x
+#include <ESPmDNS.h>           // mDNS Support (http://mylibrary.local)
+#include <FastLED.h>           // LED Strip Control
+#include <HTTPClient.h>        // ESP32 Standard Library
+#include <Preferences.h>       // For persistent WiFi credentials
+#include <SD.h>                // ESP32 Standard Library
+#include <TJpg_Decoder.h>      // v1.1.0
+#include <Waveshare_ST7262_LVGL.h> // Waveshare BSP v1.0.0
+#include <WebServer.h>             // For phone barcode scanner
+#include <WiFi.h>                  // ESP32 Standard Library
+#include <esp_heap_caps.h>         // For detailed heap analysis
+#include <lvgl.h>                  // v8.3.x (Standard for this board)
+
 
 #include "AppGlobals.h"
 #include "BackgroundWorker.h"
