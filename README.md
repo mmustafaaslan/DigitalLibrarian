@@ -173,6 +173,17 @@ The Digital Librarian features a robust web server for remote management. Access
 | `/api/setcover` | GET | `url`, `id`, `pin` | Downloads and attaches cover art to an item. |
 | `/api/export_backup`| GET | `pin` | Downloads the entire database in JSONL format. |
 | `/api/errors` | GET | - | Detailed diagnostic dump of recent system errors. |
+| `/restart` | ANY | `pin` | Remotely reboots the ESP32. |
+
+---
+
+## 🔒 Security & Authentication
+Most web pages and API endpoints are protected by a **Web PIN**. 
+
+*   **Default PIN**: `cd1234` (Can be changed in `AppGlobals.cpp`)
+*   **Constructing Links**: To access a protected page or API directly, append the `pin` parameter to your URL:
+    *   `http://digitallibrarian.local/link?pin=cd1234`
+    *   `http://digitallibrarian.local/api/control?pin=cd1234&action=random`
 
 ---
 
