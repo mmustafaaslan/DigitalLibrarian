@@ -98,6 +98,10 @@ graph LR
     ESP -->|I2C| IO[IO Expander]
     ESP -->|RGB Interface| LCD[7 Inch Touch Screen]
     ESP -->|GPIO 6| LED[WS2812B Strip]
+    
+    ESP -.->|WiFi Sync| WLED[WLED Controller]
+    WLED -.->|Alternative| LED
+    
     ESP -->|SDMMC| SD[SD Card]
     
     IO -->|Control| LCD_BL[Backlight]
