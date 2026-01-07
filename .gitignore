@@ -1,0 +1,29 @@
+# Avoid committing secrets
+secrets.h
+
+# Build artifacts
+.pio/
+build/
+*.bin
+*.elf
+
+# Local config
+*.local
+.vscode/
+
+# Temp files
+*.bak
+dump.json
+mb_results.json
+library_backup.jsonl
+*.tmp
+
+# Data (should be stored on SD, not in repo)
+db/
+covers/
+tracks/
+lyrics/
+
+# User Exclusions
+.agent/
+"Model 3D/"
