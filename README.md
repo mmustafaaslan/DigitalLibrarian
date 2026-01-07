@@ -20,6 +20,21 @@
 | <img src="docs/images/add_new_cd.jpg" width="400"> | <img src="docs/images/theme_selection.jpg" width="400"> |
 | *Barcode & ISBN lookup* | *Customizable CD/Book themes* |
 
+| Tracklists | Synced Lyrics |
+|:---:|:---:|
+| <img src="docs/images/Tracklist.jpeg" width="400"> | <img src="docs/images/Lyrics.jpeg" width="400"> |
+| *Full tracklist support* | *Live lyrics display* |
+
+| Web Dashboard | Web Scanner |
+|:---:|:---:|
+| <img src="docs/images/WEB_Dashboard.png" width="400"> | <img src="docs/images/WEB_Add_CD.png" width="400"> |
+| *Remote management hub* | *Mobile-friendly bulk scanning* |
+
+| Web LED Selector | Web Art Manager |
+|:---:|:---:|
+| <img src="docs/images/WEB_LED_Selection.png" width="400"> | <img src="docs/images/WEB_Optional_Cover_Art.png" width="400"> |
+| *Visual LED mapping* | *Manual artwork overrides* |
+
 ---
 
 ## 📖 User Guide
@@ -194,5 +209,6 @@ This project is open-source. Feel free to use, modify, and distribute it as you 
 
 ## 🙏 Credits
 *   **Metadata**: [MusicBrainz](https://musicbrainz.org/), [Google Books](https://books.google.com/), [Discogs](https://www.discogs.com/), and [Apple iTunes](https://www.apple.com/itunes/).
+*   **Lyrics**: [LRCLib](https://lrclib.net/) and [Lyrics.ovh](https://lyrics.ovh/).
 *   **UI Framework**: [LVGL](https://lvgl.io/).
 *   **Logic**: Powered by ESP32-S3.
