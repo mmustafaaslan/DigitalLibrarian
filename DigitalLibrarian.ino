@@ -1,10 +1,10 @@
 #include <Arduino.h>
-#include <ArduinoJson.h>
+#include <ArduinoJson.h> // v6.x
 #include <ESPmDNS.h>
-#include <FastLED.h>
+#include <FastLED.h> // v3.6.0
 #include <HTTPClient.h>
 #include <SD.h>
-#include <Waveshare_ST7262_LVGL.h>
+#include <Waveshare_ST7262_LVGL.h> // LVGL v8.3
 #include <WebServer.h>
 #include <WiFi.h>
 #include <esp_heap_caps.h> // For detailed heap analysis
@@ -22,7 +22,6 @@
 #include "Utils.h"
 #include "WebInterface.h"
 #include "mode_abstraction.h"
-
 
 // ========================================
 // GLOBAL OBJECTS
