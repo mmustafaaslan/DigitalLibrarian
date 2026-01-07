@@ -13,20 +13,19 @@
 #include <esp_heap_caps.h>         // For detailed heap analysis
 #include <lvgl.h>                  // v8.3.x (Standard for this board)
 
-
-#include "AppGlobals.h"
-#include "BackgroundWorker.h"
-#include "Core_Data.h"
-#include "ErrorHandler.h"
-#include "MediaManager.h"
-#include "NavigationCache.h"
-#include "NetworkManager.h"
-#include "Storage.h"
-#include "StorageTests.h"
-#include "UIManager.h"
-#include "Utils.h"
-#include "WebInterface.h"
-#include "mode_abstraction.h"
+#include "AppGlobals.h"       // Global State & Settings
+#include "BackgroundWorker.h" // Core 0 Task (Network/IO)
+#include "Core_Data.h"        // CD/Book Data Structures
+#include "ErrorHandler.h"     // System-wide Error Logging
+#include "MediaManager.h"     // API Clients (MusicBrainz, Google Books)
+#include "NavigationCache.h"  // Smart Caching for Smooth UI
+#include "NetworkManager.h"   // WiFi & Connection Management
+#include "Storage.h"          // SD Card Database Operations
+#include "StorageTests.h"     // Integrity Checks on Boot
+#include "UIManager.h"        // LVGL Interface Logic
+#include "Utils.h"            // String & Helper Functions
+#include "WebInterface.h"     // Remote Control Web Server
+#include "mode_abstraction.h" // Polymorphic Mode Handling
 
 // ========================================
 // GLOBAL OBJECTS
