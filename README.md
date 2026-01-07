@@ -37,7 +37,21 @@
 
 ---
 
-## 📖 User Guide
+## �️ Hardware Highlights
+The heart of this project is the **Waveshare ESP32-S3-Touch-LCD-7**, a high-performance development board that combines raw processing power with a stunning display.
+
+<p align="center">
+  <img src="docs/images/Waveshare%20ESP32-S3%207Inch.jpeg" width="600" alt="Waveshare ESP32-S3-Touch-LCD-7">
+</p>
+
+### Board Features:
+*   **Dual-Core ESP32-S3**: Balanced workload with Core 1 handling the GUI/Touch and Core 0 managing Background tasks (WiFi, Data fetching, SD I/O).
+*   **7" RGB LCD**: 800x480 resolution for crisp artwork and smooth animations via the RGB666 interface.
+*   **Capacitive Touch**: Responsive 5-point touch support for an intuitive user experience.
+*   **Expandable Storage**: Integrated Micro SD slot for storing thousands of item records and cover art images.
+*   **Built-in IO Expander**: CH422G chip provides additional GPIO for screen backlight control and resets without consuming primary ESP32 pins.
+
+## �📖 User Guide
 
 ### Overview
 Digital Librarian turns your media shelf into an interactive experience. Use the 7-inch touch screen or your smartphone to browse, search, and physically locate items.
