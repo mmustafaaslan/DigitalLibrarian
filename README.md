@@ -179,6 +179,16 @@ The Digital Librarian features a robust web server for remote management. Access
 | `/manual` | **User Guide** | Integrated technical manual and hardware guide. |
 | `/errors` | **Diagnostics** | Real-time memory monitoring and system error logs. |
 
+---
+
+## 🚀 Hands-Free Bulk Scanning
+You can turn your phone into a professional barcode scanner that automatically registers media to your library.
+
+1.  **Install a Barcode Scanner app** (Any app that supports "Custom Search URL").
+2.  **Set the Custom URL** in the app to:
+    `http://digitallibrarian.local/scan?pin=cd1234&code={CODE}`
+3.  **Start Scanning**: Simply point your phone at your CD/Book collection. The app will open the link, the Web UI will automatically process the lookup, and the ESP32 will light up the designated LED.
+
 ### 🛠️ Core API Endpoints (POST/GET)
 | Endpoint | Method | Params | Description |
 |:---|-:|-:|-:|
