@@ -96,7 +96,7 @@ graph TD
 graph LR
     PSU[5V 3A Power] -->|USB-C| ESP[ESP32-S3]
     ESP -->|I2C| IO[IO Expander]
-    ESP -->|RGB Interface| LCD[7" Touch Screen]
+    ESP -->|RGB Interface| LCD[7 Inch Touch Screen]
     ESP -->|GPIO 6| LED[WS2812B Strip]
     ESP -->|SDMMC| SD[SD Card]
     
