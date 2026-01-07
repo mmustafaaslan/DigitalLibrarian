@@ -91,6 +91,38 @@ graph TD
     Core -->|Update| LED[FastLED Strip]
 ```
 
+### Hardware Connections
+```mermaid
+graph LR
+    PSU[5V 3A Power] -->|USB-C| ESP[ESP32-S3]
+    ESP -->|I2C| IO[IO Expander]
+    ESP -->|RGB Interface| LCD[7" Touch Screen]
+    ESP -->|GPIO 6| LED[WS2812B Strip]
+    ESP -->|SDMMC| SD[SD Card]
+    
+    IO -->|Control| LCD_BL[Backlight]
+    IO -->|Control| LCD_RST[Touch Reset]
+```
+
+### "Add Item" Workflow
+```mermaid
+sequenceDiagram
+    participant User
+    participant UI as Touch UI
+    participant Core as Core Logic
+    participant API as MusicBrainz/Discogs
+    participant SD as SD Storage
+
+    User->>UI: Scans Barcode
+    UI->>Core: Request Lookup (ISBN/UPC)
+    Core->>API: GET Metadata
+    API-->>Core: JSON Data
+    Core->>SD: Download Cover Art
+    Core->>SD: Save details.json
+    Core-->>UI: Show Cover & Success
+    Core->>User: LED Blinks Green
+```
+
 ---
 
 ## 📜 License
