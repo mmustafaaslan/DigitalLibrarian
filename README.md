@@ -188,7 +188,9 @@ Most web pages and API endpoints are protected by a **Web PIN**.
 ---
 
 ## 📜 License
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+This project is open-source. Feel free to use, modify, and distribute it as you like. All I ask is:
+*   ⭐ **Star the project** if you find it useful!
+*   🙏 **Give credit** if you use it in your own projects.
 
 ## 🙏 Credits
 *   **Metadata**: [MusicBrainz](https://musicbrainz.org/), [Google Books](https://books.google.com/), [Discogs](https://www.discogs.com/), and [Apple iTunes](https://www.apple.com/itunes/).
