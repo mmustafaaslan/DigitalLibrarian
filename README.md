@@ -53,7 +53,8 @@ Digital Librarian turns your media shelf into an interactive experience. Use the
 
 ### Setup & Installation
 1.  **Dependencies**:
-    *   [PlatformIO](https://platformio.org/) (Recommended IDE)
+    *   **Arduino IDE**
+    *   **ESP32 Board Package** (by Espressif)
     *   LVGL 8.3
     *   ArduinoJson 6.x
     *   FastLED
