@@ -11,7 +11,10 @@ enum JobType {
   JOB_METADATA_LOOKUP,
   JOB_COVER_DOWNLOAD,
   JOB_BULK_SYNC,
-  JOB_LYRICS_FETCH_ALL
+  JOB_LYRICS_FETCH_ALL,
+  JOB_PERSIST_FAVORITE,
+  JOB_PERSIST_TRACK_FAVORITE,
+  JOB_SYNC_WLED
 };
 
 struct BackgroundJob {
@@ -20,6 +23,7 @@ struct BackgroundJob {
   int index;        // Index in the library if applicable
   String extraData; // Search query, save path, etc.
   std::function<void(bool success, String message)> onComplete;
+  bool showProgress = true;
 };
 
 class BackgroundWorker {
@@ -27,6 +31,7 @@ public:
   static void begin();
   static void addJob(BackgroundJob job);
   static bool isBusy();
+  static bool shouldShowProgress();
   static int getQueueSize();
 
   // UI Helpers
@@ -38,6 +43,7 @@ private:
   static std::queue<BackgroundJob> _jobQueue;
   static SemaphoreHandle_t _queueMutex;
   static bool _busy;
+  static bool _showProgress;
   static String _statusMsg;
   static float _progress;
   static int _totalJobs;

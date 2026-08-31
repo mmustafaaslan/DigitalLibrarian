@@ -197,6 +197,58 @@ bool LibrarianStorage::saveCD(const CD &cd, const char *oldUniqueID,
   return rewriteIndex(MODE_CD);
 }
 
+bool LibrarianStorage::updateFavorite(String uniqueID, MediaMode mode,
+                                      bool favorite) {
+  String path = getFilePath(uniqueID, mode);
+  String tmpPath = path + ".tmp";
+  bool detailSaved = false;
+
+  if (sdExpander && i2cMutex &&
+      xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(2000)) == pdPASS) {
+    sdExpander->digitalWrite(SD_CS, LOW);
+
+    File source = SD.open(path, FILE_READ);
+    if (source) {
+      DynamicJsonDocument doc(4096);
+      DeserializationError error = deserializeJson(doc, source);
+      source.close();
+
+      if (!error) {
+        doc["favorite"] = favorite;
+        if (SD.exists(tmpPath))
+          SD.remove(tmpPath);
+        File target = SD.open(tmpPath, FILE_WRITE);
+        if (target) {
+          serializeJson(doc, target);
+          target.close();
+          if (SD.exists(path))
+            SD.remove(path);
+          detailSaved = SD.rename(tmpPath, path);
+        }
+      }
+    }
+
+    sdExpander->digitalWrite(SD_CS, HIGH);
+    xSemaphoreGiveRecursive(i2cMutex);
+  }
+
+  bool indexFound = false;
+  IndexVector &index = getVectorForMode(mode);
+  for (LibraryIndexItem &item : index) {
+    if (item.uniqueID == uniqueID.c_str()) {
+      item.favorite = favorite;
+      indexFound = true;
+      break;
+    }
+  }
+
+  bool indexSaved = indexFound && rewriteIndex(mode);
+  if (!detailSaved)
+    Serial.printf("Storage: Favorite detail update failed for %s\n",
+                  uniqueID.c_str());
+  return detailSaved && indexSaved;
+}
+
 // --- LOAD INDEX ---
 bool LibrarianStorage::loadIndex(MediaMode mode) {
   auto &vec = getVectorForMode(mode);

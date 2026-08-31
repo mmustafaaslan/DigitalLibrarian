@@ -110,7 +110,15 @@ lv_obj_t *kb_search = NULL;
 lv_obj_t *dd_filter = NULL;
 lv_obj_t *list_results = NULL;
 static lv_timer_t *search_timer = NULL;
-static lv_timer_t *nav_idle_timer = NULL;
+static lv_timer_t *wled_sync_timer = NULL;
+static lv_timer_t *cover_load_timer = NULL;
+static lv_timer_t *track_summary_timer = NULL;
+static String pending_cover_file = "";
+static String displayed_cover_file = "";
+static String pending_track_summary_mbid = "";
+static String cached_track_summary_mbid = "";
+static String cached_track_summary_text = "";
+static bool cached_track_summary_has_favorites = false;
 
 // Add/Edit UI
 lv_obj_t *ta_barcode = NULL;
@@ -129,6 +137,12 @@ lv_obj_t *ta_current_page = NULL;
 lv_obj_t *ta_ssid = NULL;
 lv_obj_t *ta_password = NULL;
 lv_obj_t *kb_wifi = NULL;
+static lv_obj_t *wifi_status_label = NULL;
+static lv_obj_t *wifi_connect_button = NULL;
+static lv_timer_t *wifi_connect_timer = NULL;
+static String pending_wifi_ssid = "";
+static String pending_wifi_password = "";
+static int wifi_connect_attempts = 0;
 
 int edit_item_index = -1;
 bool sort_by_artist = true;
@@ -158,6 +172,11 @@ static void style_input_control(lv_obj_t *control) {
 static void style_keyboard_control(lv_obj_t *keyboard) {
   lv_obj_add_style(keyboard, &style_keyboard, 0);
   lv_obj_set_style_bg_color(keyboard, lv_color_hex(0x1B2632), LV_PART_ITEMS);
+  lv_obj_set_style_bg_opa(keyboard, LV_OPA_COVER, LV_PART_ITEMS);
+  lv_obj_set_style_border_color(keyboard, lv_color_hex(0x2A3948),
+                                LV_PART_ITEMS);
+  lv_obj_set_style_border_width(keyboard, 1, LV_PART_ITEMS);
+  lv_obj_set_style_radius(keyboard, 6, LV_PART_ITEMS);
   lv_obj_set_style_text_color(keyboard, lv_color_hex(0xF4F7FA), LV_PART_ITEMS);
   lv_obj_set_style_bg_color(keyboard, lv_color_hex(getCurrentThemeColor()),
                             LV_PART_ITEMS | LV_STATE_PRESSED);
@@ -210,20 +229,6 @@ static void prepare_modal_panel(lv_obj_t *panel, int width, int height,
     lv_obj_set_style_width(panel, 6, LV_PART_SCROLLBAR);
   } else {
     lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-  }
-}
-
-static void set_search_keyboard_visible(bool visible) {
-  if (!kb_search || !list_results)
-    return;
-  if (visible) {
-    lv_obj_clear_flag(kb_search, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_height(list_results, 126);
-    lv_obj_move_foreground(kb_search);
-    lv_obj_invalidate(kb_search);
-  } else {
-    lv_obj_add_flag(kb_search, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_height(list_results, 324);
   }
 }
 
@@ -319,6 +324,123 @@ void selectRandomWithEffect() {
 }
 
 void forceUpdateWLED() { AppNetworkManager::forceUpdateWLED(); }
+
+static void schedule_wled_sync(uint32_t debounceMs = 120) {
+  if (!led_use_wled || WiFi.status() != WL_CONNECTED)
+    return;
+
+  if (wled_sync_timer) {
+    lv_timer_set_period(wled_sync_timer, debounceMs);
+    lv_timer_reset(wled_sync_timer);
+    return;
+  }
+
+  wled_sync_timer = lv_timer_create(
+      [](lv_timer_t *timer) {
+        wled_sync_timer = NULL;
+        BackgroundWorker::addJob(
+            {JOB_SYNC_WLED, "", -1, "", nullptr, false});
+      },
+      debounceMs, NULL);
+  lv_timer_set_repeat_count(wled_sync_timer, 1);
+}
+
+static void schedule_cover_load(const String &filename) {
+  pending_cover_file = filename;
+  if (cover_load_timer) {
+    lv_timer_del(cover_load_timer);
+    cover_load_timer = NULL;
+  }
+
+  if (filename.length() == 0)
+    return;
+
+  cover_load_timer = lv_timer_create(
+      [](lv_timer_t *timer) {
+        cover_load_timer = NULL;
+        String filename = pending_cover_file;
+        if (filename.length() == 0)
+          return;
+        load_and_show_cover(filename);
+        displayed_cover_file = filename;
+      },
+      20, NULL);
+  lv_timer_set_repeat_count(cover_load_timer, 1);
+}
+
+static void apply_track_summary_label(const String &text, bool hasFavorites) {
+  if (!label_favorites)
+    return;
+  if (!hasFavorites) {
+    lv_obj_add_flag(label_favorites, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+
+  lv_label_set_text(label_favorites, text.c_str());
+  if (text.length() > 50) {
+    lv_label_set_long_mode(label_favorites, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_style_anim_speed(label_favorites, 40, 0);
+  } else {
+    lv_label_set_long_mode(label_favorites, LV_LABEL_LONG_DOT);
+  }
+  lv_obj_clear_flag(label_favorites, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void cache_track_summary(const String &releaseMbid,
+                                TrackList *trackList) {
+  String summary = "Fav: ";
+  int favoriteCount = 0;
+  if (trackList) {
+    for (const Track &track : trackList->tracks) {
+      if (!track.isFavoriteTrack)
+        continue;
+      if (favoriteCount > 0)
+        summary += " | ";
+      summary += LV_SYMBOL_BELL " " + String(track.trackNo) + ". " +
+                 String(track.title.c_str());
+      favoriteCount++;
+    }
+  }
+
+  cached_track_summary_mbid = releaseMbid;
+  cached_track_summary_text = summary;
+  cached_track_summary_has_favorites = favoriteCount > 0;
+}
+
+static void schedule_track_summary_load(const String &releaseMbid) {
+  pending_track_summary_mbid = releaseMbid;
+  if (track_summary_timer) {
+    lv_timer_del(track_summary_timer);
+    track_summary_timer = NULL;
+  }
+
+  if (releaseMbid.length() == 0) {
+    apply_track_summary_label("", false);
+    return;
+  }
+  if (cached_track_summary_mbid == releaseMbid) {
+    apply_track_summary_label(cached_track_summary_text,
+                              cached_track_summary_has_favorites);
+    return;
+  }
+
+  apply_track_summary_label("", false);
+  track_summary_timer = lv_timer_create(
+      [](lv_timer_t *timer) {
+        track_summary_timer = NULL;
+        String releaseMbid = pending_track_summary_mbid;
+        TrackList *trackList = Storage.loadTracklist(releaseMbid.c_str());
+        cache_track_summary(releaseMbid, trackList);
+        if (trackList)
+          Storage.deleteTracklist(trackList);
+        if (pending_track_summary_mbid == releaseMbid) {
+          apply_track_summary_label(cached_track_summary_text,
+                                    cached_track_summary_has_favorites);
+        }
+      },
+      30, NULL);
+  lv_timer_set_repeat_count(track_summary_timer, 1);
+}
 
 // Helper functions (formerly in DigitalLibrarian.ino, now drop-in compatible)
 inline int getCDCount() { return getItemCount(); }
@@ -647,7 +769,12 @@ void show_tracklist_ui(int idx) {
                                           ? lv_color_hex(0x000000)
                                           : lv_color_hex(0xCCCCCC),
                                       0);
-          Storage.saveTracklist(data->mbid.c_str(), data->tl);
+          cache_track_summary(data->mbid, data->tl);
+          apply_track_summary_label(cached_track_summary_text,
+                                    cached_track_summary_has_favorites);
+          BackgroundWorker::addJob(
+              {JOB_PERSIST_TRACK_FAVORITE, data->mbid, data->idx,
+               t.isFavoriteTrack ? "1" : "0", nullptr, false});
         },
         LV_EVENT_CLICKED, fd);
     lv_obj_add_event_cb(
@@ -1251,9 +1378,10 @@ void setupMainUI() {
   lv_timer_create(
       [](lv_timer_t *t) {
         bool isBusy = BackgroundWorker::isBusy();
+        bool showProgress = BackgroundWorker::shouldShowProgress();
 
         // Create/Show Modal
-        if (isBusy && !progress_modal) {
+        if (showProgress && !progress_modal) {
           progress_modal = lv_obj_create(lv_layer_top());
           lv_obj_set_size(progress_modal, UiLayout::screenW, UiLayout::screenH);
           lv_obj_set_pos(progress_modal, 0, 0);
@@ -1291,7 +1419,7 @@ void setupMainUI() {
         }
 
         // Update
-        if (isBusy && progress_modal) {
+        if (showProgress && progress_modal) {
           int pct = (int)(BackgroundWorker::getProgress() * 100);
           lv_bar_set_value(progress_bar, pct, LV_ANIM_ON);
           String status = BackgroundWorker::getStatusMessage();
@@ -1299,7 +1427,7 @@ void setupMainUI() {
         }
 
         // Close
-        if (!isBusy && progress_modal) {
+        if (!showProgress && progress_modal) {
           lv_obj_del(progress_modal);
           progress_modal = NULL; // Reset
           progress_bar = NULL;
@@ -1309,7 +1437,7 @@ void setupMainUI() {
           // Note: using show_info_popup might act as double popup if multiple
           // jobs run But for Bulk Sync it's useful.
           String msg = BackgroundWorker::getStatusMessage();
-          if (msg.length() > 0 && msg != "Idle") {
+          if (!isBusy && msg.length() > 0 && msg != "Idle") {
             if (msg == "Sync Complete") {
               show_info_popup(
                   "Task Finished", "Sync Complete. Tap OK to restart.",
@@ -1369,8 +1497,6 @@ void update_item_display() {
   int d_totalCount = 0;
   String d_counter_text = "";
   String d_extra_info = "";
-  String favoritesLine = "";
-  bool hasFavorites = false;
 
   // 1. Fetch Data based on Mode
   int currentIdx = getCurrentItemIndex();
@@ -1471,33 +1597,9 @@ void update_item_display() {
     lv_obj_set_style_text_color(label_favorite, lv_color_hex(themeColor), 0);
   }
 
-  // Tracklist & Favorites (Mode Specific)
-  if (hasTracklist()) {
-    int idx = getCurrentItemIndex();
-    if (idx >= 0 && idx < (int)cdLibrary.size()) {
-      CD &cd = cdLibrary[idx];
-      if (cd.releaseMbid.length() > 0) {
-        TrackList *trackList = Storage.loadTracklist(cd.releaseMbid.c_str());
-        if (trackList && trackList->tracks.size() > 0) {
-          favoritesLine = "Fav: ";
-          int favCount = 0;
-          for (int i = 0; i < (int)trackList->tracks.size(); i++) {
-            Track &track = trackList->tracks[i];
-            if (track.isFavoriteTrack) {
-              if (favCount > 0)
-                favoritesLine += " | ";
-              favoritesLine += LV_SYMBOL_BELL " " + String(track.trackNo) +
-                               ". " + String(track.title.c_str());
-              favCount++;
-            }
-          }
-          Storage.deleteTracklist(trackList);
-          if (favCount > 0)
-            hasFavorites = true;
-        }
-      }
-    }
-  }
+  // Track favorites are loaded just after the core labels render, so large
+  // tracklist files never delay NEXT/PREV feedback.
+  schedule_track_summary_load(hasTracklist() ? item.releaseMbid : "");
 
   // Notes
   if (d_notes.length() > 0) {
@@ -1530,20 +1632,6 @@ void update_item_display() {
     }
   }
 
-  // Update FAVORITES label (Tracks)
-  if (hasFavorites) {
-    lv_label_set_text(label_favorites, favoritesLine.c_str());
-    if (favoritesLine.length() > 50) {
-      lv_label_set_long_mode(label_favorites, LV_LABEL_LONG_SCROLL_CIRCULAR);
-      lv_obj_set_style_anim_speed(label_favorites, 40, 0);
-    } else {
-      lv_label_set_long_mode(label_favorites, LV_LABEL_LONG_DOT);
-    }
-    lv_obj_clear_flag(label_favorites, LV_OBJ_FLAG_HIDDEN);
-  } else {
-    lv_obj_add_flag(label_favorites, LV_OBJ_FLAG_HIDDEN);
-  }
-
   // Counter
   lv_label_set_text(label_counter, d_counter_text.c_str());
 
@@ -1559,7 +1647,9 @@ void update_item_display() {
   // Cover Image
   String diskPath = "/covers/" + d_coverFile;
   bool fileExists = false;
-  if (d_coverFile.length() > 0) {
+  if (d_coverFile.length() > 0 && displayed_cover_file == d_coverFile) {
+    fileExists = true;
+  } else if (d_coverFile.length() > 0) {
     if (i2cMutex &&
         xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(50)) == pdPASS) {
       if (sdExpander)
@@ -1576,13 +1666,21 @@ void update_item_display() {
   }
 
   if (fileExists) {
-    lv_obj_clear_flag(img_cover, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_style_bg_opa(img_cover, LV_OPA_TRANSP, 0);
-    load_and_show_cover(d_coverFile);
+    if (displayed_cover_file != d_coverFile) {
+      lv_obj_add_flag(img_cover, LV_OBJ_FLAG_HIDDEN);
+      schedule_cover_load(d_coverFile);
+    } else {
+      if (pending_cover_file != d_coverFile)
+        schedule_cover_load("");
+      lv_obj_clear_flag(img_cover, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_set_style_bg_opa(img_cover, LV_OPA_TRANSP, 0);
+    }
     lv_obj_add_flag(label_cover_url, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(btn_search, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(btn_delete_cover, LV_OBJ_FLAG_HIDDEN);
   } else {
+    displayed_cover_file = "";
+    schedule_cover_load("");
     lv_obj_add_flag(img_cover, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(label_cover_url, "Click Search to find cover");
     lv_obj_clear_flag(label_cover_url, LV_OBJ_FLAG_HIDDEN);
@@ -1618,8 +1716,7 @@ void update_item_display() {
   }
   FastLED.show();
 
-  if (led_use_wled)
-    forceUpdateWLED();
+  schedule_wled_sync();
 }
 
 void btn_prev_clicked(lv_event_t *e) {
@@ -1642,17 +1739,6 @@ void btn_prev_clicked(lv_event_t *e) {
       break;
     }
   } while (candidate != start);
-
-  // Re-center cache if idle for 10 seconds
-  if (nav_idle_timer)
-    lv_timer_del(nav_idle_timer);
-  nav_idle_timer = lv_timer_create(
-      [](lv_timer_t *t) {
-        rebuildNavigationCache(getCurrentItemIndex());
-        nav_idle_timer = NULL;
-      },
-      10000, NULL);
-  lv_timer_set_repeat_count(nav_idle_timer, 1);
 
   update_item_display();
   lvgl_port_unlock();
@@ -1679,17 +1765,6 @@ void btn_next_clicked(lv_event_t *e) {
     }
   } while (candidate != start);
 
-  // Re-center cache if idle for 10 seconds
-  if (nav_idle_timer)
-    lv_timer_del(nav_idle_timer);
-  nav_idle_timer = lv_timer_create(
-      [](lv_timer_t *t) {
-        rebuildNavigationCache(getCurrentItemIndex());
-        nav_idle_timer = NULL;
-      },
-      10000, NULL);
-  lv_timer_set_repeat_count(nav_idle_timer, 1);
-
   update_item_display();
   lvgl_port_unlock();
 }
@@ -1698,13 +1773,36 @@ void btn_favorite_clicked(lv_event_t *e) {
   if (getItemCount() == 0)
     return;
 
-  lvgl_port_lock(-1);
   int idx = getCurrentItemIndex();
-  toggleFavoriteAt(idx);
+  MediaMode mode = currentMode;
+  bool isFav = false;
+  bool toggled = false;
+  String title;
+  String uniqueID;
 
-  ItemView item = getItemAt(idx);
-  bool isFav = item.favorite;
-  String title = item.title;
+  if (libraryMutex)
+    xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
+  if (mode == MODE_CD && idx >= 0 && idx < (int)cdLibrary.size()) {
+    CD &item = cdLibrary[idx];
+    item.favorite = !item.favorite;
+    isFav = item.favorite;
+    title = item.title.c_str();
+    uniqueID = item.uniqueID.c_str();
+    toggled = true;
+  } else if (mode == MODE_BOOK && idx >= 0 &&
+             idx < (int)bookLibrary.size()) {
+    Book &item = bookLibrary[idx];
+    item.favorite = !item.favorite;
+    isFav = item.favorite;
+    title = item.title.c_str();
+    uniqueID = item.uniqueID.c_str();
+    toggled = true;
+  }
+  if (libraryMutex)
+    xSemaphoreGiveRecursive(libraryMutex);
+
+  if (!toggled)
+    return;
 
   if (isFav) {
     lv_label_set_text(label_favorite, LV_SYMBOL_MINUS);
@@ -1717,13 +1815,21 @@ void btn_favorite_clicked(lv_event_t *e) {
     Serial.printf("Unmarked '%s' as favorite\n", title.c_str());
   }
 
-  lvgl_port_unlock();
-
-  if (saveLibrary()) {
-    Serial.println("Favorites saved to SD card!");
+  if (filter_active) {
+    update_filtered_leds();
   } else {
-    Serial.println("WARNING: Failed to save favorites!");
+    for (int ledIndex : getItemLedIndices(idx)) {
+      if (ledIndex >= 0 && ledIndex < led_count)
+        leds[ledIndex] = isFav ? COLOR_FAVORITE : COLOR_SELECTED;
+    }
+    FastLED.show();
+    schedule_wled_sync();
   }
+
+  String persistenceMode = (mode == MODE_BOOK) ? "book:" : "cd:";
+  persistenceMode += isFav ? "1" : "0";
+  BackgroundWorker::addJob({JOB_PERSIST_FAVORITE, uniqueID, idx,
+                            persistenceMode, nullptr, false});
 }
 
 void btn_delete_cover_clicked(lv_event_t *e) {
@@ -1982,7 +2088,7 @@ void show_search_ui() {
 
   lv_obj_t *btn_led_search = lv_btn_create(search_panel);
   lv_obj_set_size(btn_led_search, 44, 44);
-  lv_obj_set_pos(btn_led_search, 580, 10);
+  lv_obj_set_pos(btn_led_search, 688, 10);
   style_action_button(btn_led_search, &style_icon_button);
 
   lv_obj_t *label_led_search = lv_label_create(btn_led_search);
@@ -2013,19 +2119,8 @@ void show_search_ui() {
           update_filtered_leds();
         else
           update_item_display();
-        if (led_use_wled)
-          forceUpdateWLED();
       },
       LV_EVENT_CLICKED, NULL);
-
-  lv_obj_t *btn_toggle_kb = lv_btn_create(search_panel);
-  lv_obj_set_size(btn_toggle_kb, 100, 44);
-  lv_obj_set_pos(btn_toggle_kb, 632, 10);
-  style_action_button(btn_toggle_kb, &style_secondary_button);
-  lv_obj_t *label_toggle_kb = lv_label_create(btn_toggle_kb);
-  lv_label_set_text(label_toggle_kb, LV_SYMBOL_KEYBOARD " HIDE");
-  lv_obj_center(label_toggle_kb);
-  lv_obj_set_style_text_color(label_toggle_kb, lv_color_hex(0xffffff), 0);
 
   lv_obj_t *btn_close = lv_btn_create(search_panel);
   lv_obj_set_size(btn_close, 44, 44);
@@ -2084,69 +2179,34 @@ void show_search_ui() {
   lv_obj_add_event_cb(ta_search, search_input_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
   list_results = lv_list_create(search_panel);
-  lv_obj_set_size(list_results, 760, 324);
+  lv_obj_set_size(list_results, 760, 116);
   lv_obj_set_pos(list_results, 20, 132);
   style_list_control(list_results);
 
   kb_search = lv_keyboard_create(search_panel);
-  lv_obj_set_size(kb_search, 760, 184);
-  lv_obj_set_pos(kb_search, 20, 276);
-  lv_obj_add_flag(kb_search, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_set_size(kb_search, 760, 208);
+  lv_obj_set_pos(kb_search, 20, 260);
   style_keyboard_control(kb_search);
+  lv_keyboard_set_mode(kb_search, LV_KEYBOARD_MODE_TEXT_LOWER);
 
   lv_obj_add_event_cb(
       ta_search,
       [](lv_event_t *e) {
-        lv_obj_t *toggle_label = (lv_obj_t *)lv_event_get_user_data(e);
         lv_keyboard_set_textarea(kb_search, lv_event_get_target(e));
-        set_search_keyboard_visible(true);
-        lv_label_set_text(toggle_label, LV_SYMBOL_KEYBOARD " HIDE");
+        lv_obj_clear_flag(kb_search, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(kb_search);
+        lv_obj_invalidate(kb_search);
       },
-      LV_EVENT_FOCUSED, label_toggle_kb);
-
-  static lv_obj_t *toggle_data[2];
-  toggle_data[0] = kb_search;
-  toggle_data[1] = label_toggle_kb;
-  lv_obj_add_event_cb(
-      btn_toggle_kb,
-      [](lv_event_t *e) {
-        lv_obj_t **data = (lv_obj_t **)lv_event_get_user_data(e);
-        if (!data)
-          return;
-        lv_obj_t *kb = data[0];
-        lv_obj_t *label = data[1];
-        if (lv_obj_has_flag(kb, LV_OBJ_FLAG_HIDDEN)) {
-          set_search_keyboard_visible(true);
-          lv_label_set_text(label, LV_SYMBOL_KEYBOARD " HIDE");
-        } else {
-          set_search_keyboard_visible(false);
-          lv_label_set_text(label, LV_SYMBOL_KEYBOARD " SHOW");
-        }
-      },
-      LV_EVENT_CLICKED, toggle_data);
-
-  lv_obj_add_event_cb(
-      kb_search,
-      [](lv_event_t *e) {
-        lv_obj_t *toggle_label = (lv_obj_t *)lv_event_get_user_data(e);
-        set_search_keyboard_visible(false);
-        lv_label_set_text(toggle_label, LV_SYMBOL_KEYBOARD " SHOW");
-      },
-      LV_EVENT_READY, label_toggle_kb);
-  lv_obj_add_event_cb(
-      kb_search,
-      [](lv_event_t *e) {
-        lv_obj_t *toggle_label = (lv_obj_t *)lv_event_get_user_data(e);
-        set_search_keyboard_visible(false);
-        lv_label_set_text(toggle_label, LV_SYMBOL_KEYBOARD " SHOW");
-      },
-      LV_EVENT_CANCEL, label_toggle_kb);
+      LV_EVENT_FOCUSED, NULL);
 
   lv_keyboard_set_textarea(kb_search, ta_search);
-  set_search_keyboard_visible(true);
+  lv_obj_clear_flag(kb_search, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_state(ta_search, LV_STATE_FOCUSED);
 
   filter_library("");
+  lv_obj_update_layout(search_panel);
+  lv_obj_move_foreground(kb_search);
+  lv_obj_invalidate(kb_search);
   lvgl_port_unlock();
 }
 void load_and_show_cover(String filename) {
@@ -2237,8 +2297,7 @@ void update_filtered_leds() {
   if (!led_master_on) {
     FastLED.clear();
     FastLED.show();
-    if (led_use_wled)
-      forceUpdateWLED();
+    schedule_wled_sync();
     return;
   }
 
@@ -2267,8 +2326,7 @@ void update_filtered_leds() {
   }
 
   FastLED.show();
-  if (led_use_wled)
-    forceUpdateWLED();
+  schedule_wled_sync();
 }
 
 // ==========================================
@@ -2316,12 +2374,12 @@ void show_wifi_config_ui() {
   lv_obj_set_style_text_color(label_close, lv_color_hex(0xff4444), 0);
 
   // Connect button (top left)
-  lv_obj_t *btn_connect = lv_btn_create(wifi_config_panel);
-  lv_obj_set_size(btn_connect, 132, 44);
-  lv_obj_set_pos(btn_connect, 16, 10);
-  style_action_button(btn_connect, &style_primary_button);
-  lv_obj_add_flag(btn_connect, LV_OBJ_FLAG_FLOATING);
-  lv_obj_t *label_connect = lv_label_create(btn_connect);
+  wifi_connect_button = lv_btn_create(wifi_config_panel);
+  lv_obj_set_size(wifi_connect_button, 132, 44);
+  lv_obj_set_pos(wifi_connect_button, 16, 10);
+  style_action_button(wifi_connect_button, &style_primary_button);
+  lv_obj_add_flag(wifi_connect_button, LV_OBJ_FLAG_FLOATING);
+  lv_obj_t *label_connect = lv_label_create(wifi_connect_button);
   lv_label_set_text(label_connect, LV_SYMBOL_WIFI " CONNECT");
   lv_obj_center(label_connect);
   lv_obj_set_style_text_color(label_connect, lv_color_hex(0x000000), 0);
@@ -2446,23 +2504,25 @@ void show_wifi_config_ui() {
   style_input_control(ta_password);
 
   // Current WiFi Status (positioned after password field)
-  lv_obj_t *status_label = lv_label_create(wifi_config_panel);
+  wifi_status_label = lv_label_create(wifi_config_panel);
   if (WiFi.status() == WL_CONNECTED) {
-    lv_label_set_text_fmt(status_label, "Connected to: %s",
+    lv_label_set_text_fmt(wifi_status_label, "Connected to: %s",
                           WiFi.SSID().c_str());
-    lv_obj_set_style_text_color(status_label,
+    lv_obj_set_style_text_color(wifi_status_label,
                                 lv_color_hex(getCurrentThemeColor()), 0);
   } else {
-    lv_label_set_text(status_label, "Not Connected");
-    lv_obj_set_style_text_color(status_label, lv_color_hex(0xff8800), 0);
+    lv_label_set_text(wifi_status_label, "Not Connected");
+    lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0xff8800), 0);
   }
-  lv_obj_align_to(status_label, ta_password, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 20);
-  lv_obj_set_style_text_font(status_label, &lv_font_montserrat_12, 0);
+  lv_obj_align_to(wifi_status_label, ta_password, LV_ALIGN_OUT_BOTTOM_LEFT, 0,
+                  20);
+  lv_obj_set_style_text_font(wifi_status_label, &lv_font_montserrat_12, 0);
 
   // Keyboard (positioned after status label in content flow)
   kb_wifi = lv_keyboard_create(wifi_config_panel);
   lv_obj_set_size(kb_wifi, 672, 160);
-  lv_obj_align_to(kb_wifi, status_label, LV_ALIGN_OUT_BOTTOM_LEFT, -24, 20);
+  lv_obj_align_to(kb_wifi, wifi_status_label, LV_ALIGN_OUT_BOTTOM_LEFT, -24,
+                  20);
   style_keyboard_control(kb_wifi);
   lv_obj_add_flag(kb_wifi, LV_OBJ_FLAG_HIDDEN); // Hidden by default
 
@@ -2506,71 +2566,79 @@ void show_wifi_config_ui() {
 
   // Add connect button callback
   lv_obj_add_event_cb(
-      btn_connect,
+      wifi_connect_button,
       [](lv_event_t *e) {
-        const char *new_ssid = lv_textarea_get_text(ta_ssid);
-        const char *new_password = lv_textarea_get_text(ta_password);
+        pending_wifi_ssid = lv_textarea_get_text(ta_ssid);
+        pending_wifi_password = lv_textarea_get_text(ta_password);
 
-        if (strlen(new_ssid) == 0) {
-          Serial.println("SSID cannot be empty!");
+        if (pending_wifi_ssid.length() == 0) {
+          if (wifi_status_label) {
+            lv_label_set_text(wifi_status_label, "Enter a network name first.");
+            lv_obj_set_style_text_color(wifi_status_label,
+                                        lv_color_hex(0xff4444), 0);
+          }
           return;
         }
+        if (wifi_connect_timer)
+          return;
 
-        Serial.printf("Connecting to WiFi: %s\n", new_ssid);
+        Serial.printf("Connecting to WiFi: %s\n", pending_wifi_ssid.c_str());
         WiFi.disconnect();
-        WiFi.begin(new_ssid, new_password);
-
-        // Show connecting status - find status label (it's the 8th child now)
-        lv_obj_t *status = NULL;
-        for (int i = 0; i < lv_obj_get_child_cnt(wifi_config_panel); i++) {
-          lv_obj_t *child = lv_obj_get_child(wifi_config_panel, i);
-          // Look for the status label by checking if it contains text
-          if (lv_obj_check_type(child, &lv_label_class)) {
-            const char *text = lv_label_get_text(child);
-            if (strstr(text, "Connected") || strstr(text, "Not Connected")) {
-              status = child;
-              break;
-            }
-          }
+        WiFi.begin(pending_wifi_ssid.c_str(), pending_wifi_password.c_str());
+        wifi_connect_attempts = 0;
+        lv_obj_add_state(wifi_connect_button, LV_STATE_DISABLED);
+        if (wifi_status_label) {
+          lv_label_set_text(wifi_status_label, "Connecting... 0 / 20");
+          lv_obj_set_style_text_color(wifi_status_label,
+                                      lv_color_hex(0xffdd00), 0);
         }
 
-        if (status) {
-          lv_label_set_text(status, "Connecting...");
-          lv_obj_set_style_text_color(status, lv_color_hex(0xffdd00), 0);
-        }
+        wifi_connect_timer = lv_timer_create(
+            [](lv_timer_t *timer) {
+              wifi_connect_attempts++;
+              if (WiFi.status() == WL_CONNECTED) {
+                AppNetworkManager::addWiFiNetwork(pending_wifi_ssid,
+                                                  pending_wifi_password);
+                if (wifi_status_label) {
+                  lv_label_set_text_fmt(wifi_status_label, "Connected to: %s",
+                                        WiFi.SSID().c_str());
+                  lv_obj_set_style_text_color(
+                      wifi_status_label, lv_color_hex(getCurrentThemeColor()),
+                      0);
+                }
+                if (label_wifi) {
+                  lv_label_set_text(label_wifi, LV_SYMBOL_WIFI);
+                  lv_obj_set_style_text_color(
+                      label_wifi, lv_color_hex(getCurrentThemeColor()), 0);
+                }
+                if (wifi_connect_button)
+                  lv_obj_clear_state(wifi_connect_button, LV_STATE_DISABLED);
+                lv_timer_del(timer);
+                wifi_connect_timer = NULL;
+                return;
+              }
 
-        // Wait for connection (with timeout)
-        int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-          delay(500);
-          attempts++;
-          lv_timer_handler(); // Keep UI responsive
-        }
+              if (wifi_connect_attempts >= 20) {
+                if (wifi_status_label) {
+                  lv_label_set_text(wifi_status_label,
+                                    "Connection failed. Check credentials.");
+                  lv_obj_set_style_text_color(wifi_status_label,
+                                              lv_color_hex(0xff4444), 0);
+                }
+                if (wifi_connect_button)
+                  lv_obj_clear_state(wifi_connect_button, LV_STATE_DISABLED);
+                lv_timer_del(timer);
+                wifi_connect_timer = NULL;
+                return;
+              }
 
-        if (WiFi.status() == WL_CONNECTED) {
-          Serial.println("WiFi connected!");
-          if (status) {
-            lv_label_set_text_fmt(status, "Connected to: %s",
-                                  WiFi.SSID().c_str());
-            lv_obj_set_style_text_color(
-                status, lv_color_hex(getCurrentThemeColor()), 0);
-          }
-
-          // CRITICAL: Add network to saved list
-          AppNetworkManager::addWiFiNetwork(String(new_ssid),
-                                            String(new_password));
-
-          // Close the modal after successful connection
-          delay(1000);
-          close_wifi_config_ui();
-          ESP.restart(); // Restart to update WiFi icon
-        } else {
-          Serial.println("WiFi connection failed!");
-          if (status) {
-            lv_label_set_text(status, "Connection Failed!");
-            lv_obj_set_style_text_color(status, lv_color_hex(0xff4444), 0);
-          }
-        }
+              if (wifi_status_label) {
+                lv_label_set_text_fmt(wifi_status_label,
+                                      "Connecting... %d / 20",
+                                      wifi_connect_attempts);
+              }
+            },
+            500, NULL);
       },
       LV_EVENT_CLICKED, NULL);
 
@@ -2582,11 +2650,17 @@ void close_wifi_config_ui() {
     return;
 
   lvgl_port_lock(-1);
+  if (wifi_connect_timer) {
+    lv_timer_del(wifi_connect_timer);
+    wifi_connect_timer = NULL;
+  }
   lv_obj_del(wifi_config_panel);
   wifi_config_panel = NULL;
   ta_ssid = NULL;
   ta_password = NULL;
   kb_wifi = NULL;
+  wifi_status_label = NULL;
+  wifi_connect_button = NULL;
   lvgl_port_unlock();
 }
 
@@ -5114,8 +5188,7 @@ void trigger_screensaver() {
   }
   FastLED.clear();
   FastLED.show();
-  if (led_use_wled)
-    AppNetworkManager::forceUpdateWLED();
+  schedule_wled_sync(20);
 }
 
 void wake_screen() {

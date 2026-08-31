@@ -19,6 +19,7 @@
 std::queue<BackgroundJob> BackgroundWorker::_jobQueue;
 SemaphoreHandle_t BackgroundWorker::_queueMutex = NULL;
 bool BackgroundWorker::_busy = false;
+bool BackgroundWorker::_showProgress = false;
 String BackgroundWorker::_statusMsg = "Idle";
 float BackgroundWorker::_progress = 0.0f;
 int BackgroundWorker::_totalJobs = 0;
@@ -41,6 +42,9 @@ void BackgroundWorker::addJob(BackgroundJob job) {
 }
 
 bool BackgroundWorker::isBusy() { return _busy; }
+bool BackgroundWorker::shouldShowProgress() {
+  return _busy && _showProgress;
+}
 int BackgroundWorker::getQueueSize() { return (int)_jobQueue.size(); }
 String BackgroundWorker::getStatusMessage() { return _statusMsg; }
 float BackgroundWorker::getProgress() { return _progress; }
@@ -57,8 +61,10 @@ void BackgroundWorker::workerTask(void *pvParameters) {
         hasJob = true;
         _totalJobs = getItemCount(); // Current total
         _busy = true;
+        _showProgress = currentJob.showProgress;
       } else {
         _busy = false;
+        _showProgress = false;
       }
       xSemaphoreGive(_queueMutex);
     }
@@ -310,6 +316,38 @@ void BackgroundWorker::workerTask(void *pvParameters) {
           success = true;
         }
       } break;
+
+      case JOB_PERSIST_FAVORITE: {
+        const bool isBook = currentJob.extraData.startsWith("book:");
+        const bool favorite = currentJob.extraData.endsWith(":1");
+        _statusMsg = "Saving favorite...";
+
+        MediaMode mode = isBook ? MODE_BOOK : MODE_CD;
+        success = Storage.updateFavorite(currentJob.id, mode, favorite);
+        resultMsg = success ? "Favorite saved" : "Favorite save failed";
+      } break;
+
+      case JOB_PERSIST_TRACK_FAVORITE: {
+        _statusMsg = "Saving track favorite...";
+        TrackList *trackList = Storage.loadTracklist(currentJob.id.c_str());
+        if (trackList && currentJob.index >= 0 &&
+            currentJob.index < (int)trackList->tracks.size()) {
+          trackList->tracks[currentJob.index].isFavoriteTrack =
+              currentJob.extraData == "1";
+          success = Storage.saveTracklist(currentJob.id.c_str(), trackList);
+        }
+        if (trackList)
+          Storage.deleteTracklist(trackList);
+        resultMsg = success ? "Track favorite saved"
+                            : "Track favorite save failed";
+      } break;
+
+      case JOB_SYNC_WLED:
+        _statusMsg = "Syncing shelf lights...";
+        AppNetworkManager::forceUpdateWLED();
+        success = true;
+        resultMsg = "Shelf lights synced";
+        break;
 
       default:
         break;

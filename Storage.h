@@ -56,6 +56,7 @@ public:
               bool skipIndexRewrite = false);
   bool saveBook(const Book &book, const char *oldUniqueID = nullptr,
                 bool skipIndexRewrite = false);
+  bool updateFavorite(String uniqueID, MediaMode mode, bool favorite);
 
   bool deleteItem(String uniqueID, MediaMode mode);
   bool wipeLibrary(MediaMode mode); // Delete ALL data for a mode

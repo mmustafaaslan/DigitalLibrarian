@@ -11,7 +11,7 @@ inline void initNavigationCache() {
   Serial.println("Initializing navigation cache...");
 
   // Set cache size based on user setting (default 5 items per side = 11 total)
-  int itemsPerSide = setting_cache_size;
+  int itemsPerSide = constrain(setting_cache_size, 1, 15);
   navCache.cacheSize = (itemsPerSide * 2) + 1; // e.g., 5*2+1 = 11
   navCache.cacheCenter = itemsPerSide;         // e.g., 5
 
@@ -55,26 +55,32 @@ inline bool loadItemIntoCache(int libraryIndex, int cacheIndex) {
   switch (currentMode) {
   case MODE_CD:
     if (libraryIndex >= 0 && libraryIndex < (int)cdLibrary.size()) {
-      PsramString uniqueID = cdLibrary[libraryIndex].uniqueID;
-      bool success =
-          Storage.loadCDDetail(uniqueID.c_str(), navCache.cdCache[cacheIndex]);
-      navCache.cdCacheValid[cacheIndex] = success;
-      if (success) {
-        cdLibrary[libraryIndex].detailsLoaded = true;
+      const CD &libraryItem = cdLibrary[libraryIndex];
+      bool success = false;
+      if (libraryItem.detailsLoaded) {
+        navCache.cdCache[cacheIndex] = libraryItem;
+        success = true;
+      } else {
+        success = Storage.loadCDDetail(libraryItem.uniqueID.c_str(),
+                                       navCache.cdCache[cacheIndex]);
       }
+      navCache.cdCacheValid[cacheIndex] = success;
       return success;
     }
     break;
 
   case MODE_BOOK:
     if (libraryIndex >= 0 && libraryIndex < (int)bookLibrary.size()) {
-      PsramString uniqueID = bookLibrary[libraryIndex].uniqueID;
-      bool success = Storage.loadBookDetail(uniqueID.c_str(),
-                                            navCache.bookCache[cacheIndex]);
-      navCache.bookCacheValid[cacheIndex] = success;
-      if (success) {
-        bookLibrary[libraryIndex].detailsLoaded = true;
+      const Book &libraryItem = bookLibrary[libraryIndex];
+      bool success = false;
+      if (libraryItem.detailsLoaded) {
+        navCache.bookCache[cacheIndex] = libraryItem;
+        success = true;
+      } else {
+        success = Storage.loadBookDetail(libraryItem.uniqueID.c_str(),
+                                         navCache.bookCache[cacheIndex]);
       }
+      navCache.bookCacheValid[cacheIndex] = success;
       return success;
     }
     break;
@@ -128,6 +134,65 @@ inline void rebuildNavigationCache(int centerIndex) {
     xSemaphoreGiveRecursive(libraryMutex);
 }
 
+inline ItemView buildCachedCDView(const CD &detail, int libraryIndex) {
+  ItemView view{};
+  const CD &indexItem = cdLibrary[libraryIndex];
+  view.title = indexItem.title.c_str();
+  view.artistOrAuthor = indexItem.artist.c_str();
+  view.genre = indexItem.genre.c_str();
+  view.year = indexItem.year;
+  view.ledIndices = indexItem.ledIndices;
+  view.uniqueID = indexItem.uniqueID.c_str();
+  view.coverFile = indexItem.coverFile.c_str();
+  view.favorite = indexItem.favorite;
+  view.codecOrIsbn = indexItem.barcode.c_str();
+  view.trackCount = indexItem.trackCount;
+
+  view.coverUrl = detail.coverUrl.c_str();
+  view.notes = detail.notes.c_str();
+  view.releaseMbid = detail.releaseMbid.c_str();
+  view.totalDurationMs = detail.totalDurationMs;
+  view.detailsLoaded = true;
+  int minutes = detail.totalDurationMs / 60000;
+  view.extraInfo = getExtraInfoKey() + ": " + String(indexItem.barcode.c_str()) +
+                   " | Trk: " + String(indexItem.trackCount) + " | " +
+                   String(minutes) + " " + getExtraInfoUnit();
+  view.isValid = true;
+  return view;
+}
+
+inline ItemView buildCachedBookView(const Book &detail, int libraryIndex) {
+  ItemView view{};
+  const Book &indexItem = bookLibrary[libraryIndex];
+  view.title = indexItem.title.c_str();
+  view.artistOrAuthor = indexItem.author.c_str();
+  view.genre = indexItem.genre.c_str();
+  view.year = indexItem.year;
+  view.ledIndices = indexItem.ledIndices;
+  view.uniqueID = indexItem.uniqueID.c_str();
+  view.coverFile = indexItem.coverFile.c_str();
+  view.favorite = indexItem.favorite;
+  view.codecOrIsbn = indexItem.isbn.c_str();
+  view.pageCount = indexItem.pageCount;
+  view.currentPage = indexItem.currentPage;
+
+  view.coverUrl = detail.coverUrl.c_str();
+  view.notes = detail.notes.c_str();
+  view.publisher = detail.publisher.c_str();
+  view.detailsLoaded = true;
+  if (indexItem.currentPage > 0) {
+    view.extraInfo = getExtraInfoKey() + ": " + String(indexItem.isbn.c_str()) +
+                     " | Progress: " + String(indexItem.currentPage) + " / " +
+                     String(indexItem.pageCount) + " " + getExtraInfoUnit();
+  } else {
+    view.extraInfo = getExtraInfoKey() + ": " + String(indexItem.isbn.c_str()) +
+                     " | " + getExtraInfoUnit() + ": " +
+                     String(indexItem.pageCount);
+  }
+  view.isValid = true;
+  return view;
+}
+
 // Get item from cache if available, otherwise load from SD
 inline ItemView getItemFromCache(int libraryIndex) {
   int cacheStartIndex = (currentMode == MODE_CD) ? navCache.cdCacheStartIndex
@@ -142,14 +207,11 @@ inline ItemView getItemFromCache(int libraryIndex) {
                          : navCache.bookCacheValid[cacheOffset];
 
       if (isValid) {
-        // Build view from cache
         if (currentMode == MODE_CD) {
-          const CD &c = navCache.cdCache[cacheOffset];
-          // ... build view ... (calling getItemAtRAM or similar logic)
-          return getItemAtRAM(
-              libraryIndex); // Use RAM getter since it's already in cache
+          return buildCachedCDView(navCache.cdCache[cacheOffset], libraryIndex);
         } else if (currentMode == MODE_BOOK) {
-          return getItemAtRAM(libraryIndex);
+          return buildCachedBookView(navCache.bookCache[cacheOffset],
+                                     libraryIndex);
         }
       }
     }
@@ -163,8 +225,6 @@ extern bool filter_active;
 
 // Global wrapper to use cache for all lookups
 inline ItemView getItemAt(int index) {
-  if (filter_active)
-    return getItemAtSD(index); // Bypass cache during filtering
   return getItemFromCache(index);
 }
 
