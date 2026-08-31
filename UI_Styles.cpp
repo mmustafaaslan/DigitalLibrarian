@@ -16,6 +16,16 @@ lv_style_t style_primary_button;
 lv_style_t style_secondary_button;
 lv_style_t style_meta_chip;
 lv_style_t style_text_muted;
+lv_style_t style_panel_header;
+lv_style_t style_input;
+lv_style_t style_input_focused;
+lv_style_t style_list;
+lv_style_t style_list_item;
+lv_style_t style_danger_button;
+lv_style_t style_warning_button;
+lv_style_t style_keyboard;
+lv_style_t style_section_label;
+lv_style_t style_scrim;
 
 void ui_styles_init() {
   const lv_color_t accent = lv_color_hex(getCurrentThemeColor());
@@ -108,6 +118,87 @@ void ui_styles_init() {
   lv_style_init(&style_text_muted);
   lv_style_set_text_color(&style_text_muted, textMuted);
 
+  // Reusable panel chrome keeps every workflow aligned to the same grid.
+  lv_style_init(&style_panel_header);
+  lv_style_set_bg_color(&style_panel_header, topbar);
+  lv_style_set_bg_opa(&style_panel_header, LV_OPA_COVER);
+  lv_style_set_border_color(&style_panel_header, outline);
+  lv_style_set_border_width(&style_panel_header, 1);
+  lv_style_set_border_side(&style_panel_header, LV_BORDER_SIDE_BOTTOM);
+  lv_style_set_radius(&style_panel_header, 0);
+  lv_style_set_pad_all(&style_panel_header, 0);
+
+  lv_style_init(&style_input);
+  lv_style_set_bg_color(&style_input, surfaceRaised);
+  lv_style_set_bg_opa(&style_input, LV_OPA_COVER);
+  lv_style_set_border_color(&style_input, outline);
+  lv_style_set_border_width(&style_input, 1);
+  lv_style_set_radius(&style_input, 10);
+  lv_style_set_pad_left(&style_input, 12);
+  lv_style_set_pad_right(&style_input, 12);
+  lv_style_set_text_color(&style_input, textPrimary);
+
+  lv_style_init(&style_input_focused);
+  lv_style_set_border_color(&style_input_focused, accent);
+  lv_style_set_border_width(&style_input_focused, 2);
+  lv_style_set_outline_color(&style_input_focused, accent);
+  lv_style_set_outline_width(&style_input_focused, 1);
+  lv_style_set_outline_pad(&style_input_focused, 1);
+
+  lv_style_init(&style_list);
+  lv_style_set_bg_color(&style_list, canvas);
+  lv_style_set_bg_opa(&style_list, LV_OPA_COVER);
+  lv_style_set_border_color(&style_list, outline);
+  lv_style_set_border_width(&style_list, 1);
+  lv_style_set_radius(&style_list, 12);
+  lv_style_set_pad_all(&style_list, 8);
+  lv_style_set_pad_gap(&style_list, 6);
+
+  lv_style_init(&style_list_item);
+  lv_style_set_bg_color(&style_list_item, surfaceRaised);
+  lv_style_set_bg_opa(&style_list_item, LV_OPA_COVER);
+  lv_style_set_border_color(&style_list_item, outline);
+  lv_style_set_border_width(&style_list_item, 1);
+  lv_style_set_radius(&style_list_item, 10);
+  lv_style_set_shadow_width(&style_list_item, 0);
+  lv_style_set_text_color(&style_list_item, textPrimary);
+
+  lv_style_init(&style_danger_button);
+  lv_style_set_bg_color(&style_danger_button, lv_color_hex(0x3B1D24));
+  lv_style_set_bg_opa(&style_danger_button, LV_OPA_COVER);
+  lv_style_set_border_color(&style_danger_button, lv_color_hex(0xFF5A67));
+  lv_style_set_border_width(&style_danger_button, 1);
+  lv_style_set_radius(&style_danger_button, 12);
+  lv_style_set_shadow_width(&style_danger_button, 0);
+  lv_style_set_text_color(&style_danger_button, lv_color_hex(0xFFD7DB));
+
+  lv_style_init(&style_warning_button);
+  lv_style_set_bg_color(&style_warning_button, lv_color_hex(0x3A2B14));
+  lv_style_set_bg_opa(&style_warning_button, LV_OPA_COVER);
+  lv_style_set_border_color(&style_warning_button, lv_color_hex(0xF0A43B));
+  lv_style_set_border_width(&style_warning_button, 1);
+  lv_style_set_radius(&style_warning_button, 12);
+  lv_style_set_shadow_width(&style_warning_button, 0);
+  lv_style_set_text_color(&style_warning_button, lv_color_hex(0xFFE1A8));
+
+  lv_style_init(&style_keyboard);
+  lv_style_set_bg_color(&style_keyboard, topbar);
+  lv_style_set_bg_opa(&style_keyboard, LV_OPA_COVER);
+  lv_style_set_border_color(&style_keyboard, outline);
+  lv_style_set_border_width(&style_keyboard, 1);
+  lv_style_set_radius(&style_keyboard, 12);
+  lv_style_set_text_color(&style_keyboard, textPrimary);
+
+  lv_style_init(&style_section_label);
+  lv_style_set_text_color(&style_section_label, accent);
+  lv_style_set_text_font(&style_section_label, &lv_font_montserrat_14);
+
+  lv_style_init(&style_scrim);
+  lv_style_set_bg_color(&style_scrim, lv_color_hex(0x000000));
+  lv_style_set_bg_opa(&style_scrim, LV_OPA_60);
+  lv_style_set_border_width(&style_scrim, 0);
+  lv_style_set_radius(&style_scrim, 0);
+
   // Header button compatibility style used by panels throughout the app.
   lv_style_init(&style_btn_header_green);
   lv_style_set_bg_color(&style_btn_header_green, surfaceRaised);
@@ -123,8 +214,10 @@ void ui_styles_init() {
   lv_style_set_bg_opa(&style_btn_close, LV_OPA_TRANSP);
   lv_style_set_border_color(&style_btn_close, lv_color_hex(0xff4444));
   lv_style_set_border_width(&style_btn_close, 2);
+  lv_style_set_radius(&style_btn_close, 10);
   lv_style_set_shadow_width(&style_btn_close, 0);
   lv_style_set_text_color(&style_btn_close, lv_color_hex(0xff4444));
+  lv_style_set_pad_all(&style_btn_close, 0);
 
   // Modal panels inherit the same elevated surface language.
   lv_style_init(&style_modal_panel);

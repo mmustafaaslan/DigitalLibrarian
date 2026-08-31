@@ -2227,23 +2227,63 @@ void setup() {
     lvgl_port_lock(-1);
     Serial.println("LVGL lock acquired");
 
-    // Create dark background
+    // Create a startup surface that matches the application shell.
     lv_obj_t *loading_bg = lv_obj_create(lv_scr_act());
     lv_obj_set_size(loading_bg, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_color(loading_bg, lv_color_hex(0x000000), 0);
+    lv_obj_set_pos(loading_bg, 0, 0);
+    lv_obj_set_style_bg_color(loading_bg, lv_color_hex(0x090D12), 0);
     lv_obj_set_style_border_width(loading_bg, 0, 0);
-    lv_obj_set_style_radius(loading_bg, 0, 0); // No rounded corners
+    lv_obj_set_style_radius(loading_bg, 0, 0);
+    lv_obj_set_style_pad_all(loading_bg, 0, 0);
     lv_obj_clear_flag(loading_bg, LV_OBJ_FLAG_SCROLLABLE);
     Serial.println("Background created");
 
-    // Create loading label with current mode's theme color
-    lv_obj_t *loading_label = lv_label_create(loading_bg);
-    lv_label_set_text(loading_label, "Loading Library...\nPlease wait");
-    lv_obj_set_style_text_align(loading_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_t *loading_card = lv_obj_create(loading_bg);
+    lv_obj_set_size(loading_card, 520, 220);
+    lv_obj_center(loading_card);
+    lv_obj_set_style_bg_color(loading_card, lv_color_hex(0x111820), 0);
+    lv_obj_set_style_border_color(loading_card, lv_color_hex(0x263544), 0);
+    lv_obj_set_style_border_width(loading_card, 1, 0);
+    lv_obj_set_style_radius(loading_card, 16, 0);
+    lv_obj_set_style_shadow_color(loading_card, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_width(loading_card, 28, 0);
+    lv_obj_set_style_shadow_opa(loading_card, LV_OPA_40, 0);
+    lv_obj_clear_flag(loading_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *accent = lv_obj_create(loading_card);
+    lv_obj_set_size(accent, 520, 5);
+    lv_obj_set_pos(accent, -1, -1);
+    lv_obj_set_style_bg_color(accent, lv_color_hex(getCurrentThemeColor()), 0);
+    lv_obj_set_style_border_width(accent, 0, 0);
+    lv_obj_set_style_radius(accent, 0, 0);
+    lv_obj_clear_flag(accent, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *brand = lv_label_create(loading_card);
+    lv_label_set_text(brand, "DIGITAL LIBRARIAN");
+    lv_obj_set_pos(brand, 32, 34);
+    lv_obj_set_style_text_color(brand, lv_color_hex(0xF4F7FA), 0);
+    lv_obj_set_style_text_font(brand, &lv_font_montserrat_16, 0);
+
+    lv_obj_t *loading_label = lv_label_create(loading_card);
+    lv_label_set_text(loading_label, "LOADING YOUR LIBRARY");
+    lv_obj_set_pos(loading_label, 92, 104);
     lv_obj_set_style_text_color(loading_label,
                                 lv_color_hex(getCurrentThemeColor()), 0);
-    lv_obj_set_style_text_font(loading_label, &lv_font_montserrat_26, 0);
-    lv_obj_center(loading_label);
+    lv_obj_set_style_text_font(loading_label, &lv_font_montserrat_16, 0);
+
+    lv_obj_t *loading_hint = lv_label_create(loading_card);
+    lv_label_set_text(loading_hint, "Reading the collection and preparing navigation...");
+    lv_obj_set_pos(loading_hint, 92, 142);
+    lv_obj_set_width(loading_hint, 390);
+    lv_obj_set_style_text_color(loading_hint, lv_color_hex(0x98A6B5), 0);
+    lv_label_set_long_mode(loading_hint, LV_LABEL_LONG_WRAP);
+
+    lv_obj_t *spinner = lv_spinner_create(loading_card, 900, 76);
+    lv_obj_set_size(spinner, 44, 44);
+    lv_obj_set_pos(spinner, 32, 104);
+    lv_obj_set_style_arc_color(spinner, lv_color_hex(0x263544), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(spinner, lv_color_hex(getCurrentThemeColor()),
+                               LV_PART_INDICATOR);
     Serial.println("Label created");
 
     lvgl_port_unlock();
