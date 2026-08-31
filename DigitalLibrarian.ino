@@ -2161,6 +2161,7 @@ void setupWebHandlers() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
+  Serial.println("[UPLOAD SMOKE TEST] Digital Librarian build 2026-08-31");
   logMemoryUsage("BOOT START");
 
   logMemoryUsage("BOOT START");
