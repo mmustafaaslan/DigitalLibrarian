@@ -219,6 +219,8 @@ static void set_search_keyboard_visible(bool visible) {
   if (visible) {
     lv_obj_clear_flag(kb_search, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_height(list_results, 126);
+    lv_obj_move_foreground(kb_search);
+    lv_obj_invalidate(kb_search);
   } else {
     lv_obj_add_flag(kb_search, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_height(list_results, 324);
@@ -1162,12 +1164,17 @@ void setupMainUI() {
 
   label_genre = lv_label_create(info_container);
   lv_obj_align(label_genre, LV_ALIGN_TOP_LEFT, 18, 84);
+  lv_obj_set_width(label_genre, 292);
+  lv_label_set_long_mode(label_genre, LV_LABEL_LONG_DOT);
   lv_obj_add_style(label_genre, &style_meta_chip, 0);
   lv_obj_set_style_text_color(label_genre, lv_color_hex(getCurrentThemeColor()),
                               0);
 
   label_year = lv_label_create(info_container);
-  lv_obj_align(label_year, LV_ALIGN_TOP_LEFT, 190, 84);
+  lv_obj_set_width(label_year, 128);
+  lv_obj_align(label_year, LV_ALIGN_TOP_RIGHT, -18, 84);
+  lv_obj_set_style_text_align(label_year, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_long_mode(label_year, LV_LABEL_LONG_DOT);
   lv_obj_add_style(label_year, &style_meta_chip, 0);
   lv_obj_set_style_text_color(label_year, lv_color_hex(getCurrentThemeColor()),
                               0);
@@ -2072,7 +2079,7 @@ void show_search_ui() {
   ta_search = lv_textarea_create(search_panel);
   lv_obj_set_size(ta_search, 480, 44);
   lv_obj_set_pos(ta_search, 300, 76);
-  lv_textarea_set_placeholder_text(ta_search, "Type to search...");
+  lv_textarea_set_placeholder_text(ta_search, "Search with the keyboard below...");
   style_input_control(ta_search);
   lv_obj_add_event_cb(ta_search, search_input_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
@@ -2136,7 +2143,8 @@ void show_search_ui() {
       LV_EVENT_CANCEL, label_toggle_kb);
 
   lv_keyboard_set_textarea(kb_search, ta_search);
-  lv_obj_clear_flag(kb_search, LV_OBJ_FLAG_HIDDEN);
+  set_search_keyboard_visible(true);
+  lv_obj_add_state(ta_search, LV_STATE_FOCUSED);
 
   filter_library("");
   lvgl_port_unlock();
