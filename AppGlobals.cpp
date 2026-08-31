@@ -30,7 +30,8 @@ int setting_books_led_start = 300;
 int setting_cds_led_start = 0;
 
 int led_count = 800;
-String led_type_str = "WS2812B";
+int configured_led_count = 800;
+int led_max_milliamps = LED_DEFAULT_POWER_MA;
 bool led_master_on = true;
 int led_brightness = 50;
 bool led_use_wled = false;
@@ -56,7 +57,8 @@ unsigned long previewModeUntil = 0;
 
 std::vector<int> search_matches;
 int search_display_offset = 0;
-const int SEARCH_PAGE_SIZE = 20;
+// Keep live-search result allocation small while the custom keyboard is open.
+const int SEARCH_PAGE_SIZE = 8;
 
 CD currentEditCD;
 Book currentEditBook;
@@ -121,9 +123,10 @@ ModeDefinition registry[] = {
 // --- Settings Persistence ---
 void loadSettings() {
   preferences.begin("settings", true); // Read-only
-  web_pin = preferences.getString("web_pin", "cd1234");
+  const bool hasStoredWebPin = preferences.isKey("web_pin");
+  web_pin = preferences.getString("web_pin", "");
   mdns_name = preferences.getString("mdns_name", "mylibrary");
-  led_brightness = preferences.getInt("led_bright", 50);
+  led_brightness = constrain(preferences.getInt("led_bright", 50), 0, 255);
 
   // Colors stored as uint32_t (R << 16 | G << 8 | B)
   uint32_t fav = preferences.getUInt("col_fav", 0xFF00FF); // Magenta default
@@ -138,8 +141,13 @@ void loadSettings() {
   setting_screensaver_min = preferences.getInt("saver_min", 0);
 
   // Load LED Config
-  led_count = preferences.getInt("led_count", 800);
-  led_type_str = preferences.getString("led_type", "WS2812B");
+  configured_led_count =
+      constrain(preferences.getInt("led_count", 800), LED_MIN_COUNT,
+                LED_MAX_COUNT);
+  led_count = configured_led_count;
+  led_max_milliamps =
+      constrain(preferences.getInt("led_max_ma", LED_DEFAULT_POWER_MA), 100,
+                30000);
   led_use_wled = preferences.getBool("use_wled", false);
   wled_ip = preferences.getString("wled_ip", "192.168.1.100");
 
@@ -167,8 +175,17 @@ void loadSettings() {
 
   preferences.end();
 
+  if (!hasStoredWebPin || web_pin.length() < 4) {
+    web_pin = String(100000 + (esp_random() % 900000));
+    preferences.begin("settings", false);
+    preferences.putString("web_pin", web_pin);
+    preferences.end();
+    Serial.println("Generated a unique web PIN. View it in device settings.");
+  }
+
   // Apply immediate effects
   FastLED.setBrightness(led_brightness);
+  FastLED.setMaxPowerInVoltsAndMilliamps(5, led_max_milliamps);
 }
 
 void saveSettings() {
@@ -190,8 +207,8 @@ void saveSettings() {
   preferences.putUInt("col_filt", filt);
 
   preferences.putInt("saver_min", setting_screensaver_min);
-  preferences.putInt("led_count", led_count);
-  preferences.putString("led_type", led_type_str);
+  preferences.putInt("led_count", configured_led_count);
+  preferences.putInt("led_max_ma", led_max_milliamps);
   preferences.putBool("use_wled", led_use_wled);
   preferences.putString("wled_ip", wled_ip);
 

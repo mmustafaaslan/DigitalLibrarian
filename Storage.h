@@ -69,6 +69,7 @@ public:
   // Chapter code removed
 
   bool rewriteIndex(MediaMode mode);
+  bool replaceIndex(MediaMode mode, const IndexVector &items);
 
   // Lyrics Management
   String loadLyrics(const char *lyricsPath);

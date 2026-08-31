@@ -6,6 +6,8 @@ secrets.h
 build/
 *.bin
 *.elf
+__pycache__/
+*.pyc
 
 # Local config
 *.local
@@ -26,4 +28,4 @@ lyrics/
 
 # User Exclusions
 .agent/
-"Model 3D/"
+Model 3D/

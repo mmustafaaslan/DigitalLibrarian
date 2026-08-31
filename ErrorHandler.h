@@ -2,6 +2,7 @@
 #define ERROR_HANDLER_H
 
 #include <Arduino.h>
+#include <freertos/semphr.h>
 #include <vector>
 
 // Error severity levels
@@ -32,6 +33,7 @@ private:
   static std::vector<ErrorRecord> recentErrors;
   static const int MAX_RECENT_ERRORS = 20;
   static bool sdLoggingEnabled;
+  static SemaphoreHandle_t errorsMutex;
 
   static void writeToSD(const ErrorRecord &error);
   static String levelToString(ErrorLevel level);
@@ -57,7 +59,7 @@ public:
   static bool isMemoryLow();
 
   // Error retrieval
-  static const std::vector<ErrorRecord> &getRecentErrors();
+  static std::vector<ErrorRecord> getRecentErrors();
   static void clearRecentErrors();
 
   // Configuration

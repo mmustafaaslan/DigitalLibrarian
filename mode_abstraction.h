@@ -277,10 +277,15 @@ inline void ensureItemDetailsLoaded(int index) {
   switch (currentMode) {
   case MODE_BOOK:
     if (index >= 0 && index < (int)bookLibrary.size()) {
-      if (bookLibrary[index].notes.length() == 0) {
+      if (bookLibrary[index].detailsLoaded)
+        return;
+      if (libraryMutex)
+        xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
+      if (!bookLibrary[index].detailsLoaded)
         Storage.loadBookDetail(bookLibrary[index].uniqueID.c_str(),
                                bookLibrary[index]);
-      }
+      if (libraryMutex)
+        xSemaphoreGiveRecursive(libraryMutex);
     }
     break;
   case MODE_CD:
@@ -507,6 +512,8 @@ inline ItemView getItemAtSD(int index) {
 }
 
 inline void setItem(int index, const ItemView &view) {
+  if (libraryMutex)
+    xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
   switch (currentMode) {
   case MODE_BOOK:
     if (index >= 0 && index < (int)bookLibrary.size()) {
@@ -551,6 +558,8 @@ inline void setItem(int index, const ItemView &view) {
   default:
     break;
   }
+  if (libraryMutex)
+    xSemaphoreGiveRecursive(libraryMutex);
 }
 
 // --- Persistence Functions ---
@@ -560,8 +569,12 @@ inline void setItem(int index, const ItemView &view) {
 // Save current library to SD
 // Save current library (index) to SD
 inline bool saveLibrary() {
-  auto &index = Storage.getIndex();
-  index.clear();
+  if (libraryMutex &&
+      xSemaphoreTakeRecursive(libraryMutex, pdMS_TO_TICKS(5000)) != pdPASS)
+    return false;
+
+  IndexVector index;
+  const MediaMode modeToSave = currentMode;
 
   switch (currentMode) {
   case MODE_BOOK:
@@ -600,7 +613,10 @@ inline bool saveLibrary() {
     break;
   }
 
-  return Storage.rewriteIndex(currentMode);
+  const bool saved = Storage.replaceIndex(modeToSave, index);
+  if (libraryMutex)
+    xSemaphoreGiveRecursive(libraryMutex);
+  return saved;
 }
 
 // Load current library from SD
@@ -621,6 +637,10 @@ inline bool loadCurrentLibrary() {
 
 // Delete item at index
 inline bool deleteItemAt(int index) {
+  if (libraryMutex &&
+      xSemaphoreTakeRecursive(libraryMutex, pdMS_TO_TICKS(5000)) != pdPASS)
+    return false;
+
   bool success = false;
 
   switch (currentMode) {
@@ -657,6 +677,8 @@ inline bool deleteItemAt(int index) {
     break;
   }
 
+  if (libraryMutex)
+    xSemaphoreGiveRecursive(libraryMutex);
   return success;
 }
 
@@ -867,11 +889,11 @@ inline int getNextLedIndex() {
 }
 
 // Add a new item to the correct library
-inline void addItemToLibrary(const ItemView &item) {
+inline bool addItemToLibrary(const ItemView &item) {
   if (libraryMutex) {
     if (xSemaphoreTakeRecursive(libraryMutex, pdMS_TO_TICKS(5000)) != pdPASS) {
       Serial.println("!!! DEADLOCK: addItemToLibrary failed to get mutex");
-      return;
+      return false;
     }
   }
   Serial.printf("addItem: Entering (%s)\n", item.title.c_str());
@@ -921,11 +943,14 @@ inline void addItemToLibrary(const ItemView &item) {
     cdLibrary.push_back(c);
   } break;
   default:
-    break;
+    if (libraryMutex)
+      xSemaphoreGiveRecursive(libraryMutex);
+    return false;
   }
   Serial.println("addItem: Giving mutex");
   if (libraryMutex)
     xSemaphoreGiveRecursive(libraryMutex);
+  return true;
 }
 
 // --- Metadata Fetching (Unified) ---

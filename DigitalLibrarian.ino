@@ -1,6 +1,6 @@
 #include "waveshare_sd_card.h" // Custom header for SD card pin definitions
 #include <Arduino.h>           // Core Arduino Library
-#include <ArduinoJson.h>       // v6.21.x (StaticJsonDocument usage) - NOT v7.x
+#include <ArduinoJson.h>       // Verified with 7.4.2
 #include <ESPmDNS.h>           // mDNS Support (http://mylibrary.local)
 #include <FastLED.h>           // LED Strip Control
 #include <HTTPClient.h>        // ESP32 Standard Library
@@ -10,11 +10,13 @@
 #include <Waveshare_ST7262_LVGL.h> // Waveshare BSP v1.0.0
 #include <WebServer.h>             // For phone barcode scanner
 #include <WiFi.h>                  // ESP32 Standard Library
+#include <algorithm>
+#include <cstdlib>
 #include <esp_heap_caps.h>         // For detailed heap analysis
-#include <lvgl.h>                  // v8.3.x (Standard for this board)
+#include <lvgl.h>                  // Verified with 8.4.0
 
 #include "AppGlobals.h"       // Global State & Settings
-#include "BackgroundWorker.h" // Core 0 Task (Network/IO)
+#include "BackgroundWorker.h" // Scheduled Network/IO worker
 #include "Core_Data.h"        // CD/Book Data Structures
 #include "ErrorHandler.h"     // System-wide Error Logging
 #include "MediaManager.h"     // API Clients (MusicBrainz, Google Books)
@@ -34,6 +36,22 @@ WebServer server(80);
 File uploadFile;
 SemaphoreHandle_t libraryMutex = NULL;
 SemaphoreHandle_t i2cMutex = NULL;
+SemaphoreHandle_t ledMutex = NULL;
+static bool backupUploadAuthorized = false;
+static bool backupUploadFailed = false;
+static bool backupUploadOwnsSd = false;
+static size_t backupUploadBytes = 0;
+static constexpr size_t MAX_BACKUP_UPLOAD_BYTES = 2 * 1024 * 1024;
+
+void releaseBackupUploadSd() {
+  if (!backupUploadOwnsSd)
+    return;
+  if (sdExpander)
+    sdExpander->digitalWrite(SD_CS, HIGH);
+  if (i2cMutex)
+    xSemaphoreGiveRecursive(i2cMutex);
+  backupUploadOwnsSd = false;
+}
 
 // ========================================
 // HELPER FUNCTIONS
@@ -58,6 +76,233 @@ void printDetailedMemoryStats() {
 }
 
 String getCommonCSS() { return String(COMMON_CSS); }
+
+String getCookieValue(const String &cookieHeader, const String &name) {
+  const String prefix = name + "=";
+  int start = 0;
+  while (start < cookieHeader.length()) {
+    while (start < cookieHeader.length() &&
+           (cookieHeader[start] == ' ' || cookieHeader[start] == ';'))
+      start++;
+    int end = cookieHeader.indexOf(';', start);
+    if (end < 0)
+      end = cookieHeader.length();
+    String cookie = cookieHeader.substring(start, end);
+    if (cookie.startsWith(prefix)) {
+      String value = cookie.substring(prefix.length());
+      value.trim();
+      return value;
+    }
+    start = end + 1;
+  }
+  return "";
+}
+
+String webSessionToken = "";
+String webSessionPinSnapshot = "";
+
+void ensureWebSessionToken() {
+  if (webSessionToken.length() == 32 && webSessionPinSnapshot == web_pin)
+    return;
+
+  char token[33];
+  snprintf(token, sizeof(token), "%08lx%08lx%08lx%08lx",
+           (unsigned long)esp_random(), (unsigned long)esp_random(),
+           (unsigned long)esp_random(), (unsigned long)esp_random());
+  webSessionToken = token;
+  webSessionPinSnapshot = web_pin;
+}
+
+bool webRequestAuthorized(bool allowFormPin = false) {
+  ensureWebSessionToken();
+  String suppliedPin = server.header("X-Auth-Pin");
+  if (allowFormPin && suppliedPin.length() == 0 && server.hasArg("pin"))
+    suppliedPin = server.arg("pin");
+
+  const String cookieToken =
+      getCookieValue(server.header("Cookie"), "DL_AUTH");
+  const bool pinValid = suppliedPin.length() > 0 && suppliedPin == web_pin;
+  const bool sessionValid =
+      cookieToken.length() > 0 && cookieToken == webSessionToken;
+  if (pinValid && cookieToken != webSessionToken) {
+    server.sendHeader("Set-Cookie", "DL_AUTH=" + webSessionToken +
+                                       "; Path=/; HttpOnly; SameSite=Strict");
+  }
+  return pinValid || sessionValid;
+}
+
+bool requireWebAuth() {
+  if (webRequestAuthorized())
+    return true;
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(401, "text/plain", "Unauthorized");
+  return false;
+}
+
+void sendWebLoginPage(const String &destination, const String &feature) {
+  String safeDestination = escapeJSON(destination);
+  safeDestination.replace("'", "\\'");
+  String safeFeature = escapeHTML(feature);
+  String html =
+      "<!DOCTYPE html><html><head><meta name='viewport' "
+      "content='width=device-width,initial-scale=1'><meta charset='UTF-8'>"
+      "<title>Digital Librarian Login</title><style>";
+  html += getCommonCSS();
+  html +=
+      "body{min-height:100vh;display:flex;align-items:center;justify-content:"
+      "center}.card{width:100%;max-width:340px;text-align:center}.error{color:"
+      "var(--err);min-height:24px;margin-top:12px}</style></head><body><div "
+      "class='card'><h1>Secure Login</h1><p style='color:var(--sub)'>Enter the " +
+      safeFeature +
+      " web PIN.</p><form id='loginForm'><input id='pin' name='pin' "
+      "type='password' inputmode='numeric' autocomplete='current-password' "
+      "placeholder='Web PIN' autofocus required><button type='submit'>Unlock"
+      "</button></form><div id='error' class='error'></div></div><script>"
+      "document.getElementById('loginForm').onsubmit=async function(e){e."
+      "preventDefault();const b=this.querySelector('button'),p=document."
+      "getElementById('pin').value;b.disabled=true;const r=await fetch('/api/"
+      "auth',{method:'POST',headers:{'Content-Type':'application/x-www-form-"
+      "urlencoded'},body:'pin='+encodeURIComponent(p)});if(r.ok){location."
+      "replace('" +
+      safeDestination +
+      "');return;}document.getElementById('error').textContent='Incorrect "
+      "PIN';b.disabled=false;};</script></body></html>";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(401, "text/html", html);
+}
+
+bool parseLedIndices(const String &input, std::vector<int> &result) {
+  result.clear();
+  String remaining = input;
+  remaining.replace(' ', ',');
+  while (remaining.length() > 0) {
+    int comma = remaining.indexOf(',');
+    String token = comma < 0 ? remaining : remaining.substring(0, comma);
+    remaining = comma < 0 ? "" : remaining.substring(comma + 1);
+    token.trim();
+    if (token.isEmpty())
+      continue;
+    char *end = nullptr;
+    long value = strtol(token.c_str(), &end, 10);
+    if (end == token.c_str() || *end != '\0' || value < 0 ||
+        value >= led_count)
+      return false;
+    if (std::find(result.begin(), result.end(), (int)value) == result.end())
+      result.push_back((int)value);
+  }
+  return true;
+}
+
+bool validateWebItem(const ItemView &item, int editedIndex, String &error) {
+  String title = item.title;
+  String uniqueID = item.uniqueID;
+  title.trim();
+  uniqueID.trim();
+  if (title.isEmpty()) {
+    error = "Title is required";
+    return false;
+  }
+  if (uniqueID.isEmpty() || sanitizeFilename(uniqueID).isEmpty()) {
+    error = "A valid unique ID is required";
+    return false;
+  }
+  if (item.year != 0 && (item.year < 1000 || item.year > 2100)) {
+    error = "Year must be blank or between 1000 and 2100";
+    return false;
+  }
+  const String safeID = sanitizeFilename(uniqueID);
+  for (int i = 0; i < getItemCount(); i++) {
+    if (i == editedIndex)
+      continue;
+    ItemView other = getItemAtRAM(i);
+    if (other.uniqueID == uniqueID || sanitizeFilename(other.uniqueID) == safeID) {
+      error = "Unique ID is already in use";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool persistItemAt(int index, const String &oldUniqueID) {
+  if (libraryMutex &&
+      xSemaphoreTakeRecursive(libraryMutex, pdMS_TO_TICKS(5000)) != pdPASS)
+    return false;
+  bool saved = false;
+  switch (currentMode) {
+  case MODE_CD: {
+    if (index >= 0 && index < (int)cdLibrary.size()) {
+      CD candidate = cdLibrary[index];
+      if (libraryMutex)
+        xSemaphoreGiveRecursive(libraryMutex);
+      return Storage.saveCD(candidate, oldUniqueID.c_str());
+    }
+    break;
+  }
+  case MODE_BOOK: {
+    if (index >= 0 && index < (int)bookLibrary.size()) {
+      Book candidate = bookLibrary[index];
+      if (libraryMutex)
+        xSemaphoreGiveRecursive(libraryMutex);
+      return Storage.saveBook(candidate, oldUniqueID.c_str());
+    }
+    break;
+  }
+  default:
+    break;
+  }
+  if (libraryMutex)
+    xSemaphoreGiveRecursive(libraryMutex);
+  return saved;
+}
+
+bool isPrivateOrReservedIPv4(const IPAddress &ip) {
+  const uint8_t a = ip[0];
+  const uint8_t b = ip[1];
+  if (a == 0 || a == 10 || a == 127 || a >= 224)
+    return true;
+  if (a == 169 && b == 254)
+    return true;
+  if (a == 172 && b >= 16 && b <= 31)
+    return true;
+  if (a == 192 && b == 168)
+    return true;
+  if (a == 100 && b >= 64 && b <= 127)
+    return true;
+  if (a == 198 && (b == 18 || b == 19))
+    return true;
+  return false;
+}
+
+bool isSafeRemoteCoverUrl(const String &url) {
+  if (!url.startsWith("https://"))
+    return false;
+  int hostStart = 8;
+  int hostEnd = url.indexOf('/', hostStart);
+  if (hostEnd < 0)
+    hostEnd = url.length();
+  String host = url.substring(hostStart, hostEnd);
+  int portSeparator = host.indexOf(':');
+  if (portSeparator >= 0)
+    host = host.substring(0, portSeparator);
+  host.toLowerCase();
+  if (host.isEmpty() || host == "localhost" || host.endsWith(".local") ||
+      host.startsWith("127.") || host.startsWith("10.") ||
+      host.startsWith("192.168.") || host.startsWith("169.254.") ||
+      host.startsWith("0.") || host.indexOf(':') >= 0)
+    return false;
+  if (host.startsWith("172.")) {
+    int secondDot = host.indexOf('.', 4);
+    int secondOctet = host.substring(4, secondDot).toInt();
+    if (secondOctet >= 16 && secondOctet <= 31)
+      return false;
+  }
+
+  IPAddress resolved;
+  if (!WiFi.hostByName(host.c_str(), resolved))
+    return false;
+  return !isPrivateOrReservedIPv4(resolved);
+}
+
 String getWebFooter() {
   String f = "<div style='margin-top: 40px; border-top: 1px solid #333; "
              "padding-top: 20px;'>";
@@ -101,11 +346,23 @@ void sendHTMLPage(const char *title, String body, String script = "") {
 // ========================================
 
 void setupWebHandlers() {
+  const char *authHeaders[] = {"X-Auth-Pin", "Cookie"};
+  server.collectHeaders(authHeaders, 2);
   // 1. Dashboard
   server.on("/", HTTP_GET, []() {
     String html = String(INDEX_HTML_TEMPLATE);
     html.replace("%CSS%", getCommonCSS());
     server.send(200, "text/html", html);
+  });
+
+  server.on("/api/auth", HTTP_POST, []() {
+    if (!webRequestAuthorized(true)) {
+      server.sendHeader("Cache-Control", "no-store");
+      server.send(401, "text/plain", "Unauthorized");
+      return;
+    }
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(204, "text/plain", "");
   });
 
   // 2. Status API
@@ -123,6 +380,8 @@ void setupWebHandlers() {
 
   // 2.5. Error Log API
   server.on("/api/errors", HTTP_GET, []() {
+    if (!requireWebAuth())
+      return;
     DynamicJsonDocument doc(4096);
 
     // System health
@@ -154,44 +413,46 @@ void setupWebHandlers() {
 
   // 2.6. Clear Error Log API
   server.on("/api/errors/clear", HTTP_POST, []() {
+    if (!requireWebAuth())
+      return;
     ErrorHandler::clearRecentErrors();
     ErrorHandler::logInfo(ERR_CAT_SYSTEM, "Error log cleared via web API",
                           "/api/errors/clear");
     server.send(200, "application/json", "{\"status\":\"cleared\"}");
   });
 
-  // 2.7. Run Unit Tests (Dev Only)
-  server.on("/api/tests/run", HTTP_ANY, []() {
-    if (server.arg("pin") != web_pin) {
-      server.send(401, "text/plain", "Unauthorized");
+  // 2.7. Destructive storage tests (explicit development builds only)
+  server.on("/api/tests/run", HTTP_POST, []() {
+    if (!requireWebAuth())
       return;
-    }
+#if defined(ENABLE_DESTRUCTIVE_STORAGE_TESTS) && ENABLE_DESTRUCTIVE_STORAGE_TESTS
     String results = StorageTests::runTests();
     server.send(200, "text/plain", results);
+#else
+    server.send(403, "text/plain",
+                "Storage tests are disabled in normal firmware builds");
+#endif
   });
 
   // 2.8. detailed heap analysis
   server.on("/api/debug/heap", HTTP_GET, []() {
+    if (!requireWebAuth())
+      return;
     printDetailedMemoryStats();
     server.send(200, "text/plain",
                 "Detailed heap info printed to Serial Console.");
   });
 
   // 3. Remote Control API
-  server.on("/api/control", HTTP_ANY, []() {
+  server.on("/api/control", HTTP_POST, []() {
     String action = server.arg("action");
-
-    // ledpreview doesn't need auth (temporary visual only)
-    if (action != "ledpreview") {
-      // Validate PIN for all other actions
-      if (server.arg("pin") != web_pin) {
-        server.send(401, "text/plain", "Unauthorized");
-        return;
-      }
-    }
+    if (!requireWebAuth())
+      return;
 
     if (action == "random") {
+      lvgl_port_lock(-1);
       selectRandomWithEffect();
+      lvgl_port_unlock();
       server.send(200, "text/plain", "Random selected");
 
     } else if (action == "select") {
@@ -212,7 +473,8 @@ void setupWebHandlers() {
 
       if (id >= 0 && id < getItemCount()) {
         ensureItemDetailsLoaded(id);
-        ItemView item = getItemAt(id);
+        ItemView original = getItemAt(id);
+        ItemView item = original;
         String oldUniqueID = item.uniqueID;
 
         if (server.hasArg("title"))
@@ -229,28 +491,10 @@ void setupWebHandlers() {
           item.uniqueID = server.arg("uniqueID");
 
         if (server.hasArg("ledIndex")) {
-          String lStr = server.arg("ledIndex");
-          lStr.replace(" ", ","); // Fix: Handle space delimiter
-          Serial.printf(">> WEB PARSE LEDs: '%s'\n", lStr.c_str());
-
-          item.ledIndices.clear();
-          while (lStr.length() > 0) {
-            int comma = lStr.indexOf(',');
-            if (comma == -1) {
-              lStr.trim();
-              if (lStr.length() > 0)
-                item.ledIndices.push_back(lStr.toInt());
-              break;
-            } else {
-              String part = lStr.substring(0, comma);
-              part.trim();
-              if (part.length() > 0)
-                item.ledIndices.push_back(part.toInt());
-              lStr = lStr.substring(comma + 1);
-            }
+          if (!parseLedIndices(server.arg("ledIndex"), item.ledIndices)) {
+            server.send(400, "text/plain", "LED positions must be unique numbers within the configured strip");
+            return;
           }
-          if (item.ledIndices.empty())
-            item.ledIndices.push_back(0);
         }
 
         if (server.hasArg("barcode"))
@@ -258,22 +502,18 @@ void setupWebHandlers() {
         if (server.hasArg("notes"))
           item.notes = server.arg("notes");
 
-        Serial.printf(">> WEB SAVE: Title='%s', LEDs=%d\n", item.title.c_str(),
-                      (int)item.ledIndices.size());
-        setItem(id, item);
-        saveLibrary();
+        String validationError;
+        if (!validateWebItem(item, id, validationError)) {
+          server.send(400, "text/plain", validationError);
+          return;
+        }
 
-        // DEEP SAVE: Ensure detail file on SD is also updated with new
-        // LEDs/notes
-        switch (currentMode) {
-        case MODE_CD:
-          Storage.saveCD(cdLibrary[id], oldUniqueID.c_str());
-          break;
-        case MODE_BOOK:
-          Storage.saveBook(bookLibrary[id], oldUniqueID.c_str());
-          break;
-        default:
-          break;
+        setItem(id, item);
+        if (!persistItemAt(id, oldUniqueID)) {
+          setItem(id, original);
+          server.send(500, "text/plain",
+                      "Storage write failed; the in-memory edit was rolled back");
+          return;
         }
 
         if (getCurrentItemIndex() == id) {
@@ -291,40 +531,21 @@ void setupWebHandlers() {
       Serial.printf(">> WEB LED UPDATE: ID %d\n", id);
 
       if (id >= 0 && id < getItemCount()) {
-        ItemView item = getItemAt(id); // Use getItemAt to respect abstraction
-        String lStr = server.arg("leds");
-        lStr.replace(" ", ","); // Fix: Handle space delimiter
-
-        item.ledIndices.clear();
-        while (lStr.length() > 0) {
-          int comma = lStr.indexOf(',');
-          if (comma == -1) {
-            lStr.trim();
-            if (lStr.length() > 0)
-              item.ledIndices.push_back(lStr.toInt());
-            break;
-          } else {
-            String part = lStr.substring(0, comma);
-            part.trim();
-            if (part.length() > 0)
-              item.ledIndices.push_back(part.toInt());
-            lStr = lStr.substring(comma + 1);
-          }
+        ensureItemDetailsLoaded(id);
+        ItemView original = getItemAt(id);
+        ItemView item = original;
+        if (!parseLedIndices(server.arg("leds"), item.ledIndices)) {
+          server.send(400, "text/plain",
+                      "LED positions must be unique numbers within the configured strip");
+          return;
         }
 
         setItem(id, item);
-        saveLibrary();
-
-        // DEEP SAVE
-        switch (currentMode) {
-        case MODE_CD:
-          Storage.saveCD(cdLibrary[id]);
-          break;
-        case MODE_BOOK:
-          Storage.saveBook(bookLibrary[id]);
-          break;
-        default:
-          break;
+        if (!persistItemAt(id, original.uniqueID)) {
+          setItem(id, original);
+          server.send(500, "text/plain",
+                      "Storage write failed; LED positions were rolled back");
+          return;
         }
 
         if (getCurrentItemIndex() == id && edit_item_index == id) {
@@ -358,6 +579,8 @@ void setupWebHandlers() {
 
       // Don't clear - keep current item's LEDs, just overlay preview
       // First, restore current item's LEDs
+      if (ledMutex)
+        xSemaphoreTake(ledMutex, portMAX_DELAY);
       FastLED.clear();
       int curIdx = getCurrentItemIndex();
       if (curIdx >= 0 && curIdx < getItemCount()) {
@@ -389,6 +612,8 @@ void setupWebHandlers() {
       }
 
       FastLED.show();
+      if (ledMutex)
+        xSemaphoreGive(ledMutex);
       if (led_use_wled)
         forceUpdateWLED();
       server.send(200, "text/plain", "Preview OK");
@@ -421,6 +646,10 @@ void setupWebHandlers() {
 
   // LED Selector Web UI
   server.on("/led-select", HTTP_GET, []() {
+    if (!webRequestAuthorized()) {
+      sendWebLoginPage("/led-select?cd=" + server.arg("cd"), "LED selector");
+      return;
+    }
     int cdId = server.arg("cd").toInt();
     if (cdId < 0 || cdId >= getItemCount()) {
       server.send(400, "text/plain", "Invalid CD ID");
@@ -439,7 +668,7 @@ void setupWebHandlers() {
     html += "<meta name='viewport' "
             "content='width=device-width,initial-scale=1,maximum-scale=1,user-"
             "scalable=no'>";
-    html += "<title>LED Selector - " + cd.title + "</title>";
+    html += "<title>LED Selector - " + escapeHTML(cd.title) + "</title>";
     html += "<style>";
     html += "*{margin:0;padding:0;box-sizing:border-box}";
     html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe "
@@ -488,8 +717,8 @@ void setupWebHandlers() {
     html += "</style></head><body>";
 
     html += "<div class='header'>";
-    html += "<div class='cd-info'><div class='cd-title'>" + cd.title +
-            "</div><div class='cd-artist'>" + cd.artistOrAuthor +
+    html += "<div class='cd-info'><div class='cd-title'>" + escapeHTML(cd.title) +
+            "</div><div class='cd-artist'>" + escapeHTML(cd.artistOrAuthor) +
             "</div></div>";
     html += "<div class='actions'>";
     html += "<button class='btn btn-secondary' "
@@ -617,14 +846,16 @@ void setupWebHandlers() {
 
   // 4. Scanner Tool (Full Featured)
   server.on("/scan", HTTP_GET, []() {
-    String pinArg = server.arg("pin");
+    if (!webRequestAuthorized()) {
+      String destination = "/scan";
+      if (server.hasArg("code"))
+        destination += "?code=" + urlEncode(server.arg("code"));
+      sendWebLoginPage(destination, "scanner");
+      return;
+    }
     String codeArg = server.arg("code");
     if (codeArg.length() == 0)
       codeArg = server.arg("barcode");
-
-    // Check authentication server-side
-    bool isAuthenticated = (pinArg == web_pin);
-    String displayAuth = isAuthenticated ? "display:none !important;" : "";
 
     String html = "";
     html += "<!DOCTYPE html>";
@@ -689,7 +920,7 @@ void setupWebHandlers() {
             placeholder +
             "\" required "
             "autocomplete=\"off\" rows=\"5\">" +
-            codeArg + "</textarea>";
+            escapeHTML(codeArg) + "</textarea>";
     html += "            </div>";
     html += "            <button type=\"submit\">Lookup</button>";
     html += "        </form>";
@@ -701,9 +932,6 @@ void setupWebHandlers() {
 
     // Client-side Logic (Main App Only)
     html += "<script>";
-    html += "    const PIN = '" + pinArg + "';";
-    html += "    if(PIN) localStorage.setItem('web_pin', PIN);";
-
     html += "    function processQueue(lines, idx, res, btn) {";
     html += "       if(idx >= lines.length) {";
     html += "           btn.innerText = 'Lookup'; btn.disabled = false;";
@@ -722,9 +950,8 @@ void setupWebHandlers() {
             "'</b>...</div>';";
     html += "       res.prepend(itemDiv);";
     html += "       var xhr = new XMLHttpRequest();";
-    html += "       xhr.open('GET', '/api/lookup?barcode=' + "
-            "encodeURIComponent(code) + '&pin=' + "
-            "localStorage.getItem('web_pin'), true);";
+    html += "       xhr.open('POST', '/api/lookup', true);";
+    html += "       xhr.setRequestHeader('Content-Type','application/x-www-form-urlencoded');";
     html += "       xhr.onload = function() {";
     html += "          if(xhr.status === 409) {";
     html += "             var d = JSON.parse(xhr.responseText);";
@@ -732,9 +959,8 @@ void setupWebHandlers() {
             "${code}:\\n${d.title}\\nby "
             "${d.artist}\\n\\nAdd copy anyway?`)) {";
     html += "                var x2 = new XMLHttpRequest();";
-    html += "                x2.open('GET', '/api/lookup?barcode=' + "
-            "encodeURIComponent(code) + '&pin=' + "
-            "localStorage.getItem('web_pin') + '&force=true', true);";
+    html += "                x2.open('POST', '/api/lookup', true);";
+    html += "                x2.setRequestHeader('Content-Type','application/x-www-form-urlencoded');";
     html += "                x2.onload = function(){ disp(itemDiv, x2, code); "
             "setTimeout(function(){ processQueue(lines, idx+1, res, btn); }, "
             "2000); };";
@@ -742,7 +968,7 @@ void setupWebHandlers() {
             "itemDiv.innerHTML='Error'; setTimeout(function(){ "
             "processQueue(lines, idx+1, res, btn); }, 2000); "
             "};";
-    html += "                x2.send();";
+    html += "                x2.send('barcode='+encodeURIComponent(code)+'&force=true');";
     html += "                return;";
     html += "             } else {";
     html +=
@@ -761,7 +987,7 @@ void setupWebHandlers() {
             "style=\"color:red\">Network Error</div>'; setTimeout(function(){ "
             "processQueue(lines, "
             "idx+1, res, btn); }, 2000); };";
-    html += "       xhr.send();";
+    html += "       xhr.send('barcode='+encodeURIComponent(code));";
     html += "    }";
     html += "    function disp(el, x, code) {";
     html += "       if(x.status === 200) {";
@@ -795,35 +1021,11 @@ void setupWebHandlers() {
     html += "    });";
 
     // Auto-submit if authorized and code present
-    if (isAuthenticated && codeArg.length() > 0) {
+    if (codeArg.length() > 0) {
       html += "    setTimeout(function(){ var e = new Event('submit'); "
               "document.getElementById('scanForm').dispatchEvent(e); }, 300);";
     }
 
-    html += "</script>";
-
-    // Login Overlay
-    html += "<div id='login' "
-            "style='position:fixed;top:0;left:0;width:100%;height:100%;"
-            "background:#000;z-index:9999;display:flex;flex-direction:column;"
-            "align-items:center;justify-content:center;" +
-            displayAuth + "'>";
-    html += "    <h2>Security Check</h2><br>";
-    html += "    <input type='password' id='pin' placeholder='Enter PIN' "
-            "style='width:200px;text-align:center;margin-bottom:10px'>";
-    html += "    <button onclick='sP()' style='width:200px'>Unlock</button>";
-    html += "</div>";
-
-    html += "<script>";
-    html += "function sP(){";
-    html += "  var p = document.getElementById('pin').value;";
-    html += "  localStorage.setItem('web_pin', p);";
-    html += "  location.reload();";
-    html += "}";
-    html += "if(localStorage.getItem('web_pin')) {";
-    html += "  var logDiv = document.getElementById('login');";
-    html += "  if(logDiv) logDiv.style.display='none';";
-    html += "}";
     html += "</script>";
 
     html += "</body></html>";
@@ -832,39 +1034,11 @@ void setupWebHandlers() {
 
   // Manual Cover Link Page
   server.on("/link", HTTP_GET, []() {
-    // 1. Security Check (Standard UI)
-    if (server.arg("pin") != web_pin) {
-      String html =
-          "<!DOCTYPE html><html><head><meta name='viewport' "
-          "content='width=device-width, initial-scale=1'><title>Login</title>";
-      html +=
-          "<style>* { box-sizing: border-box; } "
-          "body{background:#000;color:#fff;font-family:sans-serif;display:flex;"
-          "justify-content:center;align-items:center;height:100vh;margin:0;}";
-      html += ".card{background:#111;padding:30px;border-radius:10px;border:"
-              "1px solid #333;text-align:center;width:90%;max-width:320px;}";
-      html += "input{width:100%;padding:12px;margin:15px "
-              "0;background:#222;border:1px solid "
-              "#444;color:#fff;border-radius:5px;text-align:center;font-size:"
-              "18px;outline:none;}";
-      html += "input:focus{border-color:#00ff88;}";
-      html += "button{width:100%;padding:12px;background:#00ff88;color:#000;"
-              "border:none;border-radius:5px;font-weight:bold;cursor:pointer;"
-              "font-size:16px;text-transform:uppercase;}";
-      html += "</style></head><body>";
-      html += "<div class='card'>";
-      html += "<h2 style='color:#00ff88;margin-top:0'>SECURE LOGIN</h2>";
-      html += "<p style='color:#888;font-size:14px'>Enter PIN to access Cover "
-              "Tool</p>";
-      html += "<form><input type='password' name='pin' placeholder='PIN' "
-              "autofocus>";
-      html += "<button type='submit'>UNLOCK</button></form>";
-      html += "</div></body></html>";
-      server.send(401, "text/html", html);
+    if (!webRequestAuthorized()) {
+      sendWebLoginPage("/link", "cover manager");
       return;
     }
 
-    String pinArg = server.arg("pin");
     String html = "";
     html += "<!DOCTYPE html><html><head>";
     html += "<meta name='viewport' content='width=device-width, "
@@ -917,17 +1091,6 @@ void setupWebHandlers() {
     html += "</div>";
 
     html += "<script>";
-    html += "    const PIN = '" + pinArg + "';"; // Server-injected PIN
-    html += "    if(PIN) localStorage.setItem('web_pin', PIN);";
-
-    html += "    function sP(){ ";
-    html += "        var p = document.getElementById('pin').value;";
-    html += "        localStorage.setItem('web_pin', p);";
-    html += "        var url = new URL(window.location.href);";
-    html += "        url.searchParams.set('pin', p);";
-    html += "        window.location.href = url.toString();";
-    html += "    }";
-
     html += "document.getElementById('linkForm').onsubmit = function(e) {";
     html += "  e.preventDefault();";
     html += "  var url = document.getElementById('url').value.trim();";
@@ -937,11 +1100,9 @@ void setupWebHandlers() {
     html += "  if(url.length < 5 || tid.length < 1) return;";
     html += "  btn.innerText = 'Downloading...'; btn.disabled = true; "
             "res.style.display = 'none';";
-    html += "  var finalUrl = '/api/setcover?url=' + encodeURIComponent(url);";
-    html += "  finalUrl += '&id=' + encodeURIComponent(tid) + '&pin=' + "
-            "localStorage.getItem('web_pin');";
     html += "  var xhr = new XMLHttpRequest();";
-    html += "  xhr.open('GET', finalUrl, true);";
+    html += "  xhr.open('POST', '/api/setcover', true);";
+    html += "  xhr.setRequestHeader('Content-Type','application/x-www-form-urlencoded');";
     html += "  xhr.onload = function() {";
     html += "    btn.innerText = 'Update Cover'; btn.disabled = false; "
             "res.style.display = 'block';";
@@ -959,16 +1120,8 @@ void setupWebHandlers() {
             "xhr.responseText;";
     html += "    }";
     html += "  };";
-    html += "  xhr.send();";
+    html += "  xhr.send('url='+encodeURIComponent(url)+'&id='+encodeURIComponent(tid));";
     html += "};";
-
-    html += "    var savedPin = localStorage.getItem('web_pin');";
-    html += "    if (!PIN && savedPin) {";
-    html += "        if (document.getElementById('login').style.display !== "
-            "'none') {";
-    html += "             window.location.href = '/link?pin=' + savedPin;";
-    html += "        }";
-    html += "    }";
     html += "</script>";
 
     html += getWebFooter();
@@ -978,12 +1131,15 @@ void setupWebHandlers() {
   });
 
   // API to update cover from URL
-  server.on("/api/setcover", HTTP_GET, []() {
-    if (server.arg("pin") != web_pin) {
-      server.send(401, "text/plain", "Unauthorized: Invalid PIN");
+  server.on("/api/setcover", HTTP_POST, []() {
+    if (!requireWebAuth())
+      return;
+    String url = server.arg("url");
+    if (!isSafeRemoteCoverUrl(url)) {
+      server.send(400, "text/plain",
+                  "Cover URL must be a public HTTPS address");
       return;
     }
-    String url = server.arg("url");
     // Auto-resize Apple images to optimal 240x240
     if (url.indexOf("100x100") > 0)
       url.replace("100x100", "240x240");
@@ -1066,11 +1222,9 @@ void setupWebHandlers() {
   });
 
   // 5. Metadata Lookup API (Updated with Duplicate Check)
-  server.on("/api/lookup", HTTP_GET, []() {
-    if (server.arg("pin") != web_pin) {
-      server.send(401, "text/plain", "Unauthorized");
+  server.on("/api/lookup", HTTP_POST, []() {
+    if (!requireWebAuth())
       return;
-    }
     String code = server.arg("barcode");
     bool force = (server.arg("force") == "true");
 
@@ -1108,8 +1262,10 @@ void setupWebHandlers() {
       }
 
       // Add
-      addItemToLibrary(out);
-      saveLibrary();
+      if (!addItemToLibrary(out) || !saveLibrary()) {
+        return server.send(500, "text/plain",
+                           "Metadata was found but could not be saved");
+      }
 
       // Select & Show
       setCurrentItemIndex(getItemCount() - 1);
@@ -1132,9 +1288,10 @@ void setupWebHandlers() {
 
   // 6. Remote Browser (Full Featured)
   server.on("/browse", HTTP_GET, []() {
-    String pinArg = server.arg("pin");
-    bool isAuthenticated = (pinArg == web_pin);
-    String displayAuth = isAuthenticated ? "display:none !important;" : "";
+    if (!webRequestAuthorized()) {
+      sendWebLoginPage("/browse", "remote library");
+      return;
+    }
 
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "text/html; charset=utf-8", ""); // Start chunked transfer
@@ -1298,8 +1455,6 @@ void setupWebHandlers() {
     chunk = "<script>";
     chunk += "window.onerror = function(msg, url, line, col, error) { "
              "alert('JS Error: ' + msg); return false; };";
-    chunk += "const PIN = '" + escapeJSON(pinArg) + "';"; // ESCAPED PIN
-    chunk += "if(PIN) localStorage.setItem('web_pin', PIN);";
     chunk += "const library = [";
     server.sendContent(chunk);
 
@@ -1499,44 +1654,12 @@ void setupWebHandlers() {
 
     // SECURE doAction
     chunk += "function doAction(act, params='') {";
-    chunk += "  var p = localStorage.getItem('web_pin');";
-    chunk += "  if (!p) return;";
-    chunk +=
-        "  fetch('/api/control?pin=' + encodeURIComponent(p) + '&action=' + "
-        "encodeURIComponent(act) + params).then(r=>console.log(r.status));";
+    chunk += "  fetch('/api/control',{method:'POST',headers:{'Content-Type':"
+             "'application/x-www-form-urlencoded'},body:'action='+encodeURIComponent(act)+"
+             "params).then(r=>console.log(r.status));";
     chunk += "}";
 
     chunk += "</script>";
-
-    // Login Overlay
-    chunk += "<div id='login' "
-             "style='position:fixed;top:0;left:0;width:100%;height:100%;"
-             "background:#000;z-index:9999;display:flex;align-items:center;"
-             "justify-content:center;" +
-             displayAuth + "'>";
-    chunk += "<div "
-             "style='background:#111;padding:30px;border-radius:10px;border:"
-             "1px solid #333;text-align:center;width:90%;max-width:320px;'>";
-    chunk += "<h2 style='color:#00ff88;margin-top:0'>SECURE LOGIN</h2>";
-    chunk +=
-        "<p style='color:#888;font-size:14px'>Enter PIN to access Library</p>";
-    chunk += "<input type='password' id='pin' placeholder='PIN' "
-             "style='width:100%;padding:12px;margin:15px "
-             "0;background:#222;border:1px solid "
-             "#444;color:#fff;border-radius:5px;text-align:center;font-size:"
-             "18px;outline:none;' autofocus>";
-    chunk += "<button onclick='sP()' "
-             "style='width:100%;padding:12px;background:#00ff88;color:#000;"
-             "border:none;border-radius:5px;font-weight:bold;cursor:pointer;"
-             "font-size:16px;text-transform:uppercase;'>UNLOCK</button>";
-    chunk += "</div></div>";
-
-    chunk +=
-        "<script>function sP(){ var p = document.getElementById('pin').value; "
-        "localStorage.setItem('web_pin', p); location.reload(); }";
-    chunk += "if(localStorage.getItem('web_pin')) { var logDiv = "
-             "document.getElementById('login'); if(logDiv) "
-             "logDiv.style.display='none'; }</script>";
 
     chunk += getWebFooter();
     chunk += "</body></html>";
@@ -1546,32 +1669,8 @@ void setupWebHandlers() {
 
   // 4. Backup & Restore
   server.on("/backup", HTTP_GET, []() {
-    if (server.arg("pin") != web_pin) {
-      String html =
-          "<!DOCTYPE html><html><head><meta name='viewport' "
-          "content='width=device-width, initial-scale=1'><title>Login</title>";
-      html +=
-          "<style>* { box-sizing: border-box; } "
-          "body{background:#000;color:#fff;font-family:sans-serif;display:flex;"
-          "justify-content:center;align-items:center;height:100vh;margin:0;}";
-      html += ".card{background:#111;padding:30px;border-radius:10px;border:"
-              "1px solid #333;text-align:center;width:90%;max-width:320px;}";
-      html += "input{width:100%;padding:12px;margin:15px "
-              "0;background:#222;border:1px solid "
-              "#444;color:#fff;border-radius:5px;text-align:center;font-size:"
-              "18px;outline:none;}";
-      html += "input:focus{border-color:#00ff88;} "
-              "button{width:100%;padding:12px;background:#00ff88;color:#000;"
-              "border:none;border-radius:5px;font-weight:bold;cursor:pointer;"
-              "font-size:16px;text-transform:uppercase;}";
-      html +=
-          "</style></head><body><div class='card'><h2 "
-          "style='color:#00ff88;margin-top:0'>SECURE LOGIN</h2><p "
-          "style='color:#888;font-size:14px'>Enter PIN to access backups</p>";
-      html += "<form><input type='password' name='pin' placeholder='PIN' "
-              "autofocus><button "
-              "type='submit'>UNLOCK</button></form></div></body></html>";
-      server.send(401, "text/html", html);
+    if (!webRequestAuthorized()) {
+      sendWebLoginPage("/backup", "backup manager");
       return;
     }
 
@@ -1591,8 +1690,7 @@ void setupWebHandlers() {
             "border-radius:10px; margin-bottom:20px;'>";
     html += "<h2>⬇️ Export Library</h2><p style='color:#ccc'>Download all data "
             "as a single .jsonl file (Line-delimited JSON).</p>";
-    html += "<a href='/api/export_backup?pin=" + String(web_pin) +
-            "' download='library_backup.jsonl'><button style='padding:12px "
+    html += "<a href='/api/export_backup' download='library_backup.jsonl'><button style='padding:12px "
             "25px; background:#00ff88; color:#000; border:none; "
             "border-radius:5px; font-weight:bold; cursor:pointer;'>EXPORT "
             "FULL BACKUP</button></a>";
@@ -1603,8 +1701,7 @@ void setupWebHandlers() {
             "border-radius:10px;'>";
     html += "<h2>⬆️ Import Backup</h2><p style='color:#ffaa00'>⚠️ Warning: "
             "Adds/Overwrites items from the backup file.</p>";
-    html += "<form method='POST' action='/api/import_backup?pin=" +
-            String(web_pin) + "' enctype='multipart/form-data'>";
+    html += "<form method='POST' action='/api/import_backup' enctype='multipart/form-data'>";
     html +=
         "<input type='file' name='data' accept='.jsonl' onchange='var "
         "b=document.getElementById(\"btnR\"); b.disabled=!this.files.length; "
@@ -1643,16 +1740,13 @@ void setupWebHandlers() {
 
   // 5. Export Backup (JSONL)
   server.on("/api/export_backup", HTTP_GET, []() {
-    if (server.arg("pin") != web_pin)
-      return server.send(401, "text/plain", "Unauthorized");
+    if (!requireWebAuth())
+      return;
 
     server.sendHeader("Content-Disposition",
                       "attachment; filename=\"library_backup.jsonl\"");
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "application/ndjson", ""); // Newline Delimited JSON
-
-    if (sdExpander)
-      sdExpander->digitalWrite(SD_CS, LOW);
 
     // Export CDs
     for (const auto &item : cdLibrary) {
@@ -1685,7 +1779,7 @@ void setupWebHandlers() {
         if (fullCD.releaseMbid.length() > 0) {
           TrackList *tl = Storage.loadTracklist(fullCD.releaseMbid.c_str());
           if (tl) {
-            DynamicJsonDocument tlDoc(16384); // Larger buffer for tracklist
+            BasicJsonDocument<SpiRamAllocator> tlDoc(65536);
             tlDoc["type"] = "tracklist";
             tlDoc["mbid"] = fullCD.releaseMbid;
             JsonObject tlData = tlDoc.createNestedObject("data");
@@ -1708,8 +1802,10 @@ void setupWebHandlers() {
               lyr["lang"] = t.lyrics.lang.c_str();
             }
             String tlLine;
-            serializeJson(tlDoc, tlLine);
-            server.sendContent(tlLine + "\n");
+            if (!tlDoc.overflowed()) {
+              serializeJson(tlDoc, tlLine);
+              server.sendContent(tlLine + "\n");
+            }
             delete tl;
           }
         }
@@ -1741,8 +1837,6 @@ void setupWebHandlers() {
       }
     }
 
-    if (sdExpander)
-      sdExpander->digitalWrite(SD_CS, HIGH);
     server.sendContent("");
   });
 
@@ -1750,13 +1844,40 @@ void setupWebHandlers() {
   server.on(
       "/api/import_backup", HTTP_POST,
       []() {
+        if (!backupUploadAuthorized || backupUploadFailed ||
+            !webRequestAuthorized()) {
+          if (i2cMutex && xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(1000)) ==
+                              pdPASS) {
+            if (sdExpander)
+              sdExpander->digitalWrite(SD_CS, LOW);
+            if (SD.exists("/restore.jsonl"))
+              SD.remove("/restore.jsonl");
+            if (sdExpander)
+              sdExpander->digitalWrite(SD_CS, HIGH);
+            xSemaphoreGiveRecursive(i2cMutex);
+          }
+          return server.send(backupUploadAuthorized ? 400 : 401, "text/plain",
+                             backupUploadFailed ? "Upload rejected or too large"
+                                                : "Unauthorized");
+        }
+
         // 1. Process the saved file
+        if (!libraryMutex ||
+            xSemaphoreTakeRecursive(libraryMutex, pdMS_TO_TICKS(5000)) != pdPASS)
+          return server.send(503, "text/plain", "Library is busy");
+        if (!i2cMutex ||
+            xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(5000)) != pdPASS) {
+          xSemaphoreGiveRecursive(libraryMutex);
+          return server.send(503, "text/plain", "SD card is busy");
+        }
         if (sdExpander)
           sdExpander->digitalWrite(SD_CS, LOW);
         File file = SD.open("/restore.jsonl", FILE_READ);
         if (!file) {
           if (sdExpander)
             sdExpander->digitalWrite(SD_CS, HIGH);
+          xSemaphoreGiveRecursive(i2cMutex);
+          xSemaphoreGiveRecursive(libraryMutex);
           return server.send(500, "text/plain", "Restore file missing");
         }
 
@@ -1768,9 +1889,12 @@ void setupWebHandlers() {
           line.trim();
           if (line.length() == 0)
             continue;
+          if (line.length() > 65536) {
+            backupUploadFailed = true;
+            continue;
+          }
 
-          DynamicJsonDocument doc(
-              16384); // Unified buffer for both small and large records
+          BasicJsonDocument<SpiRamAllocator> doc(65536);
           DeserializationError error = deserializeJson(doc, line);
           if (!error) {
             String type = doc["type"].as<String>();
@@ -1791,8 +1915,10 @@ void setupWebHandlers() {
               cd.totalDurationMs = data["totalDurationMs"] | 0;
               cd.releaseMbid = (const char *)(data["releaseMbid"] | "");
 
-              Storage.saveCD(cd);
-              importCount++;
+              if (cd.uniqueID.length() > 0 && cd.title.length() > 0 &&
+                  Storage.saveCD(cd)) {
+                importCount++;
+              }
             } else if (type == "tracklist") {
               String mbid = doc["mbid"] | "";
               if (mbid.length() > 0) {
@@ -1818,8 +1944,8 @@ void setupWebHandlers() {
 
                   tl.tracks.push_back(t);
                 }
-                Storage.saveTracklist(mbid.c_str(), &tl);
-                tracklistCount++;
+                if (Storage.saveTracklist(mbid.c_str(), &tl))
+                  tracklistCount++;
               }
             } else if (type == "book") {
               Book book;
@@ -1834,8 +1960,10 @@ void setupWebHandlers() {
               book.isbn = data["isbn"] | "";
               book.pageCount = data["pageCount"] | 0;
               book.publisher = data["publisher"] | "";
-              Storage.saveBook(book);
-              importCount++;
+              if (book.uniqueID.length() > 0 && book.title.length() > 0 &&
+                  Storage.saveBook(book)) {
+                importCount++;
+              }
             }
           }
         }
@@ -1843,6 +1971,12 @@ void setupWebHandlers() {
         SD.remove("/restore.jsonl");
         if (sdExpander)
           sdExpander->digitalWrite(SD_CS, HIGH);
+        xSemaphoreGiveRecursive(i2cMutex);
+        xSemaphoreGiveRecursive(libraryMutex);
+
+        if (backupUploadFailed)
+          return server.send(500, "text/plain",
+                             "Import completed with validation or storage errors");
 
         server.send(200, "text/html",
                     "<html><head><meta http-equiv='refresh' "
@@ -1863,61 +1997,60 @@ void setupWebHandlers() {
         // 2. Upload Handler
         HTTPUpload &upload = server.upload();
         if (upload.status == UPLOAD_FILE_START) {
-          if (server.arg("pin") != web_pin)
+          backupUploadAuthorized = webRequestAuthorized();
+          backupUploadFailed = false;
+          backupUploadBytes = 0;
+          if (!backupUploadAuthorized)
             return;
+          if (!i2cMutex || xSemaphoreTakeRecursive(i2cMutex,
+                                                   pdMS_TO_TICKS(5000)) != pdPASS) {
+            backupUploadFailed = true;
+            return;
+          }
+          backupUploadOwnsSd = true;
           if (sdExpander)
             sdExpander->digitalWrite(SD_CS, LOW);
           if (SD.exists("/restore.jsonl"))
             SD.remove("/restore.jsonl");
           uploadFile = SD.open("/restore.jsonl", FILE_WRITE);
+          if (!uploadFile)
+            backupUploadFailed = true;
         } else if (upload.status == UPLOAD_FILE_WRITE) {
-          if (uploadFile)
-            uploadFile.write(upload.buf, upload.currentSize);
+          if (!backupUploadAuthorized || backupUploadFailed)
+            return;
+          backupUploadBytes += upload.currentSize;
+          if (backupUploadBytes > MAX_BACKUP_UPLOAD_BYTES) {
+            backupUploadFailed = true;
+            if (uploadFile)
+              uploadFile.close();
+            if (SD.exists("/restore.jsonl"))
+              SD.remove("/restore.jsonl");
+            return;
+          }
+          if (!uploadFile ||
+              uploadFile.write(upload.buf, upload.currentSize) !=
+                  upload.currentSize)
+            backupUploadFailed = true;
         } else if (upload.status == UPLOAD_FILE_END) {
           if (uploadFile) {
             uploadFile.flush();
             uploadFile.close();
           }
-          if (sdExpander)
-            sdExpander->digitalWrite(SD_CS, HIGH);
+          releaseBackupUploadSd();
         } else if (upload.status == UPLOAD_FILE_ABORTED) {
+          backupUploadFailed = true;
           if (uploadFile)
             uploadFile.close();
           if (SD.exists("/restore.jsonl"))
             SD.remove("/restore.jsonl");
-          if (sdExpander)
-            sdExpander->digitalWrite(SD_CS, HIGH);
+          releaseBackupUploadSd();
         }
       });
 
   // 3. User Manual
   server.on("/manual", HTTP_GET, []() {
-    if (server.arg("pin") != web_pin) {
-      String html =
-          "<!DOCTYPE html><html><head><meta name='viewport' "
-          "content='width=device-width, initial-scale=1'><title>Login</title>";
-      html +=
-          "<style>* { box-sizing: border-box; } "
-          "body{background:#000;color:#fff;font-family:sans-serif;display:flex;"
-          "justify-content:center;align-items:center;height:100vh;margin:0;}";
-      html += ".card{background:#111;padding:30px;border-radius:10px;border:"
-              "1px solid #333;text-align:center;width:90%;max-width:320px;}";
-      html += "input{width:100%;padding:12px;margin:15px "
-              "0;background:#222;border:1px solid "
-              "#444;color:#fff;border-radius:5px;text-align:center;font-size:"
-              "18px;outline:none;}";
-      html += "input:focus{border-color:#00ff88;} "
-              "button{width:100%;padding:12px;background:#00ff88;color:#000;"
-              "border:none;border-radius:5px;font-weight:bold;cursor:pointer;"
-              "font-size:16px;text-transform:uppercase;}";
-      html +=
-          "</style></head><body><div class='card'><h2 "
-          "style='color:#00ff88;margin-top:0'>SECURE LOGIN</h2><p "
-          "style='color:#888;font-size:14px'>Enter PIN to access Manual</p>";
-      html += "<form><input type='password' name='pin' placeholder='PIN' "
-              "autofocus><button "
-              "type='submit'>UNLOCK</button></form></div></body></html>";
-      server.send(401, "text/html", html);
+    if (!webRequestAuthorized()) {
+      sendWebLoginPage("/manual", "manual");
       return;
     }
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -1981,6 +2114,10 @@ void setupWebHandlers() {
 
   // Error Dashboard Page
   server.on("/errors", HTTP_GET, []() {
+    if (!webRequestAuthorized()) {
+      sendWebLoginPage("/errors", "diagnostics dashboard");
+      return;
+    }
     String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
     html +=
         "<meta name='viewport' content='width=device-width, initial-scale=1'>";
@@ -2148,7 +2285,9 @@ void setupWebHandlers() {
     server.send(200, "text/html", html);
   });
 
-  server.on("/restart", HTTP_GET, []() {
+  server.on("/restart", HTTP_POST, []() {
+    if (!requireWebAuth())
+      return;
     server.send(200, "text/plain", "Rebooting...");
     delay(1000);
     ESP.restart();
@@ -2168,6 +2307,7 @@ void setup() {
 
   libraryMutex = xSemaphoreCreateRecursiveMutex();
   i2cMutex = xSemaphoreCreateRecursiveMutex();
+  ledMutex = xSemaphoreCreateMutex();
 
   // 1. Settings
   loadSettings();
@@ -2314,33 +2454,23 @@ void setup() {
 
   // 4. LEDs
   leds = (CRGB *)malloc(sizeof(CRGB) * led_count);
+  if (!leds) {
+    static CRGB fallbackLed;
+    ErrorHandler::logFatal(ERR_CAT_MEMORY,
+                           "LED buffer allocation failed; using one safe pixel",
+                           "setup");
+    leds = &fallbackLed;
+    led_count = 1;
+  }
   FastLED.addLeds<WS2812B, LED_PIN, COLOR_ORDER>(leds, led_count);
   FastLED.setBrightness(led_brightness);
+  FastLED.setMaxPowerInVoltsAndMilliamps(5, led_max_milliamps);
   FastLED.clear(true);
 
   // 5. Network
   Serial.println("Network Init...");
   AppNetworkManager::init();
-
-  Serial.println("Connecting to WiFi...");
-  if (AppNetworkManager::tryConnectToSavedNetworks()) {
-    Serial.println("WiFi Connected!");
-    Serial.print("IP Address: ");
-    Serial.println(AppNetworkManager::getLocalIP());
-  } else {
-    Serial.println("WiFi Connection Failed - Starting AP...");
-    WiFi.mode(WIFI_AP);
-    delay(100);
-    WiFi.softAP("DigitalLibrarian_Setup", "password");
-    Serial.print("AP IP: ");
-    Serial.println(WiFi.softAPIP());
-  }
-
-  // MDNS
-  Serial.println("MDNS Begin...");
-  if (mdns_name.length() == 0)
-    mdns_name = "digitallibrarian";
-  MDNS.begin(mdns_name.c_str());
+  AppNetworkManager::startConnection();
 
   Serial.println("Web Handlers...");
   setupWebHandlers();
@@ -2373,6 +2503,7 @@ void setup() {
 // ARDUINO LOOP
 // ========================================
 void loop() {
+  AppNetworkManager::serviceConnection();
   server.handleClient();
 
   // Screen Saver Logic
@@ -2389,8 +2520,12 @@ void loop() {
         sdExpander->digitalWrite(LCD_BL, LOW);
       xSemaphoreGiveRecursive(i2cMutex);
     }
+    if (ledMutex)
+      xSemaphoreTake(ledMutex, portMAX_DELAY);
     FastLED.clear();
     FastLED.show();
+    if (ledMutex)
+      xSemaphoreGive(ledMutex);
   } else if (!should_be_off && is_screen_off) {
     Serial.println("☀️ Waking up...");
     is_screen_off = false;

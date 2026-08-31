@@ -1,7 +1,9 @@
 #include "MediaManager.h"
 #include "AppGlobals.h"
 #include "BackgroundWorker.h"
+#include "ErrorHandler.h"
 #include "NavigationCache.h"
+#include "TlsTrust.h"
 #include "mode_abstraction.h"
 #include <FastLED.h>
 #include <esp_heap_caps.h>
@@ -20,6 +22,8 @@ void MediaManager::filter(const char *query, int filterMode, bool ledMasterOn) {
   if (query == nullptr)
     return;
 
+  const uint32_t startedAt = millis();
+
   // Clear and reset results
   search_matches.clear();
   search_display_offset = 0;
@@ -27,13 +31,7 @@ void MediaManager::filter(const char *query, int filterMode, bool ledMasterOn) {
   String q = String(query);
   q.toLowerCase();
 
-  FastLED.clear();
-  if (!ledMasterOn) {
-    FastLED.show();
-  }
-
   if (q.length() == 0) {
-    FastLED.show();
     // UI should trigger initial batch render
     return;
   }
@@ -71,16 +69,12 @@ void MediaManager::filter(const char *query, int filterMode, bool ledMasterOn) {
 
     if (match) {
       search_matches.push_back(i);
-      if (ledMasterOn) {
-        for (int idx : item.ledIndices) {
-          if (idx >= 0 && idx < led_count) {
-            leds[idx] = item.favorite ? COLOR_FAVORITE : COLOR_FILTERED;
-          }
-        }
-      }
     }
   }
-  FastLED.show();
+
+  Serial.printf("[SEARCH] '%s': %d matches in %lu ms\n", query,
+                (int)search_matches.size(),
+                (unsigned long)(millis() - startedAt));
 }
 
 #include "ErrorHandler.h" // Moved here as it's used in this section
@@ -102,7 +96,7 @@ MBRelease MediaManager::fetchReleaseByBarcode(const char *barcode) {
 
   HTTPClient http;
   WiFiClientSecure client;
-  client.setInsecure();
+  configureTrustedTlsClient(client);
   client.setHandshakeTimeout(10000);
 
   String url =
@@ -224,7 +218,7 @@ MBRelease MediaManager::fetchReleaseFromDiscogs(const char *barcode) {
 
   HTTPClient http;
   WiFiClientSecure client;
-  client.setInsecure();
+  configureTrustedTlsClient(client);
   client.setHandshakeTimeout(10000);
 
   // Discogs barcode search endpoint with API token
@@ -325,7 +319,7 @@ std::vector<Track> MediaManager::fetchTracklist(const char *releaseMbid,
 
   HTTPClient http;
   WiFiClientSecure client;
-  client.setInsecure();
+  configureTrustedTlsClient(client);
   client.setHandshakeTimeout(10000);
   client.setTimeout(30000); // 30s TCP timeout (Increase to fix IncompleteInput)
 
@@ -533,7 +527,7 @@ bool MediaManager::fetchBookByISBN(const char *isbn, Book &book) {
 
   HTTPClient http;
   WiFiClientSecure client;
-  client.setInsecure();
+  configureTrustedTlsClient(client);
   // client.setBufferSizes(1024, 512); // Optimize Buffers
 
   String url =
@@ -772,7 +766,12 @@ bool MediaManager::fetchMetadataForBarcode(const char *barcode,
 
   // Only mark as fully loaded if we actually got some meat
   cd.detailsLoaded = (cd.trackCount > 0 || cd.year > 0);
-  Storage.saveCD(cd);
+  if (!Storage.saveCD(cd)) {
+    ErrorHandler::logError(ERR_CAT_STORAGE,
+                           "Could not persist fetched CD metadata",
+                           "MediaManager::fetchMetadataForBarcode");
+    return false;
+  }
 
   // Update outView
   outView.title = cd.title.c_str();
@@ -854,7 +853,12 @@ bool MediaManager::fetchMetadataForISBN(const char *isbn, ItemView &outView) {
   }
 
   book.detailsLoaded = true;
-  Storage.saveBook(book);
+  if (!Storage.saveBook(book)) {
+    ErrorHandler::logError(ERR_CAT_STORAGE,
+                           "Could not persist fetched book metadata",
+                           "MediaManager::fetchMetadataForISBN");
+    return false;
+  }
 
   // Update outView
   outView.title = book.title.c_str();
@@ -883,7 +887,7 @@ String MediaManager::fetchAlbumCoverUrl(const char *artist, const char *album) {
   for (int attempt = 1; attempt <= 2; attempt++) {
     HTTPClient http;
     WiFiClientSecure client;
-    client.setInsecure();
+    configureTrustedTlsClient(client);
     client.setHandshakeTimeout(2000); // Reduced to 2s
     client.setTimeout(5000);          // Read timeout
 
@@ -1034,7 +1038,7 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
     Serial.println("Using Strategy 1: Lyrics.ovh...");
     HTTPClient http;
     WiFiClientSecure client;
-    client.setInsecure();
+    configureTrustedTlsClient(client);
     client.setTimeout(10000);
 
     // Schema: https://api.lyrics.ovh/v1/artist/title
@@ -1074,7 +1078,7 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
     Serial.println("  -> Lyrics.ovh failed, trying LRCLib...");
     HTTPClient http;
     WiFiClientSecure client;
-    client.setInsecure();
+    configureTrustedTlsClient(client);
     client.setHandshakeTimeout(10000);
     client.setTimeout(10000);
 

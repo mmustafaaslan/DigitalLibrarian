@@ -98,7 +98,7 @@ const char *INDEX_HTML_TEMPLATE = R"rawliteral(
     </div>
 
     <div class="card" style="border-color: #331111">
-        <button class="btn-danger" onclick="if(confirm('Reboot device?')) { location.href='/restart'; } return false;">Reboot System</button>
+        <button class="btn-danger" onclick="restartDevice()">Reboot System</button>
     </div>
 
     <div class="card" style="border: 1px solid #1a3a2a;">
@@ -109,12 +109,10 @@ const char *INDEX_HTML_TEMPLATE = R"rawliteral(
     <script>
         function runTests() {
             if(!confirm("Run storage unit tests? This may take a few seconds.")) return;
-            // Assuming web_pin is 'cd1234' or needs to be asked. Ideally we ask user or store it.
-            // For now, we prompt:
             const pin = prompt("Enter Web PIN:", "cd1234");
             if (!pin) return;
             
-            fetch('/api/tests/run?pin=' + encodeURIComponent(pin), {method: 'POST'})
+            fetch('/api/tests/run', {method: 'POST', headers: {'X-Auth-Pin': pin}})
             .then(r => {
                 if(r.status === 401) throw new Error("Unauthorized (Wrong PIN)");
                 return r.text();
@@ -123,6 +121,15 @@ const char *INDEX_HTML_TEMPLATE = R"rawliteral(
                 alert("TEST RESULTS:\n\n" + text);
             })
             .catch(e => alert("Error: " + e));
+        }
+
+        function restartDevice() {
+            if(!confirm('Reboot device?')) return;
+            const pin = prompt('Enter Web PIN:');
+            if(!pin) return;
+            fetch('/restart', {method:'POST', headers:{'X-Auth-Pin':pin}})
+              .then(r => { if(!r.ok) throw new Error(r.status === 401 ? 'Wrong PIN' : 'Reboot failed'); alert('Device is rebooting.'); })
+              .catch(e => alert(e.message));
         }
     </script>
 

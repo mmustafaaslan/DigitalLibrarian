@@ -9,6 +9,141 @@
 
 LibrarianStorage Storage;
 
+namespace {
+class ScopedLibraryAccess {
+public:
+  explicit ScopedLibraryAccess(uint32_t timeoutMs = 5000) : locked(false) {
+    if (!libraryMutex) {
+      locked = true;
+      return;
+    }
+    locked = xSemaphoreTakeRecursive(libraryMutex, pdMS_TO_TICKS(timeoutMs)) ==
+             pdPASS;
+  }
+
+  ~ScopedLibraryAccess() {
+    if (locked && libraryMutex)
+      xSemaphoreGiveRecursive(libraryMutex);
+  }
+
+  explicit operator bool() const { return locked; }
+
+private:
+  bool locked;
+};
+
+class ScopedSdAccess {
+public:
+  explicit ScopedSdAccess(uint32_t timeoutMs = 2000) : locked(false) {
+    if (i2cMutex) {
+      locked = xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(timeoutMs)) ==
+               pdPASS;
+      if (!locked)
+        return;
+    } else {
+      locked = true;
+    }
+
+    if (sdExpander)
+      sdExpander->digitalWrite(SD_CS, LOW);
+  }
+
+  ~ScopedSdAccess() {
+    if (!locked)
+      return;
+    if (sdExpander)
+      sdExpander->digitalWrite(SD_CS, HIGH);
+    if (i2cMutex)
+      xSemaphoreGiveRecursive(i2cMutex);
+  }
+
+  explicit operator bool() const { return locked; }
+
+private:
+  bool locked;
+};
+
+bool replaceFileWithRollback(const String &tmpPath, const String &path,
+                             bool keepBackup = false) {
+  const String backupPath = path + ".bak";
+  if (SD.exists(backupPath) && !SD.remove(backupPath))
+    return false;
+
+  const bool hadOriginal = SD.exists(path);
+  if (hadOriginal && !SD.rename(path, backupPath))
+    return false;
+
+  if (!SD.rename(tmpPath, path)) {
+    if (hadOriginal)
+      SD.rename(backupPath, path);
+    return false;
+  }
+
+  if (!keepBackup && hadOriginal && SD.exists(backupPath))
+    SD.remove(backupPath);
+  return true;
+}
+
+void rollbackReplacedFile(const String &path, bool hadOriginal) {
+  const String backupPath = path + ".bak";
+  if (SD.exists(path))
+    SD.remove(path);
+  if (hadOriginal && SD.exists(backupPath))
+    SD.rename(backupPath, path);
+  else if (SD.exists(backupPath))
+    SD.remove(backupPath);
+}
+
+void finalizeReplacedFile(const String &path) {
+  const String backupPath = path + ".bak";
+  if (SD.exists(backupPath))
+    SD.remove(backupPath);
+}
+
+bool finishJsonWrite(File &file, size_t bytesWritten) {
+  file.flush();
+  const bool ok = bytesWritten > 0 && file.getWriteError() == 0;
+  file.close();
+  return ok;
+}
+
+bool writeIndexTemp(const IndexVector &items, const String &tmpPath) {
+  if (SD.exists(tmpPath) && !SD.remove(tmpPath))
+    return false;
+
+  File file = SD.open(tmpPath, FILE_WRITE);
+  if (!file)
+    return false;
+
+  bool writeOk = true;
+  for (const auto &item : items) {
+    StaticJsonDocument<1024> doc;
+    doc["id"] = item.uniqueID.c_str();
+    doc["t"] = item.title.c_str();
+    doc["a"] = item.artist.c_str();
+    doc["c"] = item.coverFile.c_str();
+    doc["y"] = item.year;
+    doc["g"] = item.genre.c_str();
+    doc["f"] = item.favorite;
+    doc["mi"] = item.metaInt;
+    doc["ms"] = item.metaString.c_str();
+
+    JsonArray leds = doc.createNestedArray("l");
+    for (int val : item.ledIndices)
+      leds.add(val);
+
+    writeOk = serializeJson(doc, file) > 0 && file.println() > 0 && writeOk;
+  }
+
+  file.flush();
+  writeOk = writeOk && file.getWriteError() == 0;
+  file.close();
+  if (!writeOk)
+    SD.remove(tmpPath);
+  return writeOk;
+}
+} // namespace
+
 LibrarianStorage::LibrarianStorage() {
   // Constructor
 }
@@ -72,30 +207,19 @@ IndexVector &LibrarianStorage::getIndex() {
 // --- SAVE (Core Function) ---
 bool LibrarianStorage::saveCD(const CD &cd, const char *oldUniqueID,
                               bool skipIndexRewrite) {
-  if (oldUniqueID && strlen(oldUniqueID) > 0 && cd.uniqueID != oldUniqueID) {
-    String oldPath = getFilePath(oldUniqueID, MODE_CD);
-    if (sdExpander && i2cMutex) {
-      if (xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(1000)) == pdPASS) {
-        sdExpander->digitalWrite(SD_CS, LOW);
-        if (SD.exists(oldPath)) {
-          SD.remove(oldPath);
-          Serial.printf("Storage: Cleaned up old ID file: %s\n",
-                        oldPath.c_str());
-        }
-        sdExpander->digitalWrite(SD_CS, HIGH);
-        xSemaphoreGiveRecursive(i2cMutex);
-      }
-    }
-  }
-
-  if (sdExpander && i2cMutex) {
-    if (xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(1000)) == pdPASS) {
-      sdExpander->digitalWrite(SD_CS, LOW);
-    }
+  ScopedLibraryAccess library(5000);
+  if (!library) {
+    ErrorHandler::logError(ERR_CAT_STORAGE, "Library busy", "Storage::saveCD");
+    return false;
   }
 
   String path = getFilePath(cd.uniqueID.c_str(), MODE_CD);
   String tmpPath = path + ".tmp";
+  ScopedSdAccess sd(2000);
+  if (!sd) {
+    ErrorHandler::logError(ERR_CAT_STORAGE, "SD bus busy", "Storage::saveCD");
+    return false;
+  }
 
   if (SD.exists(tmpPath))
     SD.remove(tmpPath);
@@ -106,8 +230,6 @@ bool LibrarianStorage::saveCD(const CD &cd, const char *oldUniqueID,
     ErrorHandler::logError(
         ERR_CAT_STORAGE, String("Failed to open file for writing: ") + tmpPath,
         "Storage::saveCD");
-    if (sdExpander)
-      sdExpander->digitalWrite(SD_CS, HIGH);
     return false;
   }
 
@@ -135,29 +257,19 @@ bool LibrarianStorage::saveCD(const CD &cd, const char *oldUniqueID,
     leds.add(led);
   }
 
-  serializeJson(doc, file);
-  file.close();
-
-  // ATOMIC SWAP: Remove old file, Rename tmp -> actual
-  if (SD.exists(path)) {
-    SD.remove(path);
-  }
-  if (!SD.rename(tmpPath, path)) {
+  if (!finishJsonWrite(file, serializeJson(doc, file))) {
+    SD.remove(tmpPath);
     ErrorHandler::logError(ERR_CAT_STORAGE,
-                           String("Atomic rename failed: ") + tmpPath + " -> " +
-                               path,
+                           String("Failed while writing: ") + tmpPath,
                            "Storage::saveCD");
+    return false;
   }
 
-  if (sdExpander && i2cMutex) {
-    sdExpander->digitalWrite(SD_CS, HIGH);
-    xSemaphoreGiveRecursive(i2cMutex);
-  }
-
-  // 2. Update Index
+  // 2. Build the proposed index without exposing a partially committed state.
   auto &vec = getVectorForMode(MODE_CD);
+  IndexVector updated = vec;
   bool found = false;
-  for (auto &item : vec) {
+  for (auto &item : updated) {
     if (item.uniqueID == cd.uniqueID.c_str() ||
         (oldUniqueID && strlen(oldUniqueID) > 0 &&
          item.uniqueID == oldUniqueID)) {
@@ -189,52 +301,82 @@ bool LibrarianStorage::saveCD(const CD &cd, const char *oldUniqueID,
     newItem.ledIndices.assign(cd.ledIndices.begin(), cd.ledIndices.end());
     newItem.metaInt = cd.trackCount;
     newItem.metaString = cd.barcode.c_str();
-    vec.push_back(newItem);
+    updated.push_back(newItem);
+  }
+
+  // 3. Keep the previous detail file until the matching index is durable.
+  const bool hadDetail = SD.exists(path);
+  if (!replaceFileWithRollback(tmpPath, path, true)) {
+    ErrorHandler::logError(ERR_CAT_STORAGE,
+                           String("Atomic rename failed: ") + tmpPath + " -> " +
+                               path,
+                           "Storage::saveCD");
+    SD.remove(tmpPath);
+    return false;
+  }
+
+  vec.swap(updated); // updated now contains the previous in-memory index.
+  if (!skipIndexRewrite && !rewriteIndex(MODE_CD)) {
+    vec.swap(updated);
+    rollbackReplacedFile(path, hadDetail);
+    ErrorHandler::logError(ERR_CAT_STORAGE,
+                           "Rolled back CD because index save failed",
+                           "Storage::saveCD");
+    return false;
+  }
+
+  finalizeReplacedFile(path);
+  if (oldUniqueID && strlen(oldUniqueID) > 0 && cd.uniqueID != oldUniqueID) {
+    const String oldPath = getFilePath(oldUniqueID, MODE_CD);
+    if (oldPath != path && SD.exists(oldPath) && !SD.remove(oldPath)) {
+      ErrorHandler::logError(ERR_CAT_STORAGE,
+                             String("Could not remove renamed CD file: ") + oldPath,
+                             "Storage::saveCD");
+    }
   }
 
   if (skipIndexRewrite)
     return true;
-  return rewriteIndex(MODE_CD);
+  return true;
 }
 
 bool LibrarianStorage::updateFavorite(String uniqueID, MediaMode mode,
                                       bool favorite) {
+  ScopedLibraryAccess library(5000);
+  if (!library)
+    return false;
+
   String path = getFilePath(uniqueID, mode);
   String tmpPath = path + ".tmp";
-  bool detailSaved = false;
+  ScopedSdAccess sd(5000);
+  if (!sd)
+    return false;
 
-  if (sdExpander && i2cMutex &&
-      xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(2000)) == pdPASS) {
-    sdExpander->digitalWrite(SD_CS, LOW);
+  File source = SD.open(path, FILE_READ);
+  if (!source)
+    return false;
 
-    File source = SD.open(path, FILE_READ);
-    if (source) {
-      DynamicJsonDocument doc(4096);
-      DeserializationError error = deserializeJson(doc, source);
-      source.close();
+  DynamicJsonDocument doc(4096);
+  DeserializationError error = deserializeJson(doc, source);
+  source.close();
+  if (error)
+    return false;
 
-      if (!error) {
-        doc["favorite"] = favorite;
-        if (SD.exists(tmpPath))
-          SD.remove(tmpPath);
-        File target = SD.open(tmpPath, FILE_WRITE);
-        if (target) {
-          serializeJson(doc, target);
-          target.close();
-          if (SD.exists(path))
-            SD.remove(path);
-          detailSaved = SD.rename(tmpPath, path);
-        }
-      }
-    }
-
-    sdExpander->digitalWrite(SD_CS, HIGH);
-    xSemaphoreGiveRecursive(i2cMutex);
+  doc["favorite"] = favorite;
+  if (SD.exists(tmpPath))
+    SD.remove(tmpPath);
+  File target = SD.open(tmpPath, FILE_WRITE);
+  if (!target)
+    return false;
+  if (!finishJsonWrite(target, serializeJson(doc, target))) {
+    SD.remove(tmpPath);
+    return false;
   }
 
-  bool indexFound = false;
   IndexVector &index = getVectorForMode(mode);
-  for (LibraryIndexItem &item : index) {
+  IndexVector updated = index;
+  bool indexFound = false;
+  for (LibraryIndexItem &item : updated) {
     if (item.uniqueID == uniqueID.c_str()) {
       item.favorite = favorite;
       indexFound = true;
@@ -242,33 +384,44 @@ bool LibrarianStorage::updateFavorite(String uniqueID, MediaMode mode,
     }
   }
 
-  bool indexSaved = indexFound && rewriteIndex(mode);
-  if (!detailSaved)
-    Serial.printf("Storage: Favorite detail update failed for %s\n",
-                  uniqueID.c_str());
-  return detailSaved && indexSaved;
+  if (!indexFound) {
+    SD.remove(tmpPath);
+    return false;
+  }
+
+  const bool hadDetail = SD.exists(path);
+  if (!replaceFileWithRollback(tmpPath, path, true)) {
+    SD.remove(tmpPath);
+    return false;
+  }
+
+  index.swap(updated);
+  if (!rewriteIndex(mode)) {
+    index.swap(updated);
+    rollbackReplacedFile(path, hadDetail);
+    return false;
+  }
+
+  finalizeReplacedFile(path);
+  return true;
 }
 
 // --- LOAD INDEX ---
 bool LibrarianStorage::loadIndex(MediaMode mode) {
-  auto &vec = getVectorForMode(mode);
-  vec.clear();
-  String path = getIndexPath(mode);
+  ScopedLibraryAccess library(5000);
+  if (!library)
+    return false;
 
-  if (sdExpander && i2cMutex) {
-    if (xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(1000)) == pdPASS) {
-      sdExpander->digitalWrite(SD_CS, LOW);
-    }
-  }
+  auto &vec = getVectorForMode(mode);
+  IndexVector loaded;
+  String path = getIndexPath(mode);
+  ScopedSdAccess sd(2000);
+  if (!sd)
+    return false;
   File file = SD.open(path, FILE_READ);
 
-  if (!file) {
-    if (sdExpander && i2cMutex) {
-      sdExpander->digitalWrite(SD_CS, HIGH);
-      xSemaphoreGiveRecursive(i2cMutex);
-    }
+  if (!file)
     return false; // No index yet
-  }
 
   // Read Line-By-Line (JSONL)
   while (file.available()) {
@@ -296,75 +449,63 @@ bool LibrarianStorage::loadIndex(MediaMode mode) {
       for (int val : leds)
         item.ledIndices.push_back(val);
 
-      vec.push_back(item);
+      loaded.push_back(item);
+    } else {
+      ErrorHandler::logError(ERR_CAT_STORAGE,
+                             String("Skipping invalid index row: ") + error.c_str(),
+                             "Storage::loadIndex");
     }
   }
 
   file.close();
-  if (sdExpander && i2cMutex) {
-    sdExpander->digitalWrite(SD_CS, HIGH);
-    xSemaphoreGiveRecursive(i2cMutex);
-  }
+  vec.swap(loaded);
   return true;
 }
 
 // --- REWRITE INDEX FILE ---
 bool LibrarianStorage::rewriteIndex(MediaMode mode) {
+  ScopedLibraryAccess library(5000);
+  if (!library)
+    return false;
+
   auto &vec = getVectorForMode(mode);
   String path = getIndexPath(mode);
   String tmpPath = path + ".tmp";
 
-  if (sdExpander && i2cMutex) {
-    if (xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(5000)) != pdPASS) {
-      return false;
-    }
-    sdExpander->digitalWrite(SD_CS, LOW);
-  }
+  ScopedSdAccess sd(5000);
+  if (!sd)
+    return false;
 
-  if (SD.exists(tmpPath))
+  if (!writeIndexTemp(vec, tmpPath) ||
+      !replaceFileWithRollback(tmpPath, path)) {
     SD.remove(tmpPath);
+    ErrorHandler::logError(ERR_CAT_STORAGE, "Index transaction failed",
+                           "Storage::rewriteIndex");
+    return false;
+  }
+  return true;
+}
 
-  // Write to TMP
-  File file = SD.open(tmpPath, FILE_WRITE);
-  if (!file) {
-    if (sdExpander)
-      sdExpander->digitalWrite(SD_CS, HIGH);
+bool LibrarianStorage::replaceIndex(MediaMode mode, const IndexVector &items) {
+  ScopedLibraryAccess library(5000);
+  if (!library)
+    return false;
+
+  ScopedSdAccess sd(5000);
+  if (!sd)
+    return false;
+
+  const String path = getIndexPath(mode);
+  const String tmpPath = path + ".tmp";
+  if (!writeIndexTemp(items, tmpPath) ||
+      !replaceFileWithRollback(tmpPath, path)) {
+    SD.remove(tmpPath);
+    ErrorHandler::logError(ERR_CAT_STORAGE, "Index replacement failed",
+                           "Storage::replaceIndex");
     return false;
   }
 
-  for (const auto &item : vec) {
-    StaticJsonDocument<1024> doc; // Increased size to prevent truncation
-    doc["id"] = item.uniqueID.c_str();
-    doc["t"] = item.title.c_str();
-    doc["a"] = item.artist.c_str();
-    doc["c"] = item.coverFile.c_str();
-    doc["y"] = item.year;
-    doc["g"] = item.genre.c_str();
-    doc["f"] = item.favorite;
-    doc["mi"] = item.metaInt;
-    doc["ms"] = item.metaString.c_str();
-
-    JsonArray leds = doc.createNestedArray("l");
-    for (int val : item.ledIndices)
-      leds.add(val);
-
-    serializeJson(doc, file);
-    file.println(); // Newline for JSONL
-  }
-
-  file.close();
-
-  // Atomic Swap
-  if (SD.exists(path))
-    SD.remove(path);
-  if (!SD.rename(tmpPath, path)) {
-    Serial.println("Storage: Index Atomic Rename FAILED!");
-  }
-
-  if (sdExpander && i2cMutex) {
-    sdExpander->digitalWrite(SD_CS, HIGH); // DESELECT
-    xSemaphoreGiveRecursive(i2cMutex);
-  }
+  getVectorForMode(mode) = items;
   return true;
 }
 
@@ -372,28 +513,21 @@ bool LibrarianStorage::loadCDDetail(String uniqueID, CD &outCD) {
   String path = getFilePath(uniqueID, MODE_CD);
   Serial.printf("Storage: Loading CD Detail: %s\n", path.c_str());
 
-  if (sdExpander && i2cMutex) {
-    if (xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(2000)) != pdPASS) {
-      Serial.println("!!! I2C LOCK FAIL: loadCDDetail");
-      return false;
-    }
-    sdExpander->digitalWrite(SD_CS, LOW);
-  }
-  File file = SD.open(path, FILE_READ);
-  if (!file) {
-    if (sdExpander && i2cMutex) {
-      sdExpander->digitalWrite(SD_CS, HIGH);
-      xSemaphoreGiveRecursive(i2cMutex);
-    }
+  ScopedSdAccess sd(2000);
+  if (!sd)
     return false;
-  }
+  File file = SD.open(path, FILE_READ);
+  if (!file)
+    return false;
 
   DynamicJsonDocument doc(4096);
-  deserializeJson(doc, file);
+  DeserializationError parseError = deserializeJson(doc, file);
   file.close();
-  if (sdExpander && i2cMutex) {
-    sdExpander->digitalWrite(SD_CS, HIGH);
-    xSemaphoreGiveRecursive(i2cMutex);
+  if (parseError || !doc["title"].is<const char *>()) {
+    ErrorHandler::logError(ERR_CAT_STORAGE,
+                           String("Invalid CD detail JSON: ") + parseError.c_str(),
+                           "Storage::loadCDDetail");
+    return false;
   }
 
   outCD.uniqueID = uniqueID.c_str();
@@ -430,45 +564,25 @@ bool LibrarianStorage::loadCDDetail(String uniqueID, CD &outCD) {
 // --- SAVE BOOK ---
 bool LibrarianStorage::saveBook(const Book &book, const char *oldUniqueID,
                                 bool skipIndexRewrite) {
-  if (oldUniqueID && strlen(oldUniqueID) > 0 && book.uniqueID != oldUniqueID) {
-    String oldPath = getFilePath(oldUniqueID, MODE_BOOK);
-    if (sdExpander && i2cMutex) {
-      if (xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(1000)) == pdPASS) {
-        sdExpander->digitalWrite(SD_CS, LOW);
-        if (SD.exists(oldPath)) {
-          SD.remove(oldPath);
-          Serial.printf("Storage: Cleaned up old ID file: %s\n",
-                        oldPath.c_str());
-        }
-        sdExpander->digitalWrite(SD_CS, HIGH);
-        xSemaphoreGiveRecursive(i2cMutex);
-      }
-    }
-  }
-
-  if (sdExpander && i2cMutex) {
-    if (xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(2000)) != pdPASS) {
-      Serial.println("!!! I2C LOCK FAIL: saveBook");
-      return false;
-    }
-    sdExpander->digitalWrite(SD_CS, LOW);
+  ScopedLibraryAccess library(5000);
+  if (!library) {
+    ErrorHandler::logError(ERR_CAT_STORAGE, "Library busy", "Storage::saveBook");
+    return false;
   }
 
   String path = getFilePath(book.uniqueID.c_str(), MODE_BOOK);
   String tmpPath = path + ".tmp";
+  ScopedSdAccess sd(2000);
+  if (!sd)
+    return false;
 
   if (SD.exists(tmpPath))
     SD.remove(tmpPath);
 
   // 1. Save Detail JSON to TMP
   File file = SD.open(tmpPath, FILE_WRITE);
-  if (!file) {
-    if (sdExpander && i2cMutex) {
-      sdExpander->digitalWrite(SD_CS, HIGH);
-      xSemaphoreGiveRecursive(i2cMutex);
-    }
+  if (!file)
     return false;
-  }
 
   DynamicJsonDocument doc(4096);
   doc["title"] = book.title.c_str();
@@ -492,26 +606,18 @@ bool LibrarianStorage::saveBook(const Book &book, const char *oldUniqueID,
     leds.add(led);
   }
 
-  serializeJson(doc, file);
-  file.close();
-
-  // ATOMIC SWAP: Remove old file, Rename tmp -> actual
-  if (SD.exists(path)) {
-    SD.remove(path);
-  }
-  if (!SD.rename(tmpPath, path)) {
-    Serial.println("Storage: Atomic Rename FAILED (Book)!");
+  if (!finishJsonWrite(file, serializeJson(doc, file))) {
+    SD.remove(tmpPath);
+    ErrorHandler::logError(ERR_CAT_STORAGE, "Book transaction failed",
+                           "Storage::saveBook");
+    return false;
   }
 
-  if (sdExpander && i2cMutex) {
-    sdExpander->digitalWrite(SD_CS, HIGH);
-    xSemaphoreGiveRecursive(i2cMutex);
-  }
-
-  // 2. Update Index (RAM)
+  // 2. Build the proposed index without exposing a partial update.
   auto &vec = getVectorForMode(MODE_BOOK);
+  IndexVector updated = vec;
   bool found = false;
-  for (auto &item : vec) {
+  for (auto &item : updated) {
     if (item.uniqueID == book.uniqueID.c_str() ||
         (oldUniqueID && strlen(oldUniqueID) > 0 &&
          item.uniqueID == oldUniqueID)) {
@@ -542,12 +648,40 @@ bool LibrarianStorage::saveBook(const Book &book, const char *oldUniqueID,
     newItem.ledIndices.assign(book.ledIndices.begin(), book.ledIndices.end());
     newItem.metaInt = book.pageCount;       // NEW: Page Count
     newItem.metaString = book.isbn.c_str(); // NEW: ISBN
-    vec.push_back(newItem);
+    updated.push_back(newItem);
+  }
+
+  const bool hadDetail = SD.exists(path);
+  if (!replaceFileWithRollback(tmpPath, path, true)) {
+    SD.remove(tmpPath);
+    ErrorHandler::logError(ERR_CAT_STORAGE, "Book detail commit failed",
+                           "Storage::saveBook");
+    return false;
+  }
+
+  vec.swap(updated);
+  if (!skipIndexRewrite && !rewriteIndex(MODE_BOOK)) {
+    vec.swap(updated);
+    rollbackReplacedFile(path, hadDetail);
+    ErrorHandler::logError(ERR_CAT_STORAGE,
+                           "Rolled back book because index save failed",
+                           "Storage::saveBook");
+    return false;
+  }
+
+  finalizeReplacedFile(path);
+  if (oldUniqueID && strlen(oldUniqueID) > 0 && book.uniqueID != oldUniqueID) {
+    const String oldPath = getFilePath(oldUniqueID, MODE_BOOK);
+    if (oldPath != path && SD.exists(oldPath) && !SD.remove(oldPath)) {
+      ErrorHandler::logError(ERR_CAT_STORAGE,
+                             String("Could not remove renamed book file: ") + oldPath,
+                             "Storage::saveBook");
+    }
   }
 
   if (skipIndexRewrite)
     return true;
-  return rewriteIndex(MODE_BOOK);
+  return true;
 }
 
 // --- LOAD BOOK DETAIL ---
@@ -555,28 +689,21 @@ bool LibrarianStorage::loadBookDetail(String uniqueID, Book &outBook) {
   String path = getFilePath(uniqueID, MODE_BOOK);
   Serial.printf("Storage: Loading Book Detail: %s\n", path.c_str());
 
-  if (sdExpander && i2cMutex) {
-    if (xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(2000)) != pdPASS) {
-      Serial.println("!!! I2C LOCK FAIL: loadBookDetail");
-      return false;
-    }
-    sdExpander->digitalWrite(SD_CS, LOW);
-  }
-  File file = SD.open(path, FILE_READ);
-  if (!file) {
-    if (sdExpander && i2cMutex) {
-      sdExpander->digitalWrite(SD_CS, HIGH);
-      xSemaphoreGiveRecursive(i2cMutex);
-    }
+  ScopedSdAccess sd(2000);
+  if (!sd)
     return false;
-  }
+  File file = SD.open(path, FILE_READ);
+  if (!file)
+    return false;
 
   DynamicJsonDocument doc(4096);
-  deserializeJson(doc, file);
+  DeserializationError parseError = deserializeJson(doc, file);
   file.close();
-  if (sdExpander && i2cMutex) {
-    sdExpander->digitalWrite(SD_CS, HIGH);
-    xSemaphoreGiveRecursive(i2cMutex);
+  if (parseError || !doc["title"].is<const char *>()) {
+    ErrorHandler::logError(ERR_CAT_STORAGE,
+                           String("Invalid book detail JSON: ") + parseError.c_str(),
+                           "Storage::loadBookDetail");
+    return false;
   }
 
   outBook.uniqueID = uniqueID.c_str();
@@ -611,40 +738,58 @@ bool LibrarianStorage::loadBookDetail(String uniqueID, Book &outBook) {
 // Stub for delete (can implement later)
 // --- DELETE ITEM ---
 bool LibrarianStorage::deleteItem(String uniqueID, MediaMode mode) {
+  ScopedLibraryAccess library(5000);
+  if (!library)
+    return false;
+
   String path = getFilePath(uniqueID, mode);
+  String deleteBackup = path + ".delete.bak";
   Serial.printf("Storage: Deleting %s\n", path.c_str());
 
-  if (i2cMutex &&
-      xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(1000)) == pdPASS) {
-    if (sdExpander)
-      sdExpander->digitalWrite(SD_CS, LOW);
-
-    if (SD.exists(path)) {
-      SD.remove(path);
-    } else {
-      Serial.println("Storage: File not found (might already be deleted). "
-                     "Continuing to remove from index.");
-    }
-
-    if (sdExpander)
-      sdExpander->digitalWrite(SD_CS, HIGH);
-    xSemaphoreGiveRecursive(i2cMutex);
-  }
-
-  // Remove from RAM Index
+  ScopedSdAccess sd(2000);
+  if (!sd)
+    return false;
   auto &vec = getVectorForMode(mode);
-  for (auto it = vec.begin(); it != vec.end(); ++it) {
+  IndexVector updated = vec;
+  bool found = false;
+  for (auto it = updated.begin(); it != updated.end(); ++it) {
     if (it->uniqueID == uniqueID.c_str()) {
-      vec.erase(it);
+      updated.erase(it);
+      found = true;
       break;
     }
   }
+  if (!found)
+    return false;
 
-  // Persist Index Update
-  return rewriteIndex(mode);
+  if (SD.exists(deleteBackup) && !SD.remove(deleteBackup))
+    return false;
+  const bool hadDetail = SD.exists(path);
+  if (hadDetail && !SD.rename(path, deleteBackup))
+    return false;
+
+  vec.swap(updated);
+  if (!rewriteIndex(mode)) {
+    vec.swap(updated);
+    if (hadDetail && SD.exists(deleteBackup))
+      SD.rename(deleteBackup, path);
+    return false;
+  }
+
+  if (SD.exists(deleteBackup) && !SD.remove(deleteBackup)) {
+    ErrorHandler::logError(ERR_CAT_STORAGE,
+                           String("Could not remove deleted item backup: ") +
+                               deleteBackup,
+                           "Storage::deleteItem");
+  }
+  return true;
 }
 
 bool LibrarianStorage::wipeLibrary(MediaMode mode) {
+  ScopedLibraryAccess library(5000);
+  if (!library)
+    return false;
+
   String indexFile;
   String dataDir;
 
@@ -658,12 +803,9 @@ bool LibrarianStorage::wipeLibrary(MediaMode mode) {
 
   Serial.printf("⚠️ Wiping Library Data: %s\n", dataDir.c_str());
 
-  if (sdExpander && i2cMutex) {
-    if (xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(5000)) != pdPASS) {
-      return false;
-    }
-    sdExpander->digitalWrite(SD_CS, LOW);
-  }
+  ScopedSdAccess sd(5000);
+  if (!sd)
+    return false;
 
   // 1. Delete Index File
   if (SD.exists(indexFile)) {
@@ -700,11 +842,6 @@ bool LibrarianStorage::wipeLibrary(MediaMode mode) {
       dir.close();
   }
 
-  if (sdExpander && i2cMutex) {
-    sdExpander->digitalWrite(SD_CS, HIGH);
-    xSemaphoreGiveRecursive(i2cMutex);
-  }
-
   // 3. Clear RAM Index
   getVectorForMode(mode).clear();
 
@@ -721,23 +858,14 @@ TrackList *LibrarianStorage::loadTracklist(const char *releaseMbid) {
     return nullptr;
   }
 
-  String filename = "/tracks/" + String(releaseMbid) + ".json";
-
-  if (sdExpander && i2cMutex) {
-    if (xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(1000)) != pdPASS) {
-      return nullptr;
-    }
-    sdExpander->digitalWrite(SD_CS, LOW);
-  }
+  String filename = "/tracks/" + sanitizeFilename(String(releaseMbid)) + ".json";
+  ScopedSdAccess sd(2000);
+  if (!sd)
+    return nullptr;
 
   File file = SD.open(filename, FILE_READ);
-  if (!file) {
-    if (sdExpander && i2cMutex) {
-      sdExpander->digitalWrite(SD_CS, HIGH);
-      xSemaphoreGiveRecursive(i2cMutex);
-    }
+  if (!file)
     return nullptr;
-  }
 
   // Use PSRAM for the large JSON buffer (64KB)
   // Converting 'file' to 'stream' avoids loading the whole string into Internal
@@ -745,11 +873,6 @@ TrackList *LibrarianStorage::loadTracklist(const char *releaseMbid) {
   BasicJsonDocument<SpiRamAllocator> doc(65536);
   DeserializationError error = deserializeJson(doc, file);
   file.close();
-
-  if (sdExpander && i2cMutex) {
-    sdExpander->digitalWrite(SD_CS, HIGH);
-    xSemaphoreGiveRecursive(i2cMutex);
-  }
 
   if (error) {
     Serial.printf("Storage: Tracklist JSON Error: %s\n", error.c_str());
@@ -799,31 +922,22 @@ bool LibrarianStorage::saveTracklist(const char *releaseMbid,
   if (!trackList || !releaseMbid)
     return false;
 
-  bool mutexTaken = false;
-  if (sdExpander && i2cMutex) {
-    if (xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(2000)) == pdPASS) {
-      sdExpander->digitalWrite(SD_CS, LOW);
-      mutexTaken = true;
-    }
-  }
+  ScopedSdAccess sd(3000);
+  if (!sd)
+    return false;
 
   if (!SD.exists("/tracks")) {
     SD.mkdir("/tracks");
   }
 
-  String filename = "/tracks/" + String(releaseMbid) + ".json";
-  if (SD.exists(filename)) {
-    SD.remove(filename);
-  }
+  String filename = "/tracks/" + sanitizeFilename(String(releaseMbid)) + ".json";
+  String tmpPath = filename + ".tmp";
+  if (SD.exists(tmpPath))
+    SD.remove(tmpPath);
 
-  File file = SD.open(filename, FILE_WRITE);
-  if (!file) {
-    if (sdExpander && i2cMutex && mutexTaken) {
-      sdExpander->digitalWrite(SD_CS, HIGH);
-      xSemaphoreGiveRecursive(i2cMutex);
-    }
+  File file = SD.open(tmpPath, FILE_WRITE);
+  if (!file)
     return false;
-  }
 
   // Stream JSON directly to file to save Heap
   file.print("{");
@@ -867,13 +981,16 @@ bool LibrarianStorage::saveTracklist(const char *releaseMbid,
     file.print("}");
   }
   file.print("]}");
+  file.flush();
+  const bool writeOk = file.getWriteError() == 0 && file.size() > 0;
   file.close();
 
-  if (sdExpander && i2cMutex && mutexTaken) {
-    sdExpander->digitalWrite(SD_CS, HIGH);
-    xSemaphoreGiveRecursive(i2cMutex);
+  if (!writeOk || !replaceFileWithRollback(tmpPath, filename)) {
+    SD.remove(tmpPath);
+    ErrorHandler::logError(ERR_CAT_STORAGE, "Tracklist transaction failed",
+                           "Storage::saveTracklist");
+    return false;
   }
-
   return true;
 }
 
@@ -903,31 +1020,24 @@ String LibrarianStorage::loadLyrics(const char *lyricsPath) {
     path = "/lyrics/" + path;
   }
 
-  String content = "";
-  if (sdExpander && i2cMutex) {
-    if (xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(2000)) == pdPASS) {
-      sdExpander->digitalWrite(SD_CS, LOW);
-      if (SD.exists(path)) {
-        File file = SD.open(path, FILE_READ);
-        if (file) {
-          content = file.readString();
-          file.close();
-        }
-      } else {
-        // Try root fallback
-        if (path.startsWith("/lyrics/")) {
-          String rootPath = "/" + String(lyricsPath);
-          if (SD.exists(rootPath)) {
-            File file = SD.open(rootPath, FILE_READ);
-            if (file) {
-              content = file.readString();
-              file.close();
-            }
-          }
-        }
+  String content;
+  ScopedSdAccess sd(2000);
+  if (!sd)
+    return "";
+  if (SD.exists(path)) {
+    File file = SD.open(path, FILE_READ);
+    if (file) {
+      content = file.readString();
+      file.close();
+    }
+  } else if (path.startsWith("/lyrics/")) {
+    String rootPath = "/" + String(lyricsPath);
+    if (SD.exists(rootPath)) {
+      File file = SD.open(rootPath, FILE_READ);
+      if (file) {
+        content = file.readString();
+        file.close();
       }
-      sdExpander->digitalWrite(SD_CS, HIGH);
-      xSemaphoreGiveRecursive(i2cMutex);
     }
   }
 
@@ -957,43 +1067,24 @@ bool LibrarianStorage::saveLyrics(const char *lyricsPath, String lyricsText,
     path = "/lyrics/" + path;
   }
 
+  ScopedSdAccess sd(3000);
+  if (!sd)
+    return false;
+
   // Create directory if needed
   int lastSlash = path.lastIndexOf('/');
   if (lastSlash > 0) {
     String dir = path.substring(0, lastSlash);
-    if (sdExpander && i2cMutex) {
-      if (xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(2000)) == pdPASS) {
-        sdExpander->digitalWrite(SD_CS, LOW);
-        if (!SD.exists(dir)) {
-          SD.mkdir(dir);
-        }
-        sdExpander->digitalWrite(SD_CS, HIGH);
-        xSemaphoreGiveRecursive(i2cMutex);
-      }
-    }
+    if (!SD.exists(dir) && !SD.mkdir(dir))
+      return false;
   }
 
-  if (sdExpander && i2cMutex) {
-    if (xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(2000)) == pdPASS) {
-      sdExpander->digitalWrite(SD_CS, LOW);
-    }
-  }
-
-  // Use O_TRUNC equivalent by using FILE_WRITE which on ESP32 SD usually
-  // appends? No, SD lib wrapper usually seeks to end. Best to remove file first
-  // to ensure clean write.
-  if (SD.exists(path)) {
-    SD.remove(path);
-  }
-
-  File file = SD.open(path, FILE_WRITE);
-  if (!file) {
-    if (sdExpander && i2cMutex) {
-      sdExpander->digitalWrite(SD_CS, HIGH);
-      xSemaphoreGiveRecursive(i2cMutex);
-    }
+  String tmpPath = path + ".tmp";
+  if (SD.exists(tmpPath))
+    SD.remove(tmpPath);
+  File file = SD.open(tmpPath, FILE_WRITE);
+  if (!file)
     return false;
-  }
 
   DynamicJsonDocument doc(16384);
   doc["lang"] = lang;
@@ -1003,13 +1094,12 @@ bool LibrarianStorage::saveLyrics(const char *lyricsPath, String lyricsText,
   decodeHTMLEntities(cleanLyrics);
   doc["text"] = sanitizeText(cleanLyrics);
 
-  serializeJson(doc, file);
-  file.close();
-
-  if (sdExpander && i2cMutex) {
-    sdExpander->digitalWrite(SD_CS, HIGH);
-    xSemaphoreGiveRecursive(i2cMutex);
+  if (!finishJsonWrite(file, serializeJson(doc, file)) ||
+      !replaceFileWithRollback(tmpPath, path)) {
+    SD.remove(tmpPath);
+    ErrorHandler::logError(ERR_CAT_STORAGE, "Lyrics transaction failed",
+                           "Storage::saveLyrics");
+    return false;
   }
-
   return true;
 }

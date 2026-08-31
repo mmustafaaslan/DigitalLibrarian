@@ -8,10 +8,17 @@
 // Static member initialization
 std::vector<ErrorRecord> ErrorHandler::recentErrors;
 bool ErrorHandler::sdLoggingEnabled = true;
+SemaphoreHandle_t ErrorHandler::errorsMutex = nullptr;
 
 void ErrorHandler::init() {
+  if (!errorsMutex)
+    errorsMutex = xSemaphoreCreateMutex();
+  if (errorsMutex)
+    xSemaphoreTake(errorsMutex, portMAX_DELAY);
   recentErrors.clear();
   recentErrors.reserve(MAX_RECENT_ERRORS);
+  if (errorsMutex)
+    xSemaphoreGive(errorsMutex);
   logInfo(ERR_CAT_SYSTEM, "ErrorHandler initialized", "ErrorHandler::init");
 }
 
@@ -62,10 +69,13 @@ void ErrorHandler::log(ErrorLevel level, ErrorCategory category,
   error.context = context;
 
   // Add to recent errors (keep only last N)
-  if (recentErrors.size() >= MAX_RECENT_ERRORS) {
+  if (errorsMutex)
+    xSemaphoreTake(errorsMutex, portMAX_DELAY);
+  if (recentErrors.size() >= MAX_RECENT_ERRORS)
     recentErrors.erase(recentErrors.begin());
-  }
   recentErrors.push_back(error);
+  if (errorsMutex)
+    xSemaphoreGive(errorsMutex);
 
   // Serial output
   Serial.printf("[%s][%s] %s", levelToString(level).c_str(),
@@ -89,10 +99,12 @@ void ErrorHandler::log(ErrorLevel level, ErrorCategory category,
 }
 
 void ErrorHandler::writeToSD(const ErrorRecord &error) {
-  if (!sdExpander)
+  if (!i2cMutex ||
+      xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(500)) != pdPASS)
     return;
 
-  sdExpander->digitalWrite(SD_CS, LOW);
+  if (sdExpander)
+    sdExpander->digitalWrite(SD_CS, LOW);
 
   // Ensure logs directory exists
   if (!SD.exists("/logs")) {
@@ -113,7 +125,9 @@ void ErrorHandler::writeToSD(const ErrorRecord &error) {
     logFile.close();
   }
 
-  sdExpander->digitalWrite(SD_CS, HIGH);
+  if (sdExpander)
+    sdExpander->digitalWrite(SD_CS, HIGH);
+  xSemaphoreGiveRecursive(i2cMutex);
 }
 
 void ErrorHandler::logInfo(ErrorCategory category, const String &message,
@@ -138,8 +152,6 @@ void ErrorHandler::logFatal(ErrorCategory category, const String &message,
 
 void ErrorHandler::checkMemory(const String &context) {
   uint32_t freeHeap = ESP.getFreeHeap();
-  uint32_t minFreeHeap = ESP.getMinFreeHeap();
-
   // Log if memory is getting low (< 50KB free)
   if (freeHeap < 50000) {
     logWarn(ERR_CAT_MEMORY,
@@ -156,10 +168,22 @@ void ErrorHandler::checkMemory(const String &context) {
 
 bool ErrorHandler::isMemoryLow() { return ESP.getFreeHeap() < 50000; }
 
-const std::vector<ErrorRecord> &ErrorHandler::getRecentErrors() {
-  return recentErrors;
+std::vector<ErrorRecord> ErrorHandler::getRecentErrors() {
+  std::vector<ErrorRecord> snapshot;
+  if (errorsMutex)
+    xSemaphoreTake(errorsMutex, portMAX_DELAY);
+  snapshot = recentErrors;
+  if (errorsMutex)
+    xSemaphoreGive(errorsMutex);
+  return snapshot;
 }
 
-void ErrorHandler::clearRecentErrors() { recentErrors.clear(); }
+void ErrorHandler::clearRecentErrors() {
+  if (errorsMutex)
+    xSemaphoreTake(errorsMutex, portMAX_DELAY);
+  recentErrors.clear();
+  if (errorsMutex)
+    xSemaphoreGive(errorsMutex);
+}
 
 void ErrorHandler::enableSDLogging(bool enable) { sdLoggingEnabled = enable; }

@@ -18,6 +18,7 @@
 // Static members
 std::queue<BackgroundJob> BackgroundWorker::_jobQueue;
 SemaphoreHandle_t BackgroundWorker::_queueMutex = NULL;
+TaskHandle_t BackgroundWorker::_taskHandle = NULL;
 bool BackgroundWorker::_busy = false;
 bool BackgroundWorker::_showProgress = false;
 String BackgroundWorker::_statusMsg = "Idle";
@@ -25,29 +26,117 @@ float BackgroundWorker::_progress = 0.0f;
 int BackgroundWorker::_totalJobs = 0;
 
 void BackgroundWorker::begin() {
+  if (_taskHandle)
+    return;
+
   if (_queueMutex == NULL) {
     _queueMutex = xSemaphoreCreateMutex();
   }
-  // Background task on Core 1 (Same as UI/Main Loop) to avoid Core 0
-  // System/WiFi contention Increase stack to 32KB for heavy network/JSON
-  // operations
-  xTaskCreatePinnedToCore(workerTask, "BG_Worker", 32768, NULL, 1, NULL, 1);
+  if (!_queueMutex) {
+    ErrorHandler::logError(ERR_CAT_SYSTEM,
+                           "Could not allocate background queue mutex",
+                           "BackgroundWorker::begin");
+    return;
+  }
+
+  // Let FreeRTOS schedule the worker away from whichever core is currently
+  // busiest. This prevents long network/JSON work from being permanently tied
+  // to the LVGL loop core.
+  const BaseType_t created =
+      xTaskCreate(workerTask, "BG_Worker", 32768, NULL, 1, &_taskHandle);
+  if (created != pdPASS) {
+    _taskHandle = NULL;
+    vSemaphoreDelete(_queueMutex);
+    _queueMutex = NULL;
+    ErrorHandler::logError(ERR_CAT_SYSTEM,
+                           "Could not create background worker task",
+                           "BackgroundWorker::begin");
+  }
 }
 
-void BackgroundWorker::addJob(BackgroundJob job) {
-  if (xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(100))) {
-    _jobQueue.push(job);
+bool BackgroundWorker::addJob(const BackgroundJob &job) {
+  if (!_queueMutex ||
+      xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(100)) != pdTRUE)
+    return false;
+
+  std::queue<BackgroundJob> copy = _jobQueue;
+  while (!copy.empty()) {
+    const BackgroundJob &queued = copy.front();
+    if (queued.type == job.type && queued.id == job.id &&
+        queued.index == job.index) {
+      xSemaphoreGive(_queueMutex);
+      return true;
+    }
+    copy.pop();
+  }
+  if (_jobQueue.size() >= 16) {
+    xSemaphoreGive(_queueMutex);
+    ErrorHandler::logWarn(ERR_CAT_SYSTEM, "Background queue full",
+                          "BackgroundWorker::addJob");
+    return false;
+  }
+  _jobQueue.push(job);
+  xSemaphoreGive(_queueMutex);
+  return true;
+}
+
+bool BackgroundWorker::isBusy() {
+  if (!_queueMutex || xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    return true;
+  const bool value = _busy;
+  xSemaphoreGive(_queueMutex);
+  return value;
+}
+bool BackgroundWorker::shouldShowProgress() {
+  if (!_queueMutex || xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    return false;
+  const bool value = _busy && _showProgress;
+  xSemaphoreGive(_queueMutex);
+  return value;
+}
+int BackgroundWorker::getQueueSize() {
+  if (!_queueMutex || xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    return 0;
+  const int value = (int)_jobQueue.size();
+  xSemaphoreGive(_queueMutex);
+  return value;
+}
+String BackgroundWorker::getStatusMessage() {
+  if (!_queueMutex || xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    return "Working...";
+  const String value = _statusMsg;
+  xSemaphoreGive(_queueMutex);
+  return value;
+}
+float BackgroundWorker::getProgress() {
+  if (!_queueMutex || xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    return 0.0f;
+  const float value = _progress;
+  xSemaphoreGive(_queueMutex);
+  return value;
+}
+
+void BackgroundWorker::setStatus(const String &message) {
+  if (_queueMutex && xSemaphoreTake(_queueMutex, portMAX_DELAY) == pdTRUE) {
+    _statusMsg = message;
     xSemaphoreGive(_queueMutex);
   }
 }
 
-bool BackgroundWorker::isBusy() { return _busy; }
-bool BackgroundWorker::shouldShowProgress() {
-  return _busy && _showProgress;
+void BackgroundWorker::setProgress(float progress) {
+  if (_queueMutex && xSemaphoreTake(_queueMutex, portMAX_DELAY) == pdTRUE) {
+    _progress = constrain(progress, 0.0f, 1.0f);
+    xSemaphoreGive(_queueMutex);
+  }
 }
-int BackgroundWorker::getQueueSize() { return (int)_jobQueue.size(); }
-String BackgroundWorker::getStatusMessage() { return _statusMsg; }
-float BackgroundWorker::getProgress() { return _progress; }
+
+void BackgroundWorker::setBusyState(bool busy, bool showProgress) {
+  if (_queueMutex && xSemaphoreTake(_queueMutex, portMAX_DELAY) == pdTRUE) {
+    _busy = busy;
+    _showProgress = showProgress;
+    xSemaphoreGive(_queueMutex);
+  }
+}
 
 void BackgroundWorker::workerTask(void *pvParameters) {
   while (true) {
@@ -59,7 +148,6 @@ void BackgroundWorker::workerTask(void *pvParameters) {
         currentJob = _jobQueue.front();
         _jobQueue.pop();
         hasJob = true;
-        _totalJobs = getItemCount(); // Current total
         _busy = true;
         _showProgress = currentJob.showProgress;
       } else {
@@ -75,7 +163,7 @@ void BackgroundWorker::workerTask(void *pvParameters) {
 
       switch (currentJob.type) {
       case JOB_METADATA_LOOKUP: {
-        _statusMsg = "Looking up " + currentJob.id;
+        setStatus("Looking up " + currentJob.id);
         ItemView staged;
         success = MediaManager::fetchMetadataForBarcode(currentJob.id.c_str(),
                                                         staged);
@@ -88,6 +176,7 @@ void BackgroundWorker::workerTask(void *pvParameters) {
         is_sync_stopping = false;
         int total = getItemCount();
         int downloadedCount = 0;
+        bool persistenceFailed = false;
 
         for (int i = 0; i < total; i++) {
           if (is_sync_stopping) {
@@ -95,7 +184,7 @@ void BackgroundWorker::workerTask(void *pvParameters) {
             break;
           }
 
-          _progress = (float)i / total;
+          setProgress(total > 0 ? (float)i / total : 0.0f);
 
           // 1. Initial Data Fetch (Short Lock)
           ItemView item;
@@ -122,7 +211,7 @@ void BackgroundWorker::workerTask(void *pvParameters) {
 
           if (!item.isValid)
             continue;
-          _statusMsg = "Sync: " + item.title;
+          setStatus("Sync: " + item.title);
 
           // 2. Hardware Check (I2C Lock only, NO Library Lock)
           bool missing = true;
@@ -161,11 +250,13 @@ void BackgroundWorker::workerTask(void *pvParameters) {
                   switch (currentMode) {
                   case MODE_CD:
                     if (i < (int)cdLibrary.size())
-                      Storage.saveCD(cdLibrary[i], nullptr, true);
+                      if (!Storage.saveCD(cdLibrary[i]))
+                        persistenceFailed = true;
                     break;
                   case MODE_BOOK:
                     if (i < (int)bookLibrary.size())
-                      Storage.saveBook(bookLibrary[i], nullptr, true);
+                      if (!Storage.saveBook(bookLibrary[i]))
+                        persistenceFailed = true;
                     break;
                   default:
                     break;
@@ -216,12 +307,13 @@ void BackgroundWorker::workerTask(void *pvParameters) {
                   switch (currentMode) {
                   case MODE_CD:
                     if (i < (int)cdLibrary.size())
-                      Storage.saveCD(cdLibrary[i], nullptr, true); // Batch save
+                      if (!Storage.saveCD(cdLibrary[i]))
+                        persistenceFailed = true;
                     break;
                   case MODE_BOOK:
                     if (i < (int)bookLibrary.size())
-                      Storage.saveBook(bookLibrary[i], nullptr,
-                                       true); // Batch save
+                      if (!Storage.saveBook(bookLibrary[i]))
+                        persistenceFailed = true;
                     break;
                   default:
                     break;
@@ -235,16 +327,15 @@ void BackgroundWorker::workerTask(void *pvParameters) {
           delay(10); // Yield to other operations
         }
 
-        // Final index rewrite after batch sync completes
-        Storage.rewriteIndex(currentMode);
-
-        success = !is_sync_stopping;
-        _progress = 1.0f;
-        _statusMsg = success ? "Sync Complete" : "Sync Stopped";
+        success = !is_sync_stopping && !persistenceFailed;
+        setProgress(1.0f);
+        setStatus(success ? "Sync Complete"
+                          : (persistenceFailed ? "Sync save failed"
+                                               : "Sync Stopped"));
       } break;
 
       case JOB_COVER_DOWNLOAD: {
-        _statusMsg = "Downloading cover...";
+        setStatus("Downloading cover...");
         String savePath = currentJob.extraData;
         String url = currentJob.id;
 
@@ -265,10 +356,19 @@ void BackgroundWorker::workerTask(void *pvParameters) {
         }
       } break;
 
+      case JOB_LYRICS_FETCH_ONE: {
+        setStatus("Fetching lyrics...");
+        LyricsResult result =
+            fetchLyricsIfNeeded(currentJob.id.c_str(), currentJob.index, false);
+        success = result == LYRICS_FETCHED_NOW ||
+                  result == LYRICS_ALREADY_CACHED;
+        resultMsg = success ? "Lyrics ready" : "Lyrics not found";
+      } break;
+
       case JOB_LYRICS_FETCH_ALL: {
         String targetMbid = currentJob.id;
         if (targetMbid.length() > 0) {
-          _statusMsg = "Fetching lyrics for CD...";
+          setStatus("Fetching lyrics for CD...");
           TrackList *tl = Storage.loadTracklist(targetMbid.c_str());
           if (tl) {
             int trackCount = (int)tl->tracks.size();
@@ -276,8 +376,8 @@ void BackgroundWorker::workerTask(void *pvParameters) {
             for (int i = 0; i < trackCount; i++) {
               if (is_sync_stopping)
                 break;
-              _progress = (float)i / trackCount;
-              _statusMsg = "Lyrics: " + String(tl->tracks[i].title.c_str());
+              setProgress(trackCount > 0 ? (float)i / trackCount : 0.0f);
+              setStatus("Lyrics: " + String(tl->tracks[i].title.c_str()));
 
               // This will check cache first, then hit APIs if missing
               LyricsResult res =
@@ -296,18 +396,34 @@ void BackgroundWorker::workerTask(void *pvParameters) {
           }
         } else {
           // If no specific CD, fetch for ALL items in library that have MBID
-          _statusMsg = "Lyrics: Full Scan";
-          int cdCount = (int)cdLibrary.size();
+          setStatus("Lyrics: Full Scan");
+          int cdCount = 0;
+          if (libraryMutex)
+            xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
+          cdCount = (int)cdLibrary.size();
+          if (libraryMutex)
+            xSemaphoreGiveRecursive(libraryMutex);
           for (int i = 0; i < cdCount; i++) {
             if (is_sync_stopping)
               break;
-            _progress = (float)i / cdCount;
-            CD &cd = cdLibrary[i];
-            if (cd.releaseMbid.length() > 0) {
-              _statusMsg = "Lyrics: " + String(cd.title.c_str());
+            setProgress(cdCount > 0 ? (float)i / cdCount : 0.0f);
+            String mbid;
+            String title;
+            int trackCount = 0;
+            if (libraryMutex)
+              xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
+            if (i < (int)cdLibrary.size()) {
+              mbid = cdLibrary[i].releaseMbid.c_str();
+              title = cdLibrary[i].title.c_str();
+              trackCount = cdLibrary[i].trackCount;
+            }
+            if (libraryMutex)
+              xSemaphoreGiveRecursive(libraryMutex);
+            if (mbid.length() > 0) {
+              setStatus("Lyrics: " + title);
               // Just fetch first 5 tracks in full scan to avoid API ban
-              for (int t = 0; t < std::min((int)cd.trackCount, 5); t++) {
-                fetchLyricsIfNeeded(cd.releaseMbid.c_str(), t, false);
+              for (int t = 0; t < std::min(trackCount, 5); t++) {
+                fetchLyricsIfNeeded(mbid.c_str(), t, false);
                 delay(100);
               }
             }
@@ -320,7 +436,7 @@ void BackgroundWorker::workerTask(void *pvParameters) {
       case JOB_PERSIST_FAVORITE: {
         const bool isBook = currentJob.extraData.startsWith("book:");
         const bool favorite = currentJob.extraData.endsWith(":1");
-        _statusMsg = "Saving favorite...";
+        setStatus("Saving favorite...");
 
         MediaMode mode = isBook ? MODE_BOOK : MODE_CD;
         success = Storage.updateFavorite(currentJob.id, mode, favorite);
@@ -328,7 +444,7 @@ void BackgroundWorker::workerTask(void *pvParameters) {
       } break;
 
       case JOB_PERSIST_TRACK_FAVORITE: {
-        _statusMsg = "Saving track favorite...";
+        setStatus("Saving track favorite...");
         TrackList *trackList = Storage.loadTracklist(currentJob.id.c_str());
         if (trackList && currentJob.index >= 0 &&
             currentJob.index < (int)trackList->tracks.size()) {
@@ -342,8 +458,28 @@ void BackgroundWorker::workerTask(void *pvParameters) {
                             : "Track favorite save failed";
       } break;
 
+      case JOB_TRACK_SUMMARY_LOAD: {
+        setStatus("Loading track favorites...");
+        TrackList *trackList = Storage.loadTracklist(currentJob.id.c_str());
+        int favoriteCount = 0;
+        resultMsg = "Fav: ";
+        if (trackList) {
+          for (const Track &track : trackList->tracks) {
+            if (!track.isFavoriteTrack)
+              continue;
+            if (favoriteCount > 0)
+              resultMsg += " | ";
+            resultMsg += String(track.trackNo) + ". " +
+                         String(track.title.c_str());
+            favoriteCount++;
+          }
+          Storage.deleteTracklist(trackList);
+        }
+        success = favoriteCount > 0;
+      } break;
+
       case JOB_SYNC_WLED:
-        _statusMsg = "Syncing shelf lights...";
+        setStatus("Syncing shelf lights...");
         AppNetworkManager::forceUpdateWLED();
         success = true;
         resultMsg = "Shelf lights synced";

@@ -19,6 +19,8 @@ public:
   static void addWiFiNetwork(String ssid, String password);
   static void removeWiFiNetwork(int index);
   static bool tryConnectToSavedNetworks();
+  static void startConnection();
+  static void serviceConnection();
 
   // Shared HTTP helper
   static String fetchURL(String url, int timeout = 5000);

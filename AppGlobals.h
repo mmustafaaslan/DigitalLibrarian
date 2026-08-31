@@ -12,6 +12,9 @@
 #define MAX_WIFI_NETWORKS 3
 #define LED_PIN 6
 #define COLOR_ORDER GRB
+constexpr int LED_MIN_COUNT = 1;
+constexpr int LED_MAX_COUNT = 1200;
+constexpr int LED_DEFAULT_POWER_MA = 3000;
 
 extern const char *DEFAULT_SSID;
 extern const char *DEFAULT_PASSWORD;
@@ -24,6 +27,7 @@ extern CRGB *leds;
 
 extern SemaphoreHandle_t libraryMutex;
 extern SemaphoreHandle_t i2cMutex;
+extern SemaphoreHandle_t ledMutex;
 
 extern MediaMode currentMode;
 extern int currentCDIndex;
@@ -50,7 +54,8 @@ extern int setting_cds_led_start;
 
 // --- LED State ---
 extern int led_count;
-extern String led_type_str;
+extern int configured_led_count;
+extern int led_max_milliamps;
 extern bool led_master_on;
 extern int led_brightness;
 extern bool led_use_wled;

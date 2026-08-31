@@ -16,6 +16,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <algorithm>
+#include <climits>
 #include <lvgl.h>
 
 // --- Image Loading Globals ---
@@ -109,6 +110,7 @@ lv_obj_t *ta_search = NULL;
 lv_obj_t *kb_search = NULL;
 lv_obj_t *dd_filter = NULL;
 lv_obj_t *list_results = NULL;
+lv_obj_t *label_search_status = NULL;
 static lv_timer_t *search_timer = NULL;
 static lv_timer_t *wled_sync_timer = NULL;
 static lv_timer_t *cover_load_timer = NULL;
@@ -119,6 +121,10 @@ static String pending_track_summary_mbid = "";
 static String cached_track_summary_mbid = "";
 static String cached_track_summary_text = "";
 static bool cached_track_summary_has_favorites = false;
+static bool track_summary_result_ready = false;
+static String track_summary_result_mbid = "";
+static String track_summary_result_text = "";
+static bool track_summary_result_has_favorites = false;
 
 // Add/Edit UI
 lv_obj_t *ta_barcode = NULL;
@@ -145,7 +151,7 @@ static String pending_wifi_password = "";
 static int wifi_connect_attempts = 0;
 
 int edit_item_index = -1;
-bool sort_by_artist = true;
+bool sort_by_artist = false;
 
 namespace UiLayout {
 constexpr int screenW = 800;
@@ -297,30 +303,39 @@ void selectRandomWithEffect() {
   lv_obj_set_style_text_color(lbl, lv_color_hex(getCurrentThemeColor()), 0);
   lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
 
+  struct RandomEffectState {
+    lv_obj_t *popup;
+    int steps;
+  };
+  RandomEffectState *state = new RandomEffectState{popup, 0};
   lv_timer_t *timer = lv_timer_create(
       [](lv_timer_t *t) {
-        static int steps = 0;
-        lv_obj_t *p = (lv_obj_t *)t->user_data;
+        RandomEffectState *state = (RandomEffectState *)t->user_data;
 
-        if (steps++ < 10) {
+        if (state->steps++ < 10) {
           // Flash random LEDs
+          if (ledMutex)
+            xSemaphoreTake(ledMutex, portMAX_DELAY);
           FastLED.clear();
           for (int i = 0; i < 5; i++) {
             int r = random(led_count);
             leds[r] = CHSV(random8(), 255, 255);
           }
           FastLED.show();
+          if (ledMutex)
+            xSemaphoreGive(ledMutex);
         } else {
           // Done
           int total = getItemCount();
           int r = random(total);
           setCurrentItemIndex(r);
           update_item_display();
-          lv_obj_del(p);
+          lv_obj_del(state->popup);
+          delete state;
           lv_timer_del(t);
         }
       },
-      100, popup);
+      100, state);
 }
 
 void forceUpdateWLED() { AppNetworkManager::forceUpdateWLED(); }
@@ -425,21 +440,54 @@ static void schedule_track_summary_load(const String &releaseMbid) {
   }
 
   apply_track_summary_label("", false);
+  const bool queued = BackgroundWorker::addJob(
+      {JOB_TRACK_SUMMARY_LOAD, releaseMbid, -1, "",
+       [releaseMbid](bool hasFavorites, String summary) {
+         if (libraryMutex)
+           xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
+         track_summary_result_mbid = releaseMbid;
+         track_summary_result_text = summary;
+         track_summary_result_has_favorites = hasFavorites;
+         track_summary_result_ready = true;
+         if (libraryMutex)
+           xSemaphoreGiveRecursive(libraryMutex);
+       },
+       false});
+  if (!queued)
+    return;
+
   track_summary_timer = lv_timer_create(
       [](lv_timer_t *timer) {
-        track_summary_timer = NULL;
-        String releaseMbid = pending_track_summary_mbid;
-        TrackList *trackList = Storage.loadTracklist(releaseMbid.c_str());
-        cache_track_summary(releaseMbid, trackList);
-        if (trackList)
-          Storage.deleteTracklist(trackList);
-        if (pending_track_summary_mbid == releaseMbid) {
-          apply_track_summary_label(cached_track_summary_text,
-                                    cached_track_summary_has_favorites);
+        bool ready = false;
+        String resultMbid;
+        String resultText;
+        bool resultHasFavorites = false;
+        if (libraryMutex)
+          xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
+        if (track_summary_result_ready) {
+          ready = true;
+          resultMbid = track_summary_result_mbid;
+          resultText = track_summary_result_text;
+          resultHasFavorites = track_summary_result_has_favorites;
+          track_summary_result_ready = false;
         }
+        if (libraryMutex)
+          xSemaphoreGiveRecursive(libraryMutex);
+
+        if (!ready)
+          return;
+        if (pending_track_summary_mbid != resultMbid)
+          return;
+
+        cached_track_summary_mbid = resultMbid;
+        cached_track_summary_text = resultText;
+        cached_track_summary_has_favorites = resultHasFavorites;
+        apply_track_summary_label(cached_track_summary_text,
+                                  cached_track_summary_has_favorites);
+        track_summary_timer = NULL;
+        lv_timer_del(timer);
       },
-      30, NULL);
-  lv_timer_set_repeat_count(track_summary_timer, 1);
+      50, NULL);
 }
 
 // Helper functions (formerly in DigitalLibrarian.ino, now drop-in compatible)
@@ -570,54 +618,14 @@ static void trackClickHandler(lv_event_t *e) {
     }
   }
 
-  if (track->lyrics.status == "missing") {
-    // Retry logic
-    Serial.printf("Retrying lyrics for track %d\n", track->trackNo);
-
-    LyricsResult result =
-        fetchLyricsIfNeeded(cd.releaseMbid.c_str(), trackIndex, true);
-
-    if (result == LYRICS_FETCHED_NOW || result == LYRICS_ALREADY_CACHED) {
-      TrackList *tl = Storage.loadTracklist(cd.releaseMbid.c_str());
-      if (tl && trackIndex < (int)tl->tracks.size()) {
-        String lyrics =
-            Storage.loadLyrics(tl->tracks[trackIndex].lyrics.path.c_str());
-
-        if (lyrics.length() > 0) {
-          show_lyrics_popup(String(track->title.c_str()), lyrics);
-          // close_tracklist_ui(); // Keep open behind for context
-          // show_tracklist_ui(getCurrentItemIndex());
-        }
-      }
-      if (tl)
-        delete tl;
-    } else {
-      show_info_popup("Not Found", "Lyrics still not available", NULL, NULL);
-    }
-  } else {
-    // Unchecked - fetch now
-    Serial.printf("Fetching lyrics for track %d\n", track->trackNo);
-
-    LyricsResult result =
-        fetchLyricsIfNeeded(cd.releaseMbid.c_str(), trackIndex, true);
-
-    if (result == LYRICS_FETCHED_NOW || result == LYRICS_ALREADY_CACHED) {
-      TrackList *tl = Storage.loadTracklist(cd.releaseMbid.c_str());
-      if (tl && trackIndex < (int)tl->tracks.size()) {
-        String lyrics =
-            Storage.loadLyrics(tl->tracks[trackIndex].lyrics.path.c_str());
-
-        if (lyrics.length() > 0) {
-          show_lyrics_popup(String(track->title.c_str()), lyrics);
-        }
-      }
-      if (tl)
-        delete tl;
-    } else {
-      show_info_popup("Not Found", "No lyrics available for this track", NULL,
-                      NULL);
-    }
-  }
+  const bool queued = BackgroundWorker::addJob(
+      {JOB_LYRICS_FETCH_ONE, String(cd.releaseMbid.c_str()), trackIndex, "",
+       nullptr, true});
+  show_info_popup(queued ? "Fetching Lyrics" : "Busy",
+                  queued ? "The request is running in the background. Tap the "
+                           "track again when it completes."
+                         : "The background queue is full. Please try again.",
+                  NULL, NULL);
 }
 
 void show_tracklist_ui(int idx) {
@@ -692,15 +700,27 @@ void show_tracklist_ui(int idx) {
     lv_label_set_text(lblFetchAll, LV_SYMBOL_DOWNLOAD);
     lv_obj_center(lblFetchAll);
 
-    char *mbidCopy = strdup(cd.releaseMbid.c_str());
+    String *mbidCopy = new String(cd.releaseMbid.c_str());
     lv_obj_add_event_cb(
         btnFetchAll,
         [](lv_event_t *e) {
-          char *mbid = (char *)lv_event_get_user_data(e);
-          fetchAllLyrics(mbid);
-          free(mbid);
+          String *mbid = (String *)lv_event_get_user_data(e);
+          const bool queued = mbid && BackgroundWorker::addJob(
+                                          {JOB_LYRICS_FETCH_ALL, *mbid, -1, "",
+                                           nullptr, true});
+          if (queued)
+            lv_obj_add_state(lv_event_get_target(e), LV_STATE_DISABLED);
+          show_info_popup(queued ? "Fetching Lyrics" : "Busy",
+                          queued ? "All track lyrics are being fetched in the "
+                                   "background."
+                                 : "The request could not be queued.",
+                          NULL, NULL);
         },
         LV_EVENT_CLICKED, mbidCopy);
+    lv_obj_add_event_cb(
+        btnFetchAll,
+        [](lv_event_t *e) { delete (String *)lv_event_get_user_data(e); },
+        LV_EVENT_DELETE, mbidCopy);
   } break;
   default:
     break;
@@ -1099,8 +1119,12 @@ void setupMainUI() {
         } else {
           lv_label_set_text(lbl, LV_SYMBOL_EYE_CLOSE);
           lv_obj_set_style_text_color(lbl, lv_color_hex(0x888888), 0);
+          if (ledMutex)
+            xSemaphoreTake(ledMutex, portMAX_DELAY);
           FastLED.clear();
           FastLED.show();
+          if (ledMutex)
+            xSemaphoreGive(ledMutex);
         }
       },
       LV_EVENT_CLICKED, NULL);
@@ -1204,7 +1228,20 @@ void setupMainUI() {
   img_cover = lv_img_create(img_cover_container);
   lv_obj_set_size(img_cover, 244, 244);
   lv_obj_center(img_cover);
+  lv_obj_add_flag(img_cover, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_flag(img_cover, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_event_cb(
+      img_cover,
+      [](lv_event_t *e) {
+        if (!btn_delete_cover)
+          return;
+
+        if (lv_obj_has_flag(btn_delete_cover, LV_OBJ_FLAG_HIDDEN))
+          lv_obj_clear_flag(btn_delete_cover, LV_OBJ_FLAG_HIDDEN);
+        else
+          lv_obj_add_flag(btn_delete_cover, LV_OBJ_FLAG_HIDDEN);
+      },
+      LV_EVENT_CLICKED, NULL);
 
   label_cover_url = lv_label_create(img_cover_container);
   lv_label_set_text(label_cover_url, "Click Search to find cover");
@@ -1507,9 +1544,52 @@ void update_item_display() {
       currentIdx = 0;
       item = getItemAt(currentIdx);
     }
-    if (!item.isValid)
+    if (!item.isValid) {
+      displayed_cover_file = "";
+      schedule_cover_load("");
+      schedule_track_summary_load("");
+      lv_label_set_text(label_title, "Your library is empty");
+      lv_label_set_text(label_artist, "Use Add New to create the first item");
+      lv_label_set_text(label_genre, "");
+      lv_label_set_text(label_year, "");
+      lv_label_set_text(label_led, "");
+      lv_label_set_text(label_extra_info, "");
+      lv_label_set_text(label_counter, "0 of 0");
+      lv_obj_add_flag(label_notes, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(label_favorites, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(img_cover, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(btn_search, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(btn_delete_cover, LV_OBJ_FLAG_HIDDEN);
+      if (btn_tracklist)
+        lv_obj_add_flag(btn_tracklist, LV_OBJ_FLAG_HIDDEN);
+      lv_label_set_text(label_cover_url, "No cover yet");
+      lv_obj_clear_flag(label_cover_url, LV_OBJ_FLAG_HIDDEN);
+      if (btn_prev)
+        lv_obj_add_state(btn_prev, LV_STATE_DISABLED);
+      if (btn_next)
+        lv_obj_add_state(btn_next, LV_STATE_DISABLED);
+      if (btn_edit)
+        lv_obj_add_state(btn_edit, LV_STATE_DISABLED);
+      lv_obj_add_state(label_favorite, LV_STATE_DISABLED);
+
+      if (ledMutex)
+        xSemaphoreTake(ledMutex, portMAX_DELAY);
+      FastLED.clear();
+      FastLED.show();
+      if (ledMutex)
+        xSemaphoreGive(ledMutex);
+      schedule_wled_sync();
       return;
+    }
   }
+
+  if (btn_prev)
+    lv_obj_clear_state(btn_prev, LV_STATE_DISABLED);
+  if (btn_next)
+    lv_obj_clear_state(btn_next, LV_STATE_DISABLED);
+  if (btn_edit)
+    lv_obj_clear_state(btn_edit, LV_STATE_DISABLED);
+  lv_obj_clear_state(label_favorite, LV_STATE_DISABLED);
 
   d_title = sanitizeText(item.title);
   d_artist_line = "by " + sanitizeText(item.artistOrAuthor);
@@ -1677,7 +1757,9 @@ void update_item_display() {
     }
     lv_obj_add_flag(label_cover_url, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(btn_search, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(btn_delete_cover, LV_OBJ_FLAG_HIDDEN);
+    // Destructive cover actions stay out of the normal browsing view. Tapping
+    // the cover reveals the delete button when it is actually needed.
+    lv_obj_add_flag(btn_delete_cover, LV_OBJ_FLAG_HIDDEN);
   } else {
     displayed_cover_file = "";
     schedule_cover_load("");
@@ -1696,9 +1778,13 @@ void update_item_display() {
   if (millis() < previewModeUntil)
     return;
 
+  if (ledMutex)
+    xSemaphoreTake(ledMutex, portMAX_DELAY);
   FastLED.clear();
   if (!led_master_on) {
     FastLED.show();
+    if (ledMutex)
+      xSemaphoreGive(ledMutex);
     return;
   }
 
@@ -1715,6 +1801,8 @@ void update_item_display() {
     }
   }
   FastLED.show();
+  if (ledMutex)
+    xSemaphoreGive(ledMutex);
 
   schedule_wled_sync();
 }
@@ -1818,11 +1906,15 @@ void btn_favorite_clicked(lv_event_t *e) {
   if (filter_active) {
     update_filtered_leds();
   } else {
+    if (ledMutex)
+      xSemaphoreTake(ledMutex, portMAX_DELAY);
     for (int ledIndex : getItemLedIndices(idx)) {
       if (ledIndex >= 0 && ledIndex < led_count)
         leds[ledIndex] = isFav ? COLOR_FAVORITE : COLOR_SELECTED;
     }
     FastLED.show();
+    if (ledMutex)
+      xSemaphoreGive(ledMutex);
     schedule_wled_sync();
   }
 
@@ -1976,13 +2068,19 @@ void close_search_ui() {
     lv_timer_del(search_timer);
     search_timer = NULL;
   }
+  // The search keyboard lives on LVGL's top layer so it cannot be clipped by
+  // the full-screen panel. Delete it explicitly before deleting the panel.
+  if (kb_search) {
+    lv_obj_del(kb_search);
+    kb_search = NULL;
+  }
   if (search_panel) {
     lv_obj_del(search_panel);
     search_panel = NULL;
     ta_search = NULL;
-    kb_search = NULL;
     dd_filter = NULL;
     list_results = NULL;
+    label_search_status = NULL;
     update_item_display();
   }
 }
@@ -1997,19 +2095,15 @@ static void result_click_cb(lv_event_t *e) {
 }
 
 static void search_input_cb(lv_event_t *e) {
-  if (search_timer)
-    lv_timer_del(search_timer);
-
-  search_timer = lv_timer_create(
-      [](lv_timer_t *t) {
-        if (ta_search) {
-          const char *txt = lv_textarea_get_text(ta_search);
-          filter_library(txt);
-        }
-        search_timer = NULL;
-      },
-      400, NULL);
-  lv_timer_set_repeat_count(search_timer, 1);
+  if (!ta_search || !label_search_status)
+    return;
+  const size_t length = strlen(lv_textarea_get_text(ta_search));
+  if (length == 0)
+    lv_label_set_text(label_search_status, "Enter a search term");
+  else if (length == 1)
+    lv_label_set_text(label_search_status, "Type 1 more character");
+  else
+    lv_label_set_text(label_search_status, "Press DONE to search");
 }
 
 static void render_search_batch() {
@@ -2030,13 +2124,30 @@ static void render_search_batch() {
 
   for (int i = search_display_offset; i < end; i++) {
     int libraryIdx = search_matches[i];
-    ItemView item = getItemAt(libraryIdx);
-    if (!item.isValid)
+    String labelStr;
+    int itemYear = 0;
+    if (currentMode == MODE_CD && libraryIdx >= 0 &&
+        libraryIdx < (int)cdLibrary.size()) {
+      const CD &item = cdLibrary[libraryIdx];
+      labelStr = item.title.c_str();
+      labelStr += "  —  ";
+      labelStr += item.artist.c_str();
+      itemYear = item.year;
+    } else if (currentMode == MODE_BOOK && libraryIdx >= 0 &&
+               libraryIdx < (int)bookLibrary.size()) {
+      const Book &item = bookLibrary[libraryIdx];
+      labelStr = item.title.c_str();
+      labelStr += "  —  ";
+      labelStr += item.author.c_str();
+      itemYear = item.year;
+    } else {
       continue;
-
-    String labelStr = item.artistOrAuthor + " - " + item.title;
-    lv_obj_t *btn =
-        lv_list_add_btn(list_results, LV_SYMBOL_AUDIO, labelStr.c_str());
+    }
+    if (itemYear > 0)
+      labelStr += "  •  " + String(itemYear);
+    const char *resultIcon = currentMode == MODE_BOOK ? LV_SYMBOL_FILE
+                                                      : LV_SYMBOL_AUDIO;
+    lv_obj_t *btn = lv_list_add_btn(list_results, resultIcon, labelStr.c_str());
     lv_obj_set_height(btn, 52);
     style_list_row(btn);
     lv_obj_add_event_cb(btn, result_click_cb, LV_EVENT_CLICKED,
@@ -2062,13 +2173,248 @@ static void render_search_batch() {
   }
 }
 
+static void sort_search_results() {
+  auto compare_text_ci = [](const char *left, const char *right) {
+    if (!left)
+      left = "";
+    if (!right)
+      right = "";
+    while (*left && *right) {
+      const unsigned char l = (unsigned char)tolower((unsigned char)*left);
+      const unsigned char r = (unsigned char)tolower((unsigned char)*right);
+      if (l != r)
+        return l < r ? -1 : 1;
+      ++left;
+      ++right;
+    }
+    if (*left == *right)
+      return 0;
+    return *left ? 1 : -1;
+  };
+
+  std::sort(search_matches.begin(), search_matches.end(),
+            [compare_text_ci](int a, int b) {
+    const char *leftTitle = "";
+    const char *rightTitle = "";
+    const char *leftArtist = "";
+    const char *rightArtist = "";
+    int leftLed = INT_MAX;
+    int rightLed = INT_MAX;
+
+    if (currentMode == MODE_CD && a >= 0 && b >= 0 &&
+        a < (int)cdLibrary.size() && b < (int)cdLibrary.size()) {
+      const CD &left = cdLibrary[a];
+      const CD &right = cdLibrary[b];
+      leftTitle = left.title.c_str();
+      rightTitle = right.title.c_str();
+      leftArtist = left.artist.c_str();
+      rightArtist = right.artist.c_str();
+      leftLed = left.ledIndices.empty() ? INT_MAX : left.ledIndices[0];
+      rightLed = right.ledIndices.empty() ? INT_MAX : right.ledIndices[0];
+    } else if (currentMode == MODE_BOOK && a >= 0 && b >= 0 &&
+               a < (int)bookLibrary.size() && b < (int)bookLibrary.size()) {
+      const Book &left = bookLibrary[a];
+      const Book &right = bookLibrary[b];
+      leftTitle = left.title.c_str();
+      rightTitle = right.title.c_str();
+      leftArtist = left.author.c_str();
+      rightArtist = right.author.c_str();
+      leftLed = left.ledIndices.empty() ? INT_MAX : left.ledIndices[0];
+      rightLed = right.ledIndices.empty() ? INT_MAX : right.ledIndices[0];
+    }
+
+    if (sort_by_artist) {
+      const int artistOrder = compare_text_ci(leftArtist, rightArtist);
+      if (artistOrder != 0)
+        return artistOrder < 0;
+      const int titleOrder = compare_text_ci(leftTitle, rightTitle);
+      return titleOrder == 0 ? a < b : titleOrder < 0;
+    }
+
+    if (leftLed != rightLed)
+      return leftLed < rightLed;
+    const int titleOrder = compare_text_ci(leftTitle, rightTitle);
+    return titleOrder == 0 ? a < b : titleOrder < 0;
+            });
+}
+
 void filter_library(const char *query) {
   if (!list_results)
     return;
   lv_obj_clean(list_results);
+
+  const size_t queryLength = query ? strlen(query) : 0;
+  if (queryLength == 1) {
+    // A one-character query commonly matches most of a large collection. Keep
+    // the keyboard responsive and wait for enough input to narrow the work.
+    search_matches.clear();
+    search_display_offset = 0;
+    if (label_search_status)
+      lv_label_set_text(label_search_status, "Type 1 more character");
+    lv_list_add_text(list_results, "Enter one more character to search...");
+    return;
+  }
+
   int filter_mode = lv_dropdown_get_selected(dd_filter);
+  Serial.printf("[SEARCH UI] begin '%s' heap=%u max=%u\n", query,
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   MediaManager::filter(query, filter_mode, led_master_on);
+  Serial.printf("[SEARCH UI] scan complete heap=%u max=%u\n",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  // Shelf order is already the library/index order. Only pay the sorting cost
+  // when the user explicitly selects Artist/Author order.
+  if (sort_by_artist)
+    sort_search_results();
+  if (label_search_status) {
+    if (query == nullptr || strlen(query) == 0) {
+      lv_label_set_text_fmt(label_search_status, "%d items available",
+                            getItemCount());
+    } else {
+      lv_label_set_text_fmt(label_search_status, "%d match%s",
+                            (int)search_matches.size(),
+                            search_matches.size() == 1 ? "" : "es");
+    }
+  }
   render_search_batch();
+  Serial.printf("[SEARCH UI] render complete heap=%u max=%u\n",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+}
+
+static lv_obj_t *create_search_keyboard(lv_obj_t *screen);
+
+static void show_search_keyboard() {
+  if (!ta_search || !search_panel)
+    return;
+  if (!kb_search)
+    kb_search = create_search_keyboard(lv_scr_act());
+  if (list_results)
+    lv_obj_set_size(list_results, 760, 78);
+  lv_obj_clear_flag(kb_search, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(kb_search);
+  lv_obj_invalidate(kb_search);
+}
+
+static void hide_search_keyboard() {
+  if (kb_search)
+    lv_obj_add_flag(kb_search, LV_OBJ_FLAG_HIDDEN);
+  if (list_results)
+    lv_obj_set_size(list_results, 760, 290);
+}
+
+static void submit_search() {
+  if (!ta_search)
+    return;
+  const size_t length = strlen(lv_textarea_get_text(ta_search));
+  if (length < 2) {
+    if (label_search_status)
+      lv_label_set_text(label_search_status, "Enter at least 2 characters");
+    return;
+  }
+
+  hide_search_keyboard();
+  if (label_search_status)
+    lv_label_set_text(label_search_status, "Searching...");
+
+  if (search_timer)
+    lv_timer_del(search_timer);
+  // Run on the next LVGL cycle, after the key event has returned. Deleting the
+  // custom keyboard first releases its many button/label objects before result
+  // rows and match storage are allocated.
+  search_timer = lv_timer_create(
+      [](lv_timer_t *t) {
+        if (kb_search) {
+          lv_obj_del(kb_search);
+          kb_search = NULL;
+        }
+        if (ta_search)
+          filter_library(lv_textarea_get_text(ta_search));
+        search_timer = NULL;
+      },
+      40, NULL);
+  lv_timer_set_repeat_count(search_timer, 1);
+}
+
+static void search_key_clicked_cb(lv_event_t *e) {
+  if (!ta_search)
+    return;
+  const char *value = (const char *)lv_event_get_user_data(e);
+  if (!value)
+    return;
+
+  if (strcmp(value, "__backspace") == 0) {
+    lv_textarea_del_char(ta_search);
+  } else if (strcmp(value, "__clear") == 0) {
+    lv_textarea_set_text(ta_search, "");
+    filter_library("");
+  } else if (strcmp(value, "__done") == 0) {
+    submit_search();
+    return;
+  } else {
+    lv_textarea_add_text(ta_search, value);
+  }
+  lv_obj_add_state(ta_search, LV_STATE_FOCUSED);
+}
+
+static lv_obj_t *create_search_key(lv_obj_t *parent, const char *label,
+                                   const char *value, int x, int y, int width,
+                                   bool primary = false) {
+  lv_obj_t *button = lv_btn_create(parent);
+  lv_obj_set_size(button, width, 38);
+  lv_obj_set_pos(button, x, y);
+  style_action_button(button,
+                      primary ? &style_primary_button : &style_secondary_button);
+  lv_obj_set_style_radius(button, 7, 0);
+  lv_obj_set_style_pad_all(button, 0, 0);
+  lv_obj_add_event_cb(button, search_key_clicked_cb, LV_EVENT_CLICKED,
+                      (void *)value);
+
+  lv_obj_t *keyLabel = lv_label_create(button);
+  lv_label_set_text(keyLabel, label);
+  lv_obj_center(keyLabel);
+  lv_obj_set_style_text_font(keyLabel, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(
+      keyLabel, primary ? lv_color_hex(0x090D12) : lv_color_hex(0xF4F7FA), 0);
+  return button;
+}
+
+static lv_obj_t *create_search_keyboard(lv_obj_t *screen) {
+  lv_obj_t *keyboard = lv_obj_create(screen);
+  lv_obj_set_size(keyboard, 800, 216);
+  lv_obj_set_pos(keyboard, 0, 264);
+  lv_obj_add_style(keyboard, &style_topbar, 0);
+  lv_obj_set_style_radius(keyboard, 0, 0);
+  lv_obj_set_style_border_width(keyboard, 2, 0);
+  lv_obj_set_style_border_side(keyboard, LV_BORDER_SIDE_TOP, 0);
+  lv_obj_set_style_border_color(keyboard,
+                                lv_color_hex(getCurrentThemeColor()), 0);
+  lv_obj_set_style_pad_all(keyboard, 0, 0);
+  lv_obj_clear_flag(keyboard, LV_OBJ_FLAG_SCROLLABLE);
+
+  static const char *digits[] = {"1", "2", "3", "4", "5",
+                                 "6", "7", "8", "9", "0"};
+  static const char *topRow[] = {"q", "w", "e", "r", "t",
+                                 "y", "u", "i", "o", "p"};
+  static const char *middleRow[] = {"a", "s", "d", "f", "g",
+                                    "h", "j", "k", "l"};
+  static const char *bottomRow[] = {"z", "x", "c", "v", "b", "n", "m"};
+
+  for (int i = 0; i < 10; i++)
+    create_search_key(keyboard, digits[i], digits[i], 4 + i * 79, 4, 75);
+  for (int i = 0; i < 10; i++)
+    create_search_key(keyboard, topRow[i], topRow[i], 4 + i * 79, 46, 75);
+  for (int i = 0; i < 9; i++)
+    create_search_key(keyboard, middleRow[i], middleRow[i], 22 + i * 84, 88,
+                      80);
+  for (int i = 0; i < 7; i++)
+    create_search_key(keyboard, bottomRow[i], bottomRow[i], 22 + i * 84, 130,
+                      80);
+
+  create_search_key(keyboard, "DEL", "__backspace", 610, 130, 168);
+  create_search_key(keyboard, "CLEAR", "__clear", 4, 172, 120);
+  create_search_key(keyboard, "SPACE", " ", 128, 172, 486);
+  create_search_key(keyboard, LV_SYMBOL_OK " DONE", "__done", 618, 172, 178,
+                    true);
+  return keyboard;
 }
 
 void show_search_ui() {
@@ -2083,8 +2429,8 @@ void show_search_ui() {
   lv_obj_set_style_pad_all(search_panel, 0, 0);
   lv_obj_clear_flag(search_panel, LV_OBJ_FLAG_SCROLLABLE);
 
-  String searchTitle = " SEARCH " + getModeNamePlural();
-  create_panel_header(search_panel, (LV_SYMBOL_LIST + searchTitle).c_str());
+  String searchTitle = " Search " + getModeNamePlural();
+  create_panel_header(search_panel, searchTitle.c_str());
 
   lv_obj_t *btn_led_search = lv_btn_create(search_panel);
   lv_obj_set_size(btn_led_search, 44, 44);
@@ -2135,78 +2481,115 @@ void show_search_ui() {
   lv_obj_center(label_close);
   lv_obj_set_style_text_color(label_close, lv_color_hex(0xff4444), 0);
 
+  // Primary action: a large, obvious search field directly under the header.
+  ta_search = lv_textarea_create(search_panel);
+  lv_obj_set_size(ta_search, 704, 48);
+  lv_obj_set_pos(ta_search, 20, 72);
+  lv_textarea_set_one_line(ta_search, true);
+  lv_textarea_set_placeholder_text(ta_search, "Type a title, artist, author, or genre");
+  lv_textarea_set_cursor_click_pos(ta_search, true);
+  style_input_control(ta_search);
+  lv_obj_add_event_cb(ta_search, search_input_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+  lv_obj_t *btn_clear = lv_btn_create(search_panel);
+  lv_obj_set_size(btn_clear, 48, 48);
+  lv_obj_set_pos(btn_clear, 732, 72);
+  style_action_button(btn_clear, &style_secondary_button);
+  lv_obj_t *label_clear = lv_label_create(btn_clear);
+  lv_label_set_text(label_clear, LV_SYMBOL_CLOSE);
+  lv_obj_center(label_clear);
+  lv_obj_set_style_text_color(label_clear, lv_color_hex(0xD8E1EA), 0);
+  lv_obj_add_event_cb(
+      btn_clear,
+      [](lv_event_t *e) {
+        lv_textarea_set_text(ta_search, "");
+        filter_library("");
+        show_search_keyboard();
+      },
+      LV_EVENT_CLICKED, NULL);
+
+  dd_filter = lv_dropdown_create(search_panel);
+  String artistOrAuthor = getArtistOrAuthorLabel();
+  String filterOptions = "Everything\nTitle\n" + artistOrAuthor + "\nGenre";
+  lv_dropdown_set_options(dd_filter, filterOptions.c_str());
+  lv_obj_set_size(dd_filter, 190, 42);
+  lv_obj_set_pos(dd_filter, 20, 128);
+  lv_obj_add_style(dd_filter, &style_input, 0);
+  lv_obj_add_style(dd_filter, &style_input_focused, LV_STATE_FOCUSED);
+  lv_obj_add_event_cb(
+      dd_filter,
+      [](lv_event_t *e) {
+        show_search_keyboard();
+        if (label_search_status)
+          lv_label_set_text(label_search_status, "Press DONE to search");
+      },
+      LV_EVENT_VALUE_CHANGED, NULL);
+
   lv_obj_t *btn_sort = lv_btn_create(search_panel);
-  lv_obj_set_size(btn_sort, 120, 44);
-  lv_obj_set_pos(btn_sort, 20, 76);
+  lv_obj_set_size(btn_sort, 132, 42);
+  lv_obj_set_pos(btn_sort, 218, 128);
   style_action_button(btn_sort, &style_secondary_button);
   lv_obj_t *label_sort = lv_label_create(btn_sort);
-  lv_label_set_text(label_sort, LV_SYMBOL_LIST " ID");
+  lv_label_set_text(label_sort, LV_SYMBOL_LIST " Shelf ID");
   lv_obj_center(label_sort);
   lv_obj_set_style_text_color(label_sort, lv_color_hex(0xffffff), 0);
-
   lv_obj_add_event_cb(
       btn_sort,
       [](lv_event_t *e) {
         lv_obj_t *label = (lv_obj_t *)lv_event_get_user_data(e);
         sort_by_artist = !sort_by_artist;
         if (sort_by_artist) {
-          MediaManager::sortByArtistOrAuthor();
           String sortLabel = " " + getArtistOrAuthorLabelUpper();
           lv_label_set_text(label, (LV_SYMBOL_LIST + sortLabel).c_str());
         } else {
-          MediaManager::sortByLedIndex();
-          lv_label_set_text(label, LV_SYMBOL_LIST " ID");
+          lv_label_set_text(label, LV_SYMBOL_LIST " Shelf ID");
         }
-        const char *current_query = lv_textarea_get_text(ta_search);
-        filter_library(current_query);
+        if (kb_search) {
+          if (label_search_status)
+            lv_label_set_text(label_search_status, "Press DONE to search");
+        } else if (list_results) {
+          lv_obj_clean(list_results);
+          search_display_offset = 0;
+          sort_search_results();
+          render_search_batch();
+        }
       },
       LV_EVENT_CLICKED, label_sort);
 
-  dd_filter = lv_dropdown_create(search_panel);
-  String artistOrAuthor = getArtistOrAuthorLabel();
-  String filterOptions = "All\nTitle\n" + artistOrAuthor + "\nGenre";
-  lv_dropdown_set_options(dd_filter, filterOptions.c_str());
-  lv_obj_set_size(dd_filter, 144, 44);
-  lv_obj_set_pos(dd_filter, 148, 76);
-  lv_obj_add_style(dd_filter, &style_input, 0);
-  lv_obj_add_style(dd_filter, &style_input_focused, LV_STATE_FOCUSED);
-
-  ta_search = lv_textarea_create(search_panel);
-  lv_obj_set_size(ta_search, 480, 44);
-  lv_obj_set_pos(ta_search, 300, 76);
-  lv_textarea_set_placeholder_text(ta_search, "Search with the keyboard below...");
-  style_input_control(ta_search);
-  lv_obj_add_event_cb(ta_search, search_input_cb, LV_EVENT_VALUE_CHANGED, NULL);
+  label_search_status = lv_label_create(search_panel);
+  lv_label_set_text(label_search_status, "Ready to search");
+  lv_obj_set_width(label_search_status, 410);
+  lv_obj_set_pos(label_search_status, 370, 140);
+  lv_obj_set_style_text_align(label_search_status, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_obj_set_style_text_color(label_search_status, lv_color_hex(0x8FA1B3), 0);
+  lv_obj_set_style_text_font(label_search_status, &lv_font_montserrat_14, 0);
 
   list_results = lv_list_create(search_panel);
-  lv_obj_set_size(list_results, 760, 116);
-  lv_obj_set_pos(list_results, 20, 132);
+  lv_obj_set_size(list_results, 760, 78);
+  lv_obj_set_pos(list_results, 20, 178);
   style_list_control(list_results);
 
-  kb_search = lv_keyboard_create(search_panel);
-  lv_obj_set_size(kb_search, 760, 208);
-  lv_obj_set_pos(kb_search, 20, 260);
-  style_keyboard_control(kb_search);
-  lv_keyboard_set_mode(kb_search, LV_KEYBOARD_MODE_TEXT_LOWER);
+  // A custom keyboard uses ordinary LVGL buttons, which are known to render on
+  // this display port. It is a screen-level sibling of the modal, so no parent
+  // clipping or built-in keyboard theme can make it disappear.
+  kb_search = create_search_keyboard(lv_scr_act());
 
   lv_obj_add_event_cb(
       ta_search,
       [](lv_event_t *e) {
-        lv_keyboard_set_textarea(kb_search, lv_event_get_target(e));
-        lv_obj_clear_flag(kb_search, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_move_foreground(kb_search);
-        lv_obj_invalidate(kb_search);
+        show_search_keyboard();
       },
       LV_EVENT_FOCUSED, NULL);
+  lv_obj_add_event_cb(
+      ta_search, [](lv_event_t *e) { show_search_keyboard(); },
+      LV_EVENT_CLICKED, NULL);
 
-  lv_keyboard_set_textarea(kb_search, ta_search);
   lv_obj_clear_flag(kb_search, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_state(ta_search, LV_STATE_FOCUSED);
 
   filter_library("");
   lv_obj_update_layout(search_panel);
-  lv_obj_move_foreground(kb_search);
-  lv_obj_invalidate(kb_search);
+  show_search_keyboard();
   lvgl_port_unlock();
 }
 void load_and_show_cover(String filename) {
@@ -2248,9 +2631,8 @@ void load_and_show_cover(String filename) {
     }
 
     size_t jpg_size = f.size();
-    uint8_t *jpg_data = (uint8_t *)malloc(jpg_size);
-    if (jpg_data == NULL) {
-      Serial.println("Failed to malloc buffer for JPG file!");
+    if (jpg_size == 0) {
+      Serial.println("Cover file is empty");
       f.close();
       if (sdExpander)
         sdExpander->digitalWrite(SD_CS, HIGH);
@@ -2258,12 +2640,32 @@ void load_and_show_cover(String filename) {
       return;
     }
 
-    f.read(jpg_data, jpg_size);
+    uint8_t *jpg_data =
+        (uint8_t *)heap_caps_malloc(jpg_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!jpg_data)
+      jpg_data = (uint8_t *)heap_caps_malloc(jpg_size, MALLOC_CAP_8BIT);
+    if (jpg_data == NULL) {
+      Serial.println("Failed to allocate buffer for JPG file!");
+      f.close();
+      if (sdExpander)
+        sdExpander->digitalWrite(SD_CS, HIGH);
+      xSemaphoreGiveRecursive(i2cMutex);
+      return;
+    }
+
+    const size_t bytesRead = f.read(jpg_data, jpg_size);
     f.close();
 
     if (sdExpander)
       sdExpander->digitalWrite(SD_CS, HIGH);
     xSemaphoreGiveRecursive(i2cMutex);
+
+    if (bytesRead != jpg_size) {
+      Serial.printf("Incomplete cover read: %u of %u bytes\n",
+                    (unsigned)bytesRead, (unsigned)jpg_size);
+      heap_caps_free(jpg_data);
+      return;
+    }
 
     // Get dimensions and center
     uint16_t w = 0, h = 0;
@@ -2276,7 +2678,7 @@ void load_and_show_cover(String filename) {
       off_y = 0;
 
     TJpgDec.drawJpg(off_x, off_y, jpg_data, jpg_size);
-    free(jpg_data);
+    heap_caps_free(jpg_data);
   } else {
     Serial.println(
         "load_and_show_cover: Failed to get I2C lock, skipping image load");
@@ -2294,9 +2696,13 @@ void load_and_show_cover(String filename) {
 }
 
 void update_filtered_leds() {
+  if (ledMutex)
+    xSemaphoreTake(ledMutex, portMAX_DELAY);
   if (!led_master_on) {
     FastLED.clear();
     FastLED.show();
+    if (ledMutex)
+      xSemaphoreGive(ledMutex);
     schedule_wled_sync();
     return;
   }
@@ -2326,6 +2732,8 @@ void update_filtered_leds() {
   }
 
   FastLED.show();
+  if (ledMutex)
+    xSemaphoreGive(ledMutex);
   schedule_wled_sync();
 }
 
@@ -2873,11 +3281,17 @@ void close_add_item_ui() { // Renamed from close_add_item_ui
     ta_led_index = ta_uniqueID = ta_notes = NULL;
     ta_publisher = ta_page_count = ta_current_page = NULL;
     lvgl_port_unlock();
+    // Restore the selected item's LEDs (or the empty-library state) after the
+    // Add/Edit preview temporarily illuminated a suggested shelf position.
+    update_item_display();
   }
 }
 
 void perform_save_item() {
   Serial.println(">> perform_save_item() ENTERED");
+  auto validationError = [](const String &message) {
+    show_info_popup("Check This Entry", message.c_str(), NULL, NULL);
+  };
   // Get values from form
   const char *title = lv_textarea_get_text(ta_title);
 
@@ -2890,7 +3304,7 @@ void perform_save_item() {
 
   // Validate required fields
   if (strlen(title) == 0 || strlen(artist) == 0) {
-    Serial.println("Error: Title and Artist are required!");
+    validationError("Title and artist/author are required.");
     return;
   }
 
@@ -2902,20 +3316,40 @@ void perform_save_item() {
   // or "1,2"
   lStr.replace(" ", ",");
 
+  bool invalidLed = false;
   while (lStr.length() > 0) {
     int commaIndex = lStr.indexOf(',');
     if (commaIndex == -1) {
       lStr.trim();
-      if (lStr.length() > 0)
-        parsedLeds.push_back(lStr.toInt());
+      if (lStr.length() > 0) {
+        char *end = nullptr;
+        long value = strtol(lStr.c_str(), &end, 10);
+        if (!end || *end != '\0' || value < 0 || value >= configured_led_count)
+          invalidLed = true;
+        else if (std::find(parsedLeds.begin(), parsedLeds.end(), (int)value) ==
+                 parsedLeds.end())
+          parsedLeds.push_back((int)value);
+      }
       break;
     } else {
       String part = lStr.substring(0, commaIndex);
       part.trim();
-      if (part.length() > 0)
-        parsedLeds.push_back(part.toInt());
+      if (part.length() > 0) {
+        char *end = nullptr;
+        long value = strtol(part.c_str(), &end, 10);
+        if (!end || *end != '\0' || value < 0 || value >= configured_led_count)
+          invalidLed = true;
+        else if (std::find(parsedLeds.begin(), parsedLeds.end(), (int)value) ==
+                 parsedLeds.end())
+          parsedLeds.push_back((int)value);
+      }
       lStr = lStr.substring(commaIndex + 1);
     }
+  }
+  if (invalidLed) {
+    validationError("LED positions must be unique whole numbers between 0 and " +
+                    String(configured_led_count - 1) + ".");
+    return;
   }
 
   // Use Abstraction Layer to manage staging
@@ -2933,6 +3367,11 @@ void perform_save_item() {
   staged.artistOrAuthor = String(artist);
   staged.genre = strlen(genre) > 0 ? String(genre) : "Unknown";
   staged.year = strlen(year_str) > 0 ? atoi(year_str) : 0;
+  if (staged.year < 0 || (staged.year > 0 && staged.year < 1000) ||
+      staged.year > 2100) {
+    validationError("Year must be empty, 0, or between 1000 and 2100.");
+    return;
+  }
   staged.ledIndices = parsedLeds;
   staged.codecOrIsbn = String(barcode);
   staged.notes = String(notes);
@@ -2945,6 +3384,12 @@ void perform_save_item() {
       staged.pageCount = atoi(lv_textarea_get_text(ta_page_count));
     if (ta_current_page)
       staged.currentPage = atoi(lv_textarea_get_text(ta_current_page));
+    if (staged.pageCount < 0 || staged.currentPage < 0 ||
+        (staged.pageCount > 0 && staged.currentPage > staged.pageCount)) {
+      validationError(
+          "Page values cannot be negative, and current page cannot exceed total pages.");
+      return;
+    }
     break;
   default:
     break;
@@ -2969,6 +3414,20 @@ void perform_save_item() {
     staged.uniqueID = preservedUniqueID;
   }
 
+  if (staged.uniqueID.length() > 0) {
+    const String safeID = sanitizeFilename(staged.uniqueID);
+    for (int i = 0; i < getItemCount(); ++i) {
+      if (i == edit_item_index)
+        continue;
+      ItemView existing = getItemAt(i);
+      if (existing.uniqueID == staged.uniqueID ||
+          sanitizeFilename(existing.uniqueID) == safeID) {
+        validationError("That unique ID conflicts with an existing item.");
+        return;
+      }
+    }
+  }
+
   // --- DEBUG LOGGING ---
   Serial.println("\n========== SAVING ITEM ==========");
   Serial.printf("Unique ID: '%s'\n", staged.uniqueID.c_str());
@@ -2981,17 +3440,22 @@ void perform_save_item() {
 
   if (edit_item_index >= 0 && edit_item_index < getItemCount()) {
     // === EDIT MODE ===
-    setItem(edit_item_index, staged);
+    ItemView previousEdit = getCurrentEditItem();
     updateCurrentEditItem(staged); // Sync staging struct
 
     if (saveCurrentEditItem(preservedUniqueID.c_str())) {
+      setItem(edit_item_index, staged);
       Serial.printf("✅ Saved %s: %s\n", getModeName().c_str(),
                     staged.title.c_str());
       setCurrentItemIndex(edit_item_index);
       update_item_display();
       close_add_item_ui();
     } else {
+      updateCurrentEditItem(previousEdit);
       Serial.println("❌ Failed to save item to SD!");
+      show_info_popup("Save Failed",
+                      "The previous item was kept unchanged. Check the SD card.",
+                      NULL, NULL);
     }
   } else {
     // === ADD MODE ===
@@ -3004,18 +3468,29 @@ void perform_save_item() {
 
     if (staged.ledIndices.empty()) {
       int baseLed = getSettingLedStart();
-      staged.ledIndices.push_back(baseLed + getItemCount());
+      const int suggestedLed = baseLed + getItemCount();
+      if (suggestedLed < 0 || suggestedLed >= configured_led_count) {
+        validationError("No valid automatic LED position remains. Enter one manually.");
+        return;
+      }
+      staged.ledIndices.push_back(suggestedLed);
     }
 
     if (staged.coverFile.length() == 0) {
       String prefix = getUidPrefix();
-      staged.coverFile = prefix + staged.uniqueID + ".jpg";
+      staged.coverFile = prefix + sanitizeFilename(staged.uniqueID) + ".jpg";
     }
 
-    addItemToLibrary(staged);
     updateCurrentEditItem(staged); // Sync staging struct
 
     if (saveCurrentEditItem()) {
+      if (!addItemToLibrary(staged)) {
+        show_info_popup("Save Failed",
+                        "The item was saved but the library could not be updated. "
+                        "Please restart and try again.",
+                        NULL, NULL);
+        return;
+      }
       Serial.printf("âœ… Added %s: %s\n", getModeName().c_str(),
                     staged.title.c_str());
       setCurrentItemIndex(getItemCount() - 1);
@@ -3023,6 +3498,9 @@ void perform_save_item() {
       close_add_item_ui(); // Renamed from close_add_item_ui
     } else {
       Serial.println("âŒ Failed to save item!");
+      show_info_popup("Save Failed",
+                      "The item was not added. Check the SD card and try again.",
+                      NULL, NULL);
     }
   }
 }
@@ -3076,9 +3554,13 @@ void show_add_item_ui() {
   // Guide User: Light up next available slot (if adding)
   if (edit_item_index == -1) {
     if (led_master_on && nextLed >= 0 && nextLed < led_count) {
+      if (ledMutex)
+        xSemaphoreTake(ledMutex, portMAX_DELAY);
       FastLED.clear();
       leds[nextLed] = CRGB::White; // Show white guide light
       FastLED.show();
+      if (ledMutex)
+        xSemaphoreGive(ledMutex);
     }
   }
 
@@ -3261,6 +3743,8 @@ void show_add_item_ui() {
           const char *txt = lv_textarea_get_text(lv_event_get_target(e));
           String ledStr = String(txt);
 
+          if (ledMutex)
+            xSemaphoreTake(ledMutex, portMAX_DELAY);
           FastLED.clear();
 
           while (ledStr.length() > 0) {
@@ -3282,6 +3766,8 @@ void show_add_item_ui() {
           }
 
           FastLED.show();
+          if (ledMutex)
+            xSemaphoreGive(ledMutex);
         }
       },
       LV_EVENT_VALUE_CHANGED, NULL);
@@ -3354,6 +3840,18 @@ void show_add_item_ui() {
   lv_obj_align(spacer, LV_ALIGN_BOTTOM_MID, 0, 0);
   lv_obj_set_style_bg_opa(spacer, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(spacer, 0, 0);
+
+  // The form and keyboard are created after the header, so without restoring
+  // the z-order their scrolling contents can be drawn over it. Keep the
+  // header opaque and fixed, then place its action buttons above it.
+  lv_obj_t *fixed_header = lv_obj_get_parent(title);
+  lv_obj_set_height(fixed_header, 72);
+  lv_obj_set_style_bg_opa(fixed_header, LV_OPA_COVER, 0);
+  lv_obj_add_flag(fixed_header, LV_OBJ_FLAG_FLOATING);
+  lv_obj_move_foreground(fixed_header);
+  lv_obj_move_foreground(btn_save);
+  lv_obj_move_foreground(btn_toggle_kb_add);
+  lv_obj_move_foreground(btn_close);
 
   lvgl_port_unlock();
 }
@@ -4386,7 +4884,7 @@ void show_settings_ui() {
   lv_obj_set_size(ta_cnt, 120, 44);
   lv_obj_align(ta_cnt, LV_ALIGN_TOP_LEFT, 200, led_y + 98);
   lv_textarea_set_one_line(ta_cnt, true);
-  lv_textarea_set_text(ta_cnt, String(led_count).c_str());
+  lv_textarea_set_text(ta_cnt, String(configured_led_count).c_str());
   style_input_control(ta_cnt);
   lv_obj_add_event_cb(
       ta_cnt,
@@ -4403,30 +4901,83 @@ void show_settings_ui() {
       [](lv_event_t *e) {
         String s = lv_textarea_get_text(lv_event_get_target(e));
         if (s.length() > 0) {
-          led_count = s.toInt();
-          settings_reboot_needed = true;
+          const int requested = s.toInt();
+          if (requested >= LED_MIN_COUNT && requested <= LED_MAX_COUNT) {
+            configured_led_count = requested;
+            settings_reboot_needed = configured_led_count != led_count;
+          }
         }
       },
       LV_EVENT_VALUE_CHANGED, NULL);
 
+  // Power limit
+  lv_obj_t *lbl_power = lv_label_create(tab1);
+  lv_label_set_text(lbl_power, "Power Limit (mA):");
+  lv_obj_align(lbl_power, LV_ALIGN_TOP_LEFT, 20, led_y + 155);
+  lv_obj_set_style_text_color(lbl_power, lv_color_hex(0xcccccc), 0);
+
+  lv_obj_t *ta_power = lv_textarea_create(tab1);
+  lv_obj_set_size(ta_power, 120, 44);
+  lv_obj_align(ta_power, LV_ALIGN_TOP_LEFT, 200, led_y + 148);
+  lv_textarea_set_one_line(ta_power, true);
+  lv_textarea_set_text(ta_power, String(led_max_milliamps).c_str());
+  style_input_control(ta_power);
+  lv_obj_add_event_cb(
+      ta_power,
+      [](lv_event_t *e) {
+        lv_obj_t *kb = (lv_obj_t *)lv_event_get_user_data(e);
+        lv_obj_clear_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        lv_keyboard_set_textarea(kb, lv_event_get_target(e));
+        lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
+        lv_obj_move_foreground(kb);
+      },
+      LV_EVENT_CLICKED, kb);
+  lv_obj_add_event_cb(
+      ta_power,
+      [](lv_event_t *e) {
+        const int requested =
+            String(lv_textarea_get_text(lv_event_get_target(e))).toInt();
+        if (requested >= 100 && requested <= 30000) {
+          led_max_milliamps = requested;
+          if (ledMutex)
+            xSemaphoreTake(ledMutex, portMAX_DELAY);
+          FastLED.setMaxPowerInVoltsAndMilliamps(5, led_max_milliamps);
+          if (ledMutex)
+            xSemaphoreGive(ledMutex);
+        }
+      },
+      LV_EVENT_VALUE_CHANGED, NULL);
+
+  lv_obj_t *lbl_power_warning = lv_label_create(tab1);
+  lv_label_set_text(lbl_power_warning,
+                    "Above 3000 mA: use an external, fused 5 V LED supply");
+  lv_obj_align(lbl_power_warning, LV_ALIGN_TOP_LEFT, 340, led_y + 160);
+  lv_obj_set_style_text_color(lbl_power_warning, lv_color_hex(0xFFB84D), 0);
+  lv_obj_set_width(lbl_power_warning, 300);
+  lv_label_set_long_mode(lbl_power_warning, LV_LABEL_LONG_WRAP);
+
   // Brightness Slider
   lv_obj_t *lbl_bright = lv_label_create(tab1);
   lv_label_set_text(lbl_bright, "Brightness:");
-  lv_obj_align(lbl_bright, LV_ALIGN_TOP_LEFT, 20, led_y + 155);
+  lv_obj_align(lbl_bright, LV_ALIGN_TOP_LEFT, 20, led_y + 215);
   lv_obj_set_style_text_color(lbl_bright, lv_color_hex(0xffffff), 0);
 
   lv_obj_t *slider_bright = lv_slider_create(tab1);
   lv_obj_set_size(slider_bright, 200, 15);
   lv_obj_set_ext_click_area(slider_bright, 12);
-  lv_obj_align(slider_bright, LV_ALIGN_TOP_LEFT, 140, led_y + 160);
+  lv_obj_align(slider_bright, LV_ALIGN_TOP_LEFT, 140, led_y + 220);
   lv_slider_set_range(slider_bright, 0, 255);
   lv_slider_set_value(slider_bright, led_brightness, LV_ANIM_OFF);
   lv_obj_add_event_cb(
       slider_bright,
       [](lv_event_t *e) {
         led_brightness = lv_slider_get_value(lv_event_get_target(e));
+        if (ledMutex)
+          xSemaphoreTake(ledMutex, portMAX_DELAY);
         FastLED.setBrightness(led_brightness);
         FastLED.show();
+        if (ledMutex)
+          xSemaphoreGive(ledMutex);
       },
       LV_EVENT_VALUE_CHANGED, NULL);
 
@@ -5184,10 +5735,18 @@ void trigger_screensaver() {
   Serial.println("[SLEEP] Entering Screen Saver Mode...");
   is_screen_off = true;
   if (sdExpander) {
+    if (i2cMutex)
+      xSemaphoreTakeRecursive(i2cMutex, portMAX_DELAY);
     sdExpander->digitalWrite(LCD_BL, LOW);
+    if (i2cMutex)
+      xSemaphoreGiveRecursive(i2cMutex);
   }
+  if (ledMutex)
+    xSemaphoreTake(ledMutex, portMAX_DELAY);
   FastLED.clear();
   FastLED.show();
+  if (ledMutex)
+    xSemaphoreGive(ledMutex);
   schedule_wled_sync(20);
 }
 
@@ -5197,7 +5756,11 @@ void wake_screen() {
   Serial.println("[WAKE] Waking up...");
   is_screen_off = false;
   if (sdExpander) {
+    if (i2cMutex)
+      xSemaphoreTakeRecursive(i2cMutex, portMAX_DELAY);
     sdExpander->digitalWrite(LCD_BL, HIGH);
+    if (i2cMutex)
+      xSemaphoreGiveRecursive(i2cMutex);
   }
   update_item_display();
 }

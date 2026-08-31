@@ -1,9 +1,38 @@
 // NetworkManager.cpp
 
 #include "NetworkManager.h"
+#include "TlsTrust.h"
 #include "AppGlobals.h"
 #include "ErrorHandler.h"
+#include <ESPmDNS.h>
 #include <esp_heap_caps.h>
+
+namespace {
+int connectionNetworkIndex = -1;
+unsigned long connectionAttemptStarted = 0;
+bool connectionServiceActive = false;
+bool networkReadyAnnounced = false;
+
+void beginNetworkAttempt(int index) {
+  connectionNetworkIndex = index;
+  connectionAttemptStarted = millis();
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(savedWiFiNetworks[index].ssid.c_str(),
+             savedWiFiNetworks[index].password.c_str());
+  Serial.printf("Trying WiFi: %s\n", savedWiFiNetworks[index].ssid.c_str());
+}
+
+void startSetupAccessPoint() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_AP);
+  char password[16];
+  snprintf(password, sizeof(password), "DL%08lX",
+           (unsigned long)(ESP.getEfuseMac() & 0xFFFFFFFF));
+  WiFi.softAP("DigitalLibrarian_Setup", password);
+  Serial.printf("Setup AP ready at %s, password: %s\n",
+                WiFi.softAPIP().toString().c_str(), password);
+}
+} // namespace
 
 void AppNetworkManager::init() {
   // Initialize in station mode
@@ -165,6 +194,47 @@ bool AppNetworkManager::tryConnectToSavedNetworks() {
   return false;
 }
 
+void AppNetworkManager::startConnection() {
+  networkReadyAnnounced = false;
+  if (savedWiFiNetworks.empty()) {
+    startSetupAccessPoint();
+    connectionServiceActive = false;
+    return;
+  }
+  connectionServiceActive = true;
+  beginNetworkAttempt(0);
+}
+
+void AppNetworkManager::serviceConnection() {
+  if (!connectionServiceActive)
+    return;
+  if (WiFi.status() == WL_CONNECTED) {
+    connectionServiceActive = false;
+    if (!networkReadyAnnounced) {
+      networkReadyAnnounced = true;
+      Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+      if (mdns_name.length() == 0)
+        mdns_name = "digitallibrarian";
+      MDNS.begin(mdns_name.c_str());
+    }
+    return;
+  }
+  if (millis() - connectionAttemptStarted < 8000)
+    return;
+
+  WiFi.disconnect();
+  const int next = connectionNetworkIndex + 1;
+  if (next < (int)savedWiFiNetworks.size()) {
+    beginNetworkAttempt(next);
+  } else {
+    ErrorHandler::logWarn(ERR_CAT_NETWORK,
+                          "Saved networks unavailable; starting setup AP",
+                          "serviceConnection");
+    startSetupAccessPoint();
+    connectionServiceActive = false;
+  }
+}
+
 String AppNetworkManager::fetchURL(String url, int timeout) {
   if (WiFi.status() != WL_CONNECTED)
     return "";
@@ -174,7 +244,7 @@ String AppNetworkManager::fetchURL(String url, int timeout) {
   WiFiClient clientInsecure;
 
   if (url.startsWith("https://")) {
-    clientSecure.setInsecure();
+    configureTrustedTlsClient(clientSecure);
     http.begin(clientSecure, url);
   } else {
     http.begin(clientInsecure, url);
@@ -197,6 +267,7 @@ String AppNetworkManager::fetchURL(String url, int timeout) {
 
 bool AppNetworkManager::downloadCoverImage(const String &url,
                                            const String &savePath) {
+  static constexpr int MAX_COVER_BYTES = 2 * 1024 * 1024;
   if (WiFi.status() != WL_CONNECTED)
     return false;
   if (url.isEmpty())
@@ -207,7 +278,7 @@ bool AppNetworkManager::downloadCoverImage(const String &url,
   WiFiClient clientInsecure;
 
   if (url.startsWith("https://")) {
-    clientSecure.setInsecure();
+    configureTrustedTlsClient(clientSecure);
     http.begin(clientSecure, url);
   } else {
     http.begin(clientInsecure, url);
@@ -223,7 +294,12 @@ bool AppNetworkManager::downloadCoverImage(const String &url,
   }
 
   int len = http.getSize();
-  if (len <= 0) {
+  String contentType = http.header("Content-Type");
+  contentType.toLowerCase();
+  if (len <= 0 || len > MAX_COVER_BYTES ||
+      (!contentType.isEmpty() && contentType.indexOf("image/jpeg") < 0 &&
+       contentType.indexOf("image/jpg") < 0 &&
+       contentType.indexOf("application/octet-stream") < 0)) {
     http.end();
     return false;
   }
@@ -249,7 +325,8 @@ bool AppNetworkManager::downloadCoverImage(const String &url,
   }
   http.end();
 
-  if (totalRead < len) {
+  if (totalRead < len || totalRead < 4 || downloadBuffer[0] != 0xFF ||
+      downloadBuffer[1] != 0xD8) {
     heap_caps_free(downloadBuffer);
     return false;
   }
@@ -261,11 +338,29 @@ bool AppNetworkManager::downloadCoverImage(const String &url,
     if (sdExpander)
       sdExpander->digitalWrite(SD_CS, LOW);
 
-    File file = SD.open(savePath.c_str(), FILE_WRITE);
+    const String tmpPath = savePath + ".tmp";
+    const String backupPath = savePath + ".bak";
+    if (SD.exists(tmpPath))
+      SD.remove(tmpPath);
+    File file = SD.open(tmpPath.c_str(), FILE_WRITE);
     if (file) {
       size_t written = file.write(downloadBuffer, totalRead);
+      file.flush();
+      const bool writeOk = file.getWriteError() == 0;
       file.close();
-      success = (written == (size_t)totalRead);
+      if (writeOk && written == (size_t)totalRead) {
+        if (SD.exists(backupPath))
+          SD.remove(backupPath);
+        const bool hadOriginal = SD.exists(savePath);
+        const bool backedUp = !hadOriginal || SD.rename(savePath, backupPath);
+        success = backedUp && SD.rename(tmpPath, savePath);
+        if (!success && hadOriginal)
+          SD.rename(backupPath, savePath);
+        if (success && hadOriginal)
+          SD.remove(backupPath);
+      }
+      if (!success)
+        SD.remove(tmpPath);
     }
 
     if (sdExpander)
@@ -298,6 +393,8 @@ void AppNetworkManager::forceUpdateWLED() {
   String json = "{\"seg\":{\"i\":[0," + String(led_count) + ",\"000000\"";
 
   int activeCount = 0;
+  if (ledMutex)
+    xSemaphoreTake(ledMutex, portMAX_DELAY);
   for (int i = 0; i < led_count; i++) {
     if (leds[i].r > 0 || leds[i].g > 0 || leds[i].b > 0) {
       char hex[8];
@@ -308,6 +405,8 @@ void AppNetworkManager::forceUpdateWLED() {
         break;
     }
   }
+  if (ledMutex)
+    xSemaphoreGive(ledMutex);
   json += "]}}";
 
   int httpCode = http.POST(json);

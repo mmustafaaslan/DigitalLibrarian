@@ -1,7 +1,7 @@
 # 📚 Digital Librarian (ESP32-S3)
 
 [![Hardware: ESP32-S3](https://img.shields.io/badge/Hardware-ESP32--S3-orange.svg)](https://www.espressif.com/en/products/socs/esp32-s3)
-[![UI: LVGL](https://img.shields.io/badge/UI-LVGL%208.3-blue.svg)](https://lvgl.io/)
+[![UI: LVGL](https://img.shields.io/badge/UI-LVGL%208.4-blue.svg)](https://lvgl.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Digital Librarian** is a smart physical media management system running on the **Waveshare 7" ESP32-S3 Touch LCD**. It acts as a "physical search engine" for your library: simply search for an item on the screen or your phone, and an **addressable LED strip** will instantly light up its exact location on your shelf.
@@ -45,8 +45,8 @@ The heart of this project is the **Waveshare ESP32-S3-Touch-LCD-7**, a high-perf
 </p>
 
 ### Board Features:
-*   **Dual-Core ESP32-S3**: Balanced workload with Core 1 handling the GUI/Touch and Core 0 managing Background tasks (WiFi, Data fetching, SD I/O).
-*   **7" RGB LCD**: 800x480 resolution for crisp artwork and smooth animations via the RGB666 interface.
+*   **Dual-Core ESP32-S3**: Core 1 runs the Arduino/LVGL loop while the background worker is scheduled independently for network and storage jobs.
+*   **7" RGB LCD**: 800x480 resolution with a 16-bit RGB interface.
 *   **Capacitive Touch**: Responsive 5-point touch support for an intuitive user experience.
 *   **Expandable Storage**: Integrated Micro SD slot for storing thousands of item records and cover art images.
 *   **Built-in IO Expander**: CH422G chip provides additional GPIO for screen backlight control and resets without consuming primary ESP32 pins.
@@ -72,8 +72,8 @@ Digital Librarian turns your media shelf into an interactive experience. Use the
 
 ### Technical Specifications
 *   **MCU**: ESP32-S3 (Xtensa LX7 Dual Core, 240MHz)
-*   **Memory**: 8MB PSRAM (OPI), 16MB Flash (QSPI)
-*   **Display**: 7-inch IPS (1024x600) with Capacitive Touch (GT911)
+*   **Memory**: 8MB PSRAM (OPI), 8MB Flash (QIO build target)
+*   **Display**: 7-inch IPS (800x480) with Capacitive Touch (GT911)
 *   **Connectivity**: 2.4GHz WiFi
 *   **Peripherals**:
     *   **SD Card**: SDMMC (4-bit mode) for database and image storage.
@@ -84,23 +84,25 @@ Digital Librarian turns your media shelf into an interactive experience. Use the
 1.  **Dependencies**:
     *   **Arduino IDE**
     *   **ESP32 Board Package** (by Espressif)
-    *   LVGL 8.3
-    *   ArduinoJson 6.x
-    *   FastLED
+    *   LVGL 8.4.0
+    *   ArduinoJson 7.4.2
+    *   FastLED 3.10.3
 
 2.  **Configuration**:
     *   Rename `secrets.example.h` to `secrets.h` and add your WiFi credentials.
-    *   Copy the `/libs` folder to your library path if not using PlatformIO's lib_deps.
+    *   Keep the repository's `/libraries` folder available to the sketch.
+    *   See [`docs/BUILD_ENVIRONMENT.md`](docs/BUILD_ENVIRONMENT.md) for the complete verified versions and board options.
 
 3.  **Compiling**:
-    *   **Board**: `esp32s3`
-    *   **Flash Mode**: QIO 80MHz
-    *   **PSRAM**: OPI (Critical for LVGL performance)
+    *   **Board**: Waveshare ESP32-S3 Touch LCD 7
+    *   **Flash Mode**: QIO; **Flash Size**: 8 MB; **Partition**: Huge APP
+    *   **PSRAM**: Enabled (critical for LVGL performance)
+    *   Run `tools/verify-build.ps1` for a compile-only verification with the exact target options.
 
 ### Architecture
-The system uses a **Dual-Core Architecture** to ensure smooth UI performance:
+The system separates interactive UI work from queued network and storage work:
 *   **Core 1 (UI Task)**: Runs the LVGL loop. Handles touch input, animations, and rendering.
-*   **Core 0 (Background Task)**: Handles heavy lifting:
+*   **Background Worker**: Scheduled by FreeRTOS and handles heavier work without blocking the UI:
     *   WiFi / API Requests (MusicBrainz, Google Books)
     *   SD Card I/O (Database reads, Cover art caching)
     *   LED Control (FastLED timing)
@@ -113,7 +115,7 @@ graph TD
     UI -->|Events| Core[Core Logic]
     Web -->|API| Core
     
-    Core -->|Job Queue| BW[Background Worker - Core 0]
+    Core -->|Job Queue| BW[Background Worker]
     BW -->|I/O| SD[(SD Card)]
     BW -->|Fetch| API[MusicBrainz/Google Books]
     
@@ -199,30 +201,31 @@ The Digital Librarian features a robust web server for remote management. Access
 You can turn your phone into a professional barcode scanner that automatically registers media to your library.
 
 1.  **Install a Barcode Scanner app** (Any app that supports "Custom Search URL").
-2.  **Set the Custom URL** in the app to:
-    `http://digitallibrarian.local/scan?pin=cd1234&code={CODE}`
+2.  **Log in once** at `http://digitallibrarian.local/scan`, then set the scanner's custom URL to:
+    `http://digitallibrarian.local/scan?code={CODE}`
 3.  **Start Scanning**: Simply point your phone at your CD/Book collection. The app will open the link, the Web UI will automatically process the lookup, and the ESP32 will light up the designated LED.
 
 ### 🛠️ Core API Endpoints (POST/GET)
 | Endpoint | Method | Params | Description |
 |:---|-:|-:|-:|
 | `/api/status` | GET | - | Returns JSON with item counts, heap, and uptime. |
-| `/api/control` | ANY | `action`, `pin`, `id` | Remote hardware control (LEDs, navigation). |
-| `/api/lookup` | GET | `barcode`, `pin` | Fetches metadata from MusicBrainz/Google Books. |
-| `/api/setcover` | GET | `url`, `id`, `pin` | Downloads and attaches cover art to an item. |
-| `/api/export_backup`| GET | `pin` | Downloads the entire database in JSONL format. |
-| `/api/errors` | GET | - | Detailed diagnostic dump of recent system errors. |
-| `/restart` | ANY | `pin` | Remotely reboots the ESP32. |
+| `/api/control` | POST | `action`, `id` | Remote hardware control (LEDs, navigation). |
+| `/api/lookup` | POST | `barcode` | Fetches metadata and adds a record. |
+| `/api/setcover` | POST | `url`, `id` | Downloads and attaches cover art to an item. |
+| `/api/export_backup`| GET | authenticated cookie | Downloads the entire database in JSONL format. |
+| `/api/errors` | GET | authenticated cookie | Detailed diagnostic dump of recent system errors. |
+| `/restart` | POST | authenticated cookie or PIN header | Remotely reboots the ESP32. |
 
 ---
 
 ## 🔒 Security & Authentication
-Most web pages and API endpoints are protected by a **Web PIN**. 
+Library pages and mutating API endpoints are protected by a **Web PIN**. After
+login, the device stores a random, per-boot HTTP-only same-site session cookie;
+the PIN itself is not stored in the cookie or accepted from query strings.
 
-*   **Default PIN**: `cd1234` (Can be changed in `AppGlobals.cpp`)
-*   **Constructing Links**: To access a protected page or API directly, append the `pin` parameter to your URL:
-    *   `http://digitallibrarian.local/link?pin=cd1234`
-    *   `http://digitallibrarian.local/api/control?pin=cd1234&action=random`
+*   On first boot the device generates and saves a unique six-digit PIN. View or change it in device Settings.
+*   Do not place the PIN in bookmarks, scanner URLs, or query strings. Open a protected page and use its login screen instead.
+*   Outbound HTTPS requests validate server certificates with the CA bundle supplied by the installed ESP32 board core.
 
 ---
 
