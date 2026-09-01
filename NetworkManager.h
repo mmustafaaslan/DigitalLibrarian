@@ -28,7 +28,8 @@ public:
 
   // Shared HTTP helper
   static String fetchURL(String url, int timeout = 5000);
-  static bool downloadCoverImage(const String &url, const String &savePath);
+  static bool downloadCoverImage(const String &url, const String &savePath,
+                                 bool quickMode = false);
   static void forceUpdateWLED();
 };
 

@@ -19,6 +19,7 @@
 #include <climits>
 #include <esp_heap_caps.h>
 #include <lvgl.h>
+#include <new>
 #include <utility>
 
 // --- Image Loading Globals ---
@@ -30,7 +31,11 @@ static lv_obj_t *progress_modal = NULL;
 static lv_obj_t *progress_bar = NULL;
 static lv_obj_t *progress_label = NULL;
 static lv_obj_t *progress_spinner = NULL;
-static bool compact_lyrics_progress_active = false;
+static lv_obj_t *progress_skip_button = NULL;
+static lv_obj_t *progress_skip_label = NULL;
+static bool compact_tls_progress_active = false;
+static bool compact_metadata_progress_active = false;
+static bool compact_cancel_requested = false;
 
 static void dismiss_progress_modal() {
   if (progress_modal)
@@ -39,7 +44,11 @@ static void dismiss_progress_modal() {
   progress_bar = NULL;
   progress_label = NULL;
   progress_spinner = NULL;
-  compact_lyrics_progress_active = false;
+  progress_skip_button = NULL;
+  progress_skip_label = NULL;
+  compact_tls_progress_active = false;
+  compact_metadata_progress_active = false;
+  compact_cancel_requested = false;
 }
 
 // TJpg output callback
@@ -352,10 +361,16 @@ static void prepare_modal_panel(lv_obj_t *panel, int width, int height,
   }
 }
 
-static void show_compact_lyrics_progress() {
+static void show_compact_network_progress(const char *titleText,
+                                          bool metadataLookup = false,
+                                          const char *messageText =
+                                              "Please wait; the interface is responsive.",
+                                          bool cancellable = false) {
   if (progress_modal)
     return;
-  compact_lyrics_progress_active = true;
+  compact_tls_progress_active = true;
+  compact_metadata_progress_active = metadataLookup;
+  compact_cancel_requested = false;
   progress_modal = lv_obj_create(lv_layer_top());
   lv_obj_set_size(progress_modal, UiLayout::screenW, UiLayout::screenH);
   lv_obj_set_pos(progress_modal, 0, 0);
@@ -366,7 +381,7 @@ static void show_compact_lyrics_progress() {
   // ESP32 core, so constructing the full generic progress dialog immediately
   // before a handshake can leave too little contiguous heap.
   lv_obj_t *panel = lv_obj_create(progress_modal);
-  prepare_modal_panel(panel, 430, 142);
+  prepare_modal_panel(panel, 430, cancellable ? 174 : 142);
 
   progress_spinner = lv_spinner_create(panel, 900, 76);
   lv_obj_set_size(progress_spinner, 44, 44);
@@ -378,15 +393,50 @@ static void show_compact_lyrics_progress() {
                              LV_PART_INDICATOR);
 
   lv_obj_t *title = lv_label_create(panel);
-  lv_label_set_text(title, "DOWNLOADING LYRICS");
+  lv_label_set_text(title, titleText);
   lv_obj_set_pos(title, 88, 42);
   lv_obj_add_style(title, &style_section_label, 0);
 
   progress_label = lv_label_create(panel);
-  lv_label_set_text(progress_label, "Please wait; the interface is responsive.");
+  lv_label_set_text(progress_label, messageText);
   lv_obj_set_pos(progress_label, 88, 72);
   lv_obj_set_width(progress_label, 318);
   lv_obj_set_style_text_color(progress_label, lv_color_hex(0x98A6B5), 0);
+
+  if (cancellable) {
+    lv_obj_t *cancelButton = lv_btn_create(panel);
+    lv_obj_set_size(cancelButton, 120, 40);
+    lv_obj_set_pos(cancelButton, 286, 116);
+    style_action_button(cancelButton, &style_danger_button);
+    lv_obj_t *cancelLabel = lv_label_create(cancelButton);
+    lv_label_set_text(cancelLabel, LV_SYMBOL_CLOSE " CANCEL");
+    lv_obj_center(cancelLabel);
+    lv_obj_add_event_cb(
+        cancelButton,
+        [](lv_event_t *e) {
+          compact_cancel_requested = true;
+          BackgroundWorker::requestCancel();
+          if (progress_label)
+            lv_label_set_text_static(
+                progress_label,
+                "Cancelling at the next safe checkpoint...");
+          lv_obj_t *button = lv_event_get_target(e);
+          lv_obj_t *label = lv_obj_get_child(button, 0);
+          if (label)
+            lv_label_set_text_static(label, "CANCELLING");
+          // Keep the action visually legible. LV_STATE_DISABLED faded the
+          // entire control so much that a registered tap looked like a broken
+          // button on the physical display.
+          lv_obj_clear_flag(button, LV_OBJ_FLAG_CLICKABLE);
+        },
+        LV_EVENT_CLICKED, NULL);
+  }
+}
+
+static void show_compact_lyrics_progress() {
+  show_compact_network_progress("DOWNLOADING LYRICS", false,
+                                "Please wait; the interface is responsive.",
+                                true);
 }
 
 // Forward declarations
@@ -744,6 +794,10 @@ void show_lyrics_popup(String trackTitle, PsramString lyricsText) {
 
   LyricsPopupData *popupData =
       new LyricsPopupData{std::move(trackTitle), std::move(lyricsText)};
+  // The bundled compact LVGL font does not contain the full Unicode range.
+  // Normalize only this PSRAM-backed display copy; the cached lyrics on SD
+  // remain unchanged.
+  sanitizeLvglTextInPlace(popupData->lyrics);
 
   // Use top layer to ensure visibility above other modals
   lyrics_panel = lv_obj_create(lv_layer_top());
@@ -752,7 +806,7 @@ void show_lyrics_popup(String trackTitle, PsramString lyricsText) {
 
   lv_obj_t *lblTitle =
       create_panel_header(lyrics_panel,
-                          sanitizeText(popupData->title).c_str());
+                          sanitizeLvglText(popupData->title).c_str());
   lv_obj_set_width(lblTitle, 640);
   lv_label_set_long_mode(lblTitle, LV_LABEL_LONG_DOT);
 
@@ -1028,7 +1082,7 @@ static void append_tracklist_row(TracklistBuildState *state, int index) {
 
   lv_obj_t *lblLeft = lv_label_create(btn);
   lv_label_set_text_fmt(lblLeft, "%d. %s", track.trackNo,
-                        sanitizeText(String(track.title.c_str())).c_str());
+                        sanitizeLvglText(String(track.title.c_str())).c_str());
   lv_obj_align(lblLeft, LV_ALIGN_LEFT_MID, 58, 0);
   lv_obj_set_width(lblLeft, containerW - 196);
   lv_label_set_long_mode(lblLeft, LV_LABEL_LONG_DOT);
@@ -1096,8 +1150,8 @@ static void render_tracklist_ui(int idx, const String &releaseMbid,
   lv_obj_add_flag(tracklist_panel, LV_OBJ_FLAG_HIDDEN);
   prepare_modal_panel(tracklist_panel, 704, 432);
 
-  String tracklistTitle = sanitizeText(String(cd.title.c_str())) + " - " +
-                          sanitizeText(String(cd.artist.c_str()));
+  String tracklistTitle = sanitizeLvglText(String(cd.title.c_str())) + " - " +
+                          sanitizeLvglText(String(cd.artist.c_str()));
   lv_obj_t *lblTitle =
       create_panel_header(tracklist_panel, tracklistTitle.c_str());
   lv_obj_set_pos(lblTitle, 76, 22);
@@ -1323,7 +1377,8 @@ void setupMainUI() {
   lv_obj_clear_flag(topbar, LV_OBJ_FLAG_SCROLLABLE);
 
   label_brand_title = lv_label_create(topbar);
-  lv_label_set_text(label_brand_title, setting_brand_title.c_str());
+  lv_label_set_text(label_brand_title,
+                    sanitizeLvglText(setting_brand_title).c_str());
   lv_obj_set_pos(label_brand_title, 18, 13);
   lv_obj_set_width(label_brand_title, 420);
   lv_label_set_long_mode(label_brand_title, LV_LABEL_LONG_DOT);
@@ -1332,7 +1387,8 @@ void setupMainUI() {
   lv_obj_set_style_text_letter_space(label_brand_title, 1, 0);
 
   label_brand_subtitle = lv_label_create(topbar);
-  lv_label_set_text(label_brand_subtitle, setting_brand_subtitle.c_str());
+  lv_label_set_text(label_brand_subtitle,
+                    sanitizeLvglText(setting_brand_subtitle).c_str());
   lv_obj_set_pos(label_brand_subtitle, 18, 39);
   lv_obj_set_width(label_brand_subtitle, 420);
   lv_label_set_long_mode(label_brand_subtitle, LV_LABEL_LONG_DOT);
@@ -1630,6 +1686,13 @@ void setupMainUI() {
   lv_obj_add_event_cb(
       btn_sync_ui,
       [](lv_event_t *e) {
+        if (!sd_card_ready) {
+          show_info_popup("SD Card Unavailable",
+                          "The library card is not mounted. Check the card "
+                          "and restart before syncing.",
+                          NULL, NULL);
+          return;
+        }
         show_confirmation_popup(
             "Sync Library", "Reload index AND download missing covers?",
             [](lv_event_t *e) { // YES
@@ -1909,6 +1972,56 @@ void setupMainUI() {
         bool isBusy = BackgroundWorker::isBusy();
         bool showProgress = BackgroundWorker::shouldShowProgress();
 
+        // Saving detail JSON and atomically rewriting the index can take long
+        // enough to starve touch when executed inside the SAVE callback. The
+        // worker performs that transaction; LVGL only applies the verified
+        // result to its in-memory view here.
+        bool itemSaveSuccess = false;
+        String itemSaveMessage;
+        ItemView savedItem;
+        MediaMode savedMode = MODE_CD;
+        int savedEditIndex = -1;
+        if (BackgroundWorker::takeItemSaveCompletion(
+                itemSaveSuccess, itemSaveMessage, savedItem, savedMode,
+                savedEditIndex)) {
+          dismiss_progress_modal();
+          if (!itemSaveSuccess) {
+            show_info_popup("Save Failed", itemSaveMessage.c_str(), NULL,
+                            NULL);
+            return;
+          }
+
+          if (!add_item_panel || currentMode != savedMode) {
+            show_info_popup("Saved",
+                            "The item was saved. Reopen the library to refresh it.",
+                            NULL, NULL);
+            return;
+          }
+
+          updateCurrentEditItem(savedItem);
+          int selectedIndex = savedEditIndex;
+          if (savedEditIndex >= 0) {
+            setItem(savedEditIndex, savedItem);
+          } else {
+            if (!addItemToLibrary(savedItem)) {
+              show_info_popup(
+                  "Refresh Needed",
+                  "The item was saved, but the in-memory list could not be updated. Restart the app to reload it.",
+                  NULL, NULL);
+              return;
+            }
+            selectedIndex = getItemCount() - 1;
+          }
+
+          setCurrentItemIndex(selectedIndex);
+          initNavigationCache();
+          Serial.printf("Saved %s: %s\n",
+                        savedMode == MODE_BOOK ? "Book" : "CD",
+                        savedItem.title.c_str());
+          close_add_item_ui();
+          return;
+        }
+
         // Opening a songs window can involve SD access, detail loading, and a
         // sizeable JSON parse. Its completion is consumed directly so none of
         // that work (including failure handling) ever runs in a touch event.
@@ -1953,6 +2066,8 @@ void setupMainUI() {
                 lyricsSuccess, lyricsMessage, lyricsTitle, lyricsText)) {
           lyrics_request_pending = false;
           dismiss_progress_modal();
+          if (lyricsMessage == "Cancelled")
+            return;
           if (lyricsSuccess && !lyricsText.empty()) {
             show_lyrics_popup(std::move(lyricsTitle), std::move(lyricsText));
           } else if (tracklist_feedback_label) {
@@ -1969,6 +2084,11 @@ void setupMainUI() {
 
         // Create/Show Modal
         if (showProgress && !progress_modal) {
+          const JobType progressJob = BackgroundWorker::getCurrentJobType();
+          const bool cancellable =
+              progressJob == JOB_BULK_SYNC ||
+              progressJob == JOB_COVER_DOWNLOAD ||
+              progressJob == JOB_LYRICS_FETCH_ALL;
           progress_modal = lv_obj_create(lv_layer_top());
           lv_obj_set_size(progress_modal, UiLayout::screenW, UiLayout::screenH);
           lv_obj_set_pos(progress_modal, 0, 0);
@@ -2022,21 +2142,113 @@ void setupMainUI() {
 
           lv_obj_t *waitHint = lv_label_create(panel);
           lv_label_set_text(waitHint,
-                            "Network requests can take a little while.");
+                            cancellable
+                                ? "Weak WiFi can slow individual records."
+                                : "Network requests can take a little while.");
           lv_obj_set_pos(waitHint, 32, 230);
-          lv_obj_set_width(waitHint, 496);
+          lv_obj_set_width(waitHint,
+                           progressJob == JOB_BULK_SYNC
+                               ? 220
+                               : (cancellable ? 350 : 496));
           lv_obj_set_style_text_color(waitHint, lv_color_hex(0x718092), 0);
+
+          if (progressJob == JOB_BULK_SYNC) {
+            progress_skip_button = lv_btn_create(panel);
+            lv_obj_set_size(progress_skip_button, 118, 40);
+            lv_obj_set_pos(progress_skip_button, 270, 218);
+            style_action_button(progress_skip_button, &style_warning_button);
+            progress_skip_label = lv_label_create(progress_skip_button);
+            lv_label_set_text_static(progress_skip_label, "SKIP ITEM");
+            lv_obj_center(progress_skip_label);
+            lv_obj_add_event_cb(
+                progress_skip_button,
+                [](lv_event_t *e) {
+                  BackgroundWorker::requestSkipCurrent();
+                  if (progress_label)
+                    lv_label_set_text_static(progress_label,
+                                             "Skipping the current record...");
+                  if (progress_skip_label)
+                    lv_label_set_text_static(progress_skip_label, "SKIPPING");
+                  lv_obj_clear_flag(lv_event_get_target(e),
+                                    LV_OBJ_FLAG_CLICKABLE);
+                },
+                LV_EVENT_CLICKED, NULL);
+          }
+
+          if (cancellable) {
+            lv_obj_t *cancelButton = lv_btn_create(panel);
+            lv_obj_set_size(cancelButton, 128, 40);
+            lv_obj_set_pos(cancelButton, 400, 218);
+            style_action_button(cancelButton, &style_danger_button);
+            lv_obj_t *cancelLabel = lv_label_create(cancelButton);
+            lv_label_set_text(cancelLabel, LV_SYMBOL_CLOSE " CANCEL");
+            lv_obj_center(cancelLabel);
+            lv_obj_add_event_cb(
+                cancelButton,
+                [](lv_event_t *e) {
+                  const JobType activeJob =
+                      BackgroundWorker::getCurrentJobType();
+                  if (activeJob == JOB_BULK_SYNC ||
+                      activeJob == JOB_LYRICS_FETCH_ALL)
+                    is_sync_stopping = true;
+                  BackgroundWorker::requestCancel();
+                  if (progress_label)
+                    lv_label_set_text_static(
+                        progress_label,
+                        "Cancelling at the next safe checkpoint...");
+                  lv_obj_t *button = lv_event_get_target(e);
+                  lv_obj_t *label = lv_obj_get_child(button, 0);
+                  if (label)
+                    lv_label_set_text_static(label, "CANCELLING");
+                  lv_obj_clear_flag(button, LV_OBJ_FLAG_CLICKABLE);
+                  if (progress_skip_button)
+                    lv_obj_clear_flag(progress_skip_button,
+                                      LV_OBJ_FLAG_CLICKABLE);
+                },
+                LV_EVENT_CLICKED, NULL);
+          }
         }
 
         // Update
         if (showProgress && progress_modal) {
+          const int pct = (int)(BackgroundWorker::getProgress() * 100);
+          if (progress_skip_button && progress_skip_label &&
+              !BackgroundWorker::isSkipRequested() &&
+              !BackgroundWorker::isCancellationRequested() &&
+              !lv_obj_has_flag(progress_skip_button,
+                               LV_OBJ_FLAG_CLICKABLE)) {
+            lv_label_set_text_static(progress_skip_label, "SKIP ITEM");
+            lv_obj_add_flag(progress_skip_button, LV_OBJ_FLAG_CLICKABLE);
+          }
           if (progress_bar) {
-            int pct = (int)(BackgroundWorker::getProgress() * 100);
-            lv_bar_set_value(progress_bar, pct, LV_ANIM_ON);
+            // The spinner already communicates activity. Replacing a running
+            // bar animation every 200 ms can accumulate LVGL animations and
+            // make the display appear to shake under load.
+            if (lv_bar_get_value(progress_bar) != pct)
+              lv_bar_set_value(progress_bar, pct, LV_ANIM_OFF);
+          }
+
+          // The compact dialog deliberately has no progress bar, so stage
+          // updates must remain independent of the progress-bar branch.
+          if (compact_metadata_progress_active && progress_label &&
+              !compact_cancel_requested) {
+            const char *stage = "Starting lookup...";
+            if (pct >= 85)
+              stage = "Preparing editable fields...";
+            else if (pct >= 60)
+              stage = "Loading songs and duration...";
+            else if (pct >= 35)
+              stage = "Checking alternate details...";
+            else if (currentMode == MODE_BOOK)
+              stage = "Checking Google Books...";
+            else
+              stage = "Checking MusicBrainz...";
+            if (strcmp(lv_label_get_text(progress_label), stage) != 0)
+              lv_label_set_text_static(progress_label, stage);
           }
           // Keep the compact TLS dialog's text static. Updating LVGL label
           // buffers during a handshake competes for the same internal heap.
-          if (progress_label && !compact_lyrics_progress_active) {
+          if (progress_label && !compact_tls_progress_active) {
             String status = BackgroundWorker::getStatusMessage();
             lv_label_set_text(progress_label, status.c_str());
           }
@@ -2048,8 +2260,13 @@ void setupMainUI() {
               BackgroundWorker::getLastCompletedJobType();
           const bool completedSuccessfully =
               BackgroundWorker::wasLastJobSuccessful();
+          const String completedMessage =
+              BackgroundWorker::getStatusMessage();
           dismiss_progress_modal();
           bool completionHandled = false;
+
+          if (completedMessage == "Cancelled")
+            completionHandled = true;
 
           if (completedJob == JOB_COVER_DOWNLOAD) {
             if (btn_search)
@@ -2059,7 +2276,11 @@ void setupMainUI() {
             if (btn_metadata_fetch)
               lv_obj_clear_state(btn_metadata_fetch, LV_STATE_DISABLED);
             ItemView metadata;
-            if (completedSuccessfully &&
+            if (completedMessage == "Cancelled") {
+              // Clear any result that raced with a late cancel tap, but leave
+              // the edit form exactly as the user had it.
+              BackgroundWorker::takeMetadataResult(metadata);
+            } else if (completedSuccessfully &&
                 BackgroundWorker::takeMetadataResult(metadata) &&
                 add_item_panel) {
               apply_metadata_result(metadata);
@@ -2072,7 +2293,7 @@ void setupMainUI() {
           // Show completion info
           // Note: using show_info_popup might act as double popup if multiple
           // jobs run But for Bulk Sync it's useful.
-          String msg = BackgroundWorker::getStatusMessage();
+          String msg = completedMessage;
           if (!isBusy && !completionHandled && msg.length() > 0 &&
               msg != "Idle") {
             if (msg == "Sync Complete") {
@@ -2152,8 +2373,12 @@ void update_item_display() {
       displayed_cover_file = "";
       schedule_cover_load("");
       schedule_track_summary_load("");
-      lv_label_set_text(label_title, "Your library is empty");
-      lv_label_set_text(label_artist, "Use Add New to create the first item");
+      lv_label_set_text(label_title, sd_card_ready ? "Your library is empty"
+                                                   : "SD card unavailable");
+      lv_label_set_text(label_artist,
+                        sd_card_ready
+                            ? "Use Add New to create the first item"
+                            : "Check the card and restart; no data was erased");
       lv_label_set_text(label_genre, "");
       lv_label_set_text(label_year, "");
       lv_label_set_text(label_led, "");
@@ -2195,18 +2420,18 @@ void update_item_display() {
     lv_obj_clear_state(btn_edit, LV_STATE_DISABLED);
   lv_obj_clear_state(label_favorite, LV_STATE_DISABLED);
 
-  d_title = sanitizeText(item.title);
-  d_artist_line = "by " + sanitizeText(item.artistOrAuthor);
-  d_genre = "Genre: " + sanitizeText(item.genre);
+  d_title = sanitizeLvglText(item.title);
+  d_artist_line = "by " + sanitizeLvglText(item.artistOrAuthor);
+  d_genre = "Genre: " + sanitizeLvglText(item.genre);
   d_year_line = "Year: " + String(item.year);
   d_ledIndices = item.ledIndices;
   d_uniqueID = item.uniqueID;
-  d_notes = item.notes;
+  d_notes = sanitizeLvglText(item.notes);
   d_coverFile = item.coverFile;
   d_coverUrl = item.coverUrl;
   d_favorite = item.favorite;
   d_barcode = item.codecOrIsbn;
-  d_extra_info = item.extraInfo;
+  d_extra_info = sanitizeLvglText(item.extraInfo);
 
   /*
   // DEBUG: Print complete item data
@@ -2499,7 +2724,7 @@ void btn_favorite_clicked(lv_event_t *e) {
   if (isFav) {
     lv_label_set_text(label_favorite, LV_SYMBOL_MINUS);
     lv_obj_set_style_text_color(label_favorite, lv_color_hex(0xff4444), 0);
-    Serial.printf("â­ Marked '%s' as favorite\n", title.c_str());
+    Serial.printf("Marked '%s' as favorite\n", title.c_str());
   } else {
     lv_label_set_text(label_favorite, LV_SYMBOL_PLUS);
     lv_obj_set_style_text_color(label_favorite,
@@ -2664,22 +2889,22 @@ static void render_search_batch() {
     if (currentMode == MODE_CD && libraryIdx >= 0 &&
         libraryIdx < (int)cdLibrary.size()) {
       const CD &item = cdLibrary[libraryIdx];
-      labelStr = item.title.c_str();
-      labelStr += "  —  ";
-      labelStr += item.artist.c_str();
+      labelStr = sanitizeLvglText(String(item.title.c_str()));
+      labelStr += "  -  ";
+      labelStr += sanitizeLvglText(String(item.artist.c_str()));
       itemYear = item.year;
     } else if (currentMode == MODE_BOOK && libraryIdx >= 0 &&
                libraryIdx < (int)bookLibrary.size()) {
       const Book &item = bookLibrary[libraryIdx];
-      labelStr = item.title.c_str();
-      labelStr += "  —  ";
-      labelStr += item.author.c_str();
+      labelStr = sanitizeLvglText(String(item.title.c_str()));
+      labelStr += "  -  ";
+      labelStr += sanitizeLvglText(String(item.author.c_str()));
       itemYear = item.year;
     } else {
       continue;
     }
     if (itemYear > 0)
-      labelStr += "  •  " + String(itemYear);
+      labelStr += "  |  " + String(itemYear);
     const char *resultIcon = currentMode == MODE_BOOK ? LV_SYMBOL_FILE
                                                       : LV_SYMBOL_AUDIO;
     lv_obj_t *btn = lv_list_add_btn(list_results, resultIcon, labelStr.c_str());
@@ -3785,7 +4010,7 @@ void show_edit_item_ui(int index) {
                 return;
 
               if (deleteItemAt(edit_item_index)) {
-                Serial.println("✅ Deleted successfully!");
+                Serial.println("Deleted successfully!");
                 if (currentCDIndex >= getItemCount())
                   currentCDIndex = getItemCount() - 1;
                 if (currentCDIndex < 0)
@@ -3793,7 +4018,7 @@ void show_edit_item_ui(int index) {
                 update_item_display();
                 close_add_item_ui();
               } else {
-                Serial.println("❌ Failed to delete!");
+                Serial.println("Failed to delete!");
                 show_info_popup("DELETE FAILED",
                                 "The item could not be removed from storage.");
               }
@@ -3826,11 +4051,12 @@ void manual_entry_confirm_cb(lv_event_t *e) {
 static void apply_metadata_result(const ItemView &staged) {
   updateCurrentEditItem(staged);
   if (ta_title)
-    lv_textarea_set_text(ta_title, staged.title.c_str());
+    lv_textarea_set_text(ta_title, sanitizeLvglText(staged.title).c_str());
   if (ta_artist)
-    lv_textarea_set_text(ta_artist, staged.artistOrAuthor.c_str());
+    lv_textarea_set_text(ta_artist,
+                         sanitizeLvglText(staged.artistOrAuthor).c_str());
   if (ta_genre)
-    lv_textarea_set_text(ta_genre, staged.genre.c_str());
+    lv_textarea_set_text(ta_genre, sanitizeLvglText(staged.genre).c_str());
   if (ta_year)
     lv_textarea_set_text(ta_year, String(staged.year).c_str());
 
@@ -3874,6 +4100,13 @@ void fetch_barcode_cb(lv_event_t *e) {
     return;
   }
 
+  // Construct a small, static progress surface before the TLS worker starts.
+  // Avoiding the larger animated dialog and status-label churn preserves a
+  // contiguous internal heap block for MbedTLS.
+  const String progressTitle = "FETCHING " + getModeName() + " DETAILS";
+  show_compact_network_progress(
+      progressTitle.c_str(), true,
+      "Please wait; the interface is responsive.", true);
   const bool queued = BackgroundWorker::addJob(
       {JOB_METADATA_LOOKUP, String(barcode), edit_item_index, "", nullptr,
        true});
@@ -3881,6 +4114,7 @@ void fetch_barcode_cb(lv_event_t *e) {
     if (btn_metadata_fetch)
       lv_obj_add_state(btn_metadata_fetch, LV_STATE_DISABLED);
   } else {
+    dismiss_progress_modal();
     show_info_popup("Busy", "The metadata request could not be queued.", NULL,
                     NULL);
   }
@@ -3904,6 +4138,13 @@ void close_add_item_ui() { // Renamed from close_add_item_ui
 }
 
 void perform_save_item() {
+  if (!sd_card_ready) {
+    show_info_popup("SD Card Unavailable",
+                    "The library card is not mounted. Check the card and "
+                    "restart before saving.",
+                    NULL, NULL);
+    return;
+  }
   Serial.println(">> perform_save_item() ENTERED");
   auto validationError = [](const String &message) {
     show_info_popup("Check This Entry", message.c_str(), NULL, NULL);
@@ -4035,7 +4276,7 @@ void perform_save_item() {
     for (int i = 0; i < getItemCount(); ++i) {
       if (i == edit_item_index)
         continue;
-      ItemView existing = getItemAt(i);
+      ItemView existing = getItemAtRAM(i);
       if (existing.uniqueID == staged.uniqueID ||
           sanitizeFilename(existing.uniqueID) == safeID) {
         validationError("That unique ID conflicts with an existing item.");
@@ -4044,37 +4285,9 @@ void perform_save_item() {
     }
   }
 
-  // --- DEBUG LOGGING ---
-  Serial.println("\n========== SAVING ITEM ==========");
-  Serial.printf("Unique ID: '%s'\n", staged.uniqueID.c_str());
-  Serial.printf("Title:     '%s'\n", staged.title.c_str());
-  Serial.printf("Artist:    '%s'\n", staged.artistOrAuthor.c_str());
-  Serial.printf("LEDs:      (Count: %d)\n", staged.ledIndices.size());
-  for (int l : staged.ledIndices)
-    Serial.printf("  - %d\n", l);
-  Serial.println("=================================\n");
-
-  if (edit_item_index >= 0 && edit_item_index < getItemCount()) {
-    // === EDIT MODE ===
-    ItemView previousEdit = getCurrentEditItem();
-    updateCurrentEditItem(staged); // Sync staging struct
-
-    if (saveCurrentEditItem(preservedUniqueID.c_str())) {
-      setItem(edit_item_index, staged);
-      Serial.printf("✅ Saved %s: %s\n", getModeName().c_str(),
-                    staged.title.c_str());
-      setCurrentItemIndex(edit_item_index);
-      update_item_display();
-      close_add_item_ui();
-    } else {
-      updateCurrentEditItem(previousEdit);
-      Serial.println("❌ Failed to save item to SD!");
-      show_info_popup("Save Failed",
-                      "The previous item was kept unchanged. Check the SD card.",
-                      NULL, NULL);
-    }
-  } else {
-    // === ADD MODE ===
+  const bool editingExisting =
+      edit_item_index >= 0 && edit_item_index < getItemCount();
+  if (!editingExisting) {
     if (staged.uniqueID.length() == 0) {
       if (staged.codecOrIsbn.length() > 0)
         staged.uniqueID = staged.codecOrIsbn;
@@ -4096,28 +4309,47 @@ void perform_save_item() {
       String prefix = getUidPrefix();
       staged.coverFile = prefix + sanitizeFilename(staged.uniqueID) + ".jpg";
     }
+  }
 
-    updateCurrentEditItem(staged); // Sync staging struct
+  // The form contains the complete detail record, so keep the post-save
+  // display on its RAM copy rather than immediately reading the SD card again.
+  staged.detailsLoaded = true;
 
-    if (saveCurrentEditItem()) {
-      if (!addItemToLibrary(staged)) {
-        show_info_popup("Save Failed",
-                        "The item was saved but the library could not be updated. "
-                        "Please restart and try again.",
-                        NULL, NULL);
-        return;
-      }
-      Serial.printf("âœ… Added %s: %s\n", getModeName().c_str(),
-                    staged.title.c_str());
-      setCurrentItemIndex(getItemCount() - 1);
-      update_item_display();
-      close_add_item_ui(); // Renamed from close_add_item_ui
-    } else {
-      Serial.println("âŒ Failed to save item!");
-      show_info_popup("Save Failed",
-                      "The item was not added. Check the SD card and try again.",
-                      NULL, NULL);
-    }
+  Serial.println("\n========== QUEUING ITEM SAVE ==========");
+  Serial.printf("Unique ID: '%s'\n", staged.uniqueID.c_str());
+  Serial.printf("Title:     '%s'\n", staged.title.c_str());
+  Serial.printf("Artist:    '%s'\n", staged.artistOrAuthor.c_str());
+  Serial.printf("LEDs:      (Count: %d)\n", staged.ledIndices.size());
+  Serial.println("=======================================\n");
+
+  ItemSavePayload *payload = new (std::nothrow) ItemSavePayload();
+  if (!payload) {
+    show_info_popup("Save Failed", "There is not enough memory to start save.",
+                    NULL, NULL);
+    return;
+  }
+  payload->item = staged;
+  payload->mode = currentMode;
+  payload->editIndex = editingExisting ? edit_item_index : -1;
+  payload->oldUniqueID = editingExisting ? preservedUniqueID : "";
+
+  BackgroundJob saveJob{JOB_ITEM_SAVE,
+                        staged.uniqueID,
+                        payload->editIndex,
+                        payload->oldUniqueID,
+                        nullptr,
+                        true};
+  saveJob.savePayload = payload;
+
+  const String saveTitle = "SAVING " + getModeName();
+  show_compact_network_progress(
+      saveTitle.c_str(), false,
+      "Writing and verifying the SD card; controls remain responsive.");
+  if (!BackgroundWorker::addJob(saveJob)) {
+    delete payload;
+    dismiss_progress_modal();
+    show_info_popup("Busy", "The save could not be queued. Please try again.",
+                    NULL, NULL);
   }
 }
 
@@ -4140,7 +4372,7 @@ void save_new_item_cb(lv_event_t *e) {
     // Linear search for ID (RAM only for speed)
     for (int i = 0; i < count; i++) {
       if (getItemAtRAM(i).uniqueID == targetID) {
-        ItemView item = getItemAt(i); // Fetch full item for display
+        ItemView item = getItemAtRAM(i);
         String duplicateMessage = "This barcode already belongs to:\n" +
                                   item.title + "\n\nAdd another copy anyway?";
         show_confirmation_popup(
@@ -5404,10 +5636,11 @@ void show_settings_ui() {
         lv_obj_del(lv_obj_get_parent(lv_event_get_target(e)));
         saveSettings();
         if (label_brand_title)
-          lv_label_set_text(label_brand_title, setting_brand_title.c_str());
+          lv_label_set_text(label_brand_title,
+                            sanitizeLvglText(setting_brand_title).c_str());
         if (label_brand_subtitle)
           lv_label_set_text(label_brand_subtitle,
-                            setting_brand_subtitle.c_str());
+                            sanitizeLvglText(setting_brand_subtitle).c_str());
         if (settings_reboot_needed) {
           Serial.println("Rebooting for new settings...");
           show_info_popup("SETTINGS SAVED",
@@ -5675,7 +5908,8 @@ void show_settings_ui() {
   lv_obj_align(ta_brand_title, LV_ALIGN_TOP_LEFT, 180, 12);
   lv_textarea_set_one_line(ta_brand_title, true);
   lv_textarea_set_max_length(ta_brand_title, BRAND_TITLE_MAX_LENGTH);
-  lv_textarea_set_text(ta_brand_title, setting_brand_title.c_str());
+  lv_textarea_set_text(ta_brand_title,
+                       sanitizeLvglText(setting_brand_title).c_str());
   style_input_control(ta_brand_title);
   lv_obj_add_event_cb(
       ta_brand_title,
@@ -5704,7 +5938,8 @@ void show_settings_ui() {
   lv_obj_align(ta_brand_subtitle, LV_ALIGN_TOP_LEFT, 180, 70);
   lv_textarea_set_one_line(ta_brand_subtitle, true);
   lv_textarea_set_max_length(ta_brand_subtitle, BRAND_SUBTITLE_MAX_LENGTH);
-  lv_textarea_set_text(ta_brand_subtitle, setting_brand_subtitle.c_str());
+  lv_textarea_set_text(ta_brand_subtitle,
+                       sanitizeLvglText(setting_brand_subtitle).c_str());
   style_input_control(ta_brand_subtitle);
   lv_obj_add_event_cb(
       ta_brand_subtitle,

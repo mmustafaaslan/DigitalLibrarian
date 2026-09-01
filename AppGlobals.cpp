@@ -57,6 +57,7 @@ int setting_cache_size =
 bool is_screen_off = false;
 bool filter_active = false;
 bool settings_reboot_needed = false;
+bool sd_card_ready = false;
 String filter_genre = "";
 int filter_decade = 0;
 bool filter_favorites_only = false;

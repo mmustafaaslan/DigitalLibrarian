@@ -562,6 +562,54 @@ inline void setItem(int index, const ItemView &view) {
     xSemaphoreGiveRecursive(libraryMutex);
 }
 
+// Persist an immutable form snapshot without touching the global edit objects.
+// This is safe to call from the background worker while LVGL remains active.
+inline bool saveItemViewToStorage(const ItemView &view, MediaMode mode,
+                                  const char *oldUniqueID = nullptr) {
+  switch (mode) {
+  case MODE_BOOK: {
+    Book book;
+    book.title = view.title.c_str();
+    book.author = view.artistOrAuthor.c_str();
+    book.genre = view.genre.c_str();
+    book.year = view.year;
+    book.uniqueID = view.uniqueID.c_str();
+    book.coverUrl = view.coverUrl.c_str();
+    book.coverFile = view.coverFile.c_str();
+    book.favorite = view.favorite;
+    book.notes = view.notes.c_str();
+    book.isbn = view.codecOrIsbn.c_str();
+    book.ledIndices = view.ledIndices;
+    book.pageCount = view.pageCount;
+    book.currentPage = view.currentPage;
+    book.publisher = view.publisher.c_str();
+    book.detailsLoaded = view.detailsLoaded;
+    return Storage.saveBook(book, oldUniqueID);
+  }
+  case MODE_CD: {
+    CD cd;
+    cd.title = view.title.c_str();
+    cd.artist = view.artistOrAuthor.c_str();
+    cd.genre = view.genre.c_str();
+    cd.year = view.year;
+    cd.uniqueID = view.uniqueID.c_str();
+    cd.coverUrl = view.coverUrl.c_str();
+    cd.coverFile = view.coverFile.c_str();
+    cd.favorite = view.favorite;
+    cd.notes = view.notes.c_str();
+    cd.barcode = view.codecOrIsbn.c_str();
+    cd.ledIndices = view.ledIndices;
+    cd.trackCount = view.trackCount;
+    cd.releaseMbid = view.releaseMbid.c_str();
+    cd.totalDurationMs = view.totalDurationMs;
+    cd.detailsLoaded = view.detailsLoaded;
+    return Storage.saveCD(cd, oldUniqueID);
+  }
+  default:
+    return false;
+  }
+}
+
 // --- Persistence Functions ---
 
 // --- Persistence Functions ---

@@ -2,6 +2,305 @@
 #include <ctype.h>
 #include <time.h>
 
+namespace {
+
+bool isUtf8Continuation(unsigned char value) {
+  return (value & 0xC0) == 0x80;
+}
+
+// Decode one UTF-8 code point without ever reading beyond the supplied buffer.
+// Invalid sequences consume one byte and become a visible ASCII question mark.
+uint32_t decodeUtf8(const char *data, size_t length, size_t &offset) {
+  const unsigned char first = static_cast<unsigned char>(data[offset++]);
+  if (first < 0x80)
+    return first;
+
+  if (first >= 0xC2 && first <= 0xDF && offset < length) {
+    const unsigned char second = static_cast<unsigned char>(data[offset]);
+    if (isUtf8Continuation(second)) {
+      offset++;
+      return ((first & 0x1F) << 6) | (second & 0x3F);
+    }
+  } else if (first >= 0xE0 && first <= 0xEF && offset + 1 < length) {
+    const unsigned char second = static_cast<unsigned char>(data[offset]);
+    const unsigned char third = static_cast<unsigned char>(data[offset + 1]);
+    const bool validSecond =
+        isUtf8Continuation(second) &&
+        !(first == 0xE0 && second < 0xA0) &&
+        !(first == 0xED && second >= 0xA0);
+    if (validSecond && isUtf8Continuation(third)) {
+      offset += 2;
+      return ((first & 0x0F) << 12) | ((second & 0x3F) << 6) |
+             (third & 0x3F);
+    }
+  } else if (first >= 0xF0 && first <= 0xF4 && offset + 2 < length) {
+    const unsigned char second = static_cast<unsigned char>(data[offset]);
+    const unsigned char third = static_cast<unsigned char>(data[offset + 1]);
+    const unsigned char fourth = static_cast<unsigned char>(data[offset + 2]);
+    const bool validSecond =
+        isUtf8Continuation(second) &&
+        !(first == 0xF0 && second < 0x90) &&
+        !(first == 0xF4 && second >= 0x90);
+    if (validSecond && isUtf8Continuation(third) &&
+        isUtf8Continuation(fourth)) {
+      offset += 3;
+      return ((first & 0x07) << 18) | ((second & 0x3F) << 12) |
+             ((third & 0x3F) << 6) | (fourth & 0x3F);
+    }
+  }
+
+  return '?';
+}
+
+void appendAscii(PsramString &output, const char *value) {
+  output.append(value);
+}
+
+void appendLvglCodePoint(PsramString &output, uint32_t codePoint) {
+  if (codePoint < 0x80) {
+    // Preserve useful whitespace, but discard control characters that can
+    // confuse LVGL's text layout.
+    if (codePoint >= 0x20 || codePoint == '\n' || codePoint == '\r' ||
+        codePoint == '\t')
+      output.push_back(static_cast<char>(codePoint));
+    return;
+  }
+
+  // Combining accents follow an already rendered base letter.
+  if (codePoint >= 0x0300 && codePoint <= 0x036F)
+    return;
+
+  switch (codePoint) {
+  case 0x00A0:
+    output.push_back(' ');
+    return;
+  case 0x00A3:
+    appendAscii(output, "GBP");
+    return;
+  case 0x00A5:
+    appendAscii(output, "YEN");
+    return;
+  case 0x00A9:
+    appendAscii(output, "(c)");
+    return;
+  case 0x00AE:
+    appendAscii(output, "(R)");
+    return;
+  case 0x00B7:
+  case 0x2022:
+    output.push_back('-');
+    return;
+  case 0x00D7:
+    output.push_back('x');
+    return;
+  case 0x00C6:
+    appendAscii(output, "AE");
+    return;
+  case 0x00E6:
+    appendAscii(output, "ae");
+    return;
+  case 0x00D0:
+    output.push_back('D');
+    return;
+  case 0x00F0:
+    output.push_back('d');
+    return;
+  case 0x00DE:
+    appendAscii(output, "TH");
+    return;
+  case 0x00FE:
+    appendAscii(output, "th");
+    return;
+  case 0x00DF:
+    appendAscii(output, "ss");
+    return;
+  case 0x0152:
+    appendAscii(output, "OE");
+    return;
+  case 0x0153:
+    appendAscii(output, "oe");
+    return;
+  case 0x0131:
+    output.push_back('i');
+    return;
+  case 0x0141:
+    output.push_back('L');
+    return;
+  case 0x0142:
+    output.push_back('l');
+    return;
+  case 0x2010:
+  case 0x2011:
+  case 0x2012:
+  case 0x2013:
+  case 0x2014:
+  case 0x2015:
+  case 0x2212:
+    output.push_back('-');
+    return;
+  case 0x2018:
+  case 0x2019:
+  case 0x201A:
+  case 0x02BC:
+    output.push_back('\'');
+    return;
+  case 0x201C:
+  case 0x201D:
+  case 0x201E:
+    output.push_back('"');
+    return;
+  case 0x2026:
+    appendAscii(output, "...");
+    return;
+  case 0x20AC:
+    appendAscii(output, "EUR");
+    return;
+  case 0x2122:
+    appendAscii(output, "(TM)");
+    return;
+  default:
+    break;
+  }
+
+  // Latin letters with common accents. LVGL's compact Montserrat build only
+  // contains the basic glyph range, so transliterate rather than draw boxes.
+  if ((codePoint >= 0x00C0 && codePoint <= 0x00C5) ||
+      (codePoint >= 0x0100 && codePoint <= 0x0105))
+    output.push_back((codePoint & 1) && codePoint >= 0x0100 ? 'a' : 'A');
+  else if (codePoint >= 0x00E0 && codePoint <= 0x00E5)
+    output.push_back('a');
+  else if (codePoint == 0x00C7 || codePoint == 0x0106 ||
+           codePoint == 0x0108 || codePoint == 0x010A ||
+           codePoint == 0x010C)
+    output.push_back('C');
+  else if (codePoint == 0x00E7 || codePoint == 0x0107 ||
+           codePoint == 0x0109 || codePoint == 0x010B ||
+           codePoint == 0x010D)
+    output.push_back('c');
+  else if (codePoint == 0x010E)
+    output.push_back('D');
+  else if (codePoint == 0x010F)
+    output.push_back('d');
+  else if ((codePoint >= 0x00C8 && codePoint <= 0x00CB) ||
+           codePoint == 0x0112 || codePoint == 0x0114 ||
+           codePoint == 0x0116 || codePoint == 0x0118 ||
+           codePoint == 0x011A)
+    output.push_back('E');
+  else if ((codePoint >= 0x00E8 && codePoint <= 0x00EB) ||
+           codePoint == 0x0113 || codePoint == 0x0115 ||
+           codePoint == 0x0117 || codePoint == 0x0119 ||
+           codePoint == 0x011B)
+    output.push_back('e');
+  else if (codePoint == 0x011C || codePoint == 0x011E ||
+           codePoint == 0x0120 || codePoint == 0x0122)
+    output.push_back('G');
+  else if (codePoint == 0x011D || codePoint == 0x011F ||
+           codePoint == 0x0121 || codePoint == 0x0123)
+    output.push_back('g');
+  else if (codePoint == 0x0124 || codePoint == 0x0126)
+    output.push_back('H');
+  else if (codePoint == 0x0125 || codePoint == 0x0127)
+    output.push_back('h');
+  else if ((codePoint >= 0x00CC && codePoint <= 0x00CF) ||
+           codePoint == 0x0128 || codePoint == 0x012A ||
+           codePoint == 0x012C || codePoint == 0x012E)
+    output.push_back('I');
+  else if ((codePoint >= 0x00EC && codePoint <= 0x00EF) ||
+           codePoint == 0x0129 || codePoint == 0x012B ||
+           codePoint == 0x012D || codePoint == 0x012F)
+    output.push_back('i');
+  else if (codePoint == 0x0134)
+    output.push_back('J');
+  else if (codePoint == 0x0135)
+    output.push_back('j');
+  else if (codePoint == 0x0136)
+    output.push_back('K');
+  else if (codePoint == 0x0137 || codePoint == 0x0138)
+    output.push_back('k');
+  else if (codePoint == 0x00D1 || codePoint == 0x0143 ||
+           codePoint == 0x0145 || codePoint == 0x0147)
+    output.push_back('N');
+  else if (codePoint == 0x00F1 || codePoint == 0x0144 ||
+           codePoint == 0x0146 || codePoint == 0x0148)
+    output.push_back('n');
+  else if ((codePoint >= 0x00D2 && codePoint <= 0x00D6) ||
+           codePoint == 0x00D8 || codePoint == 0x014C ||
+           codePoint == 0x014E || codePoint == 0x0150)
+    output.push_back('O');
+  else if ((codePoint >= 0x00F2 && codePoint <= 0x00F6) ||
+           codePoint == 0x00F8 || codePoint == 0x014D ||
+           codePoint == 0x014F || codePoint == 0x0151)
+    output.push_back('o');
+  else if (codePoint == 0x0154 || codePoint == 0x0156 ||
+           codePoint == 0x0158)
+    output.push_back('R');
+  else if (codePoint == 0x0155 || codePoint == 0x0157 ||
+           codePoint == 0x0159)
+    output.push_back('r');
+  else if (codePoint == 0x015A || codePoint == 0x015C ||
+           codePoint == 0x015E || codePoint == 0x0160)
+    output.push_back('S');
+  else if (codePoint == 0x015B || codePoint == 0x015D ||
+           codePoint == 0x015F || codePoint == 0x0161)
+    output.push_back('s');
+  else if (codePoint == 0x0162 || codePoint == 0x0164 ||
+           codePoint == 0x0166)
+    output.push_back('T');
+  else if (codePoint == 0x0163 || codePoint == 0x0165 ||
+           codePoint == 0x0167)
+    output.push_back('t');
+  else if ((codePoint >= 0x00D9 && codePoint <= 0x00DC) ||
+           codePoint == 0x0168 || codePoint == 0x016A ||
+           codePoint == 0x016C || codePoint == 0x016E ||
+           codePoint == 0x0170 || codePoint == 0x0172)
+    output.push_back('U');
+  else if ((codePoint >= 0x00F9 && codePoint <= 0x00FC) ||
+           codePoint == 0x0169 || codePoint == 0x016B ||
+           codePoint == 0x016D || codePoint == 0x016F ||
+           codePoint == 0x0171 || codePoint == 0x0173)
+    output.push_back('u');
+  else if (codePoint == 0x00DD || codePoint == 0x0176 ||
+           codePoint == 0x0178)
+    output.push_back('Y');
+  else if (codePoint == 0x00FD || codePoint == 0x00FF ||
+           codePoint == 0x0177)
+    output.push_back('y');
+  else if (codePoint == 0x0174)
+    output.push_back('W');
+  else if (codePoint == 0x0175)
+    output.push_back('w');
+  else if (codePoint == 0x0179 || codePoint == 0x017B ||
+           codePoint == 0x017D)
+    output.push_back('Z');
+  else if (codePoint == 0x017A || codePoint == 0x017C ||
+           codePoint == 0x017E)
+    output.push_back('z');
+  else {
+    // One replacement per unsupported code point is substantially clearer
+    // than one rectangle per UTF-8 byte.
+    output.push_back('?');
+  }
+}
+
+} // namespace
+
+void sanitizeLvglTextInPlace(PsramString &text) {
+  PsramString output;
+  output.reserve(text.size());
+  size_t offset = 0;
+  while (offset < text.size()) {
+    const uint32_t codePoint = decodeUtf8(text.data(), text.size(), offset);
+    appendLvglCodePoint(output, codePoint);
+  }
+  text.swap(output);
+}
+
+String sanitizeLvglText(const String &text) {
+  PsramString output(text.c_str());
+  sanitizeLvglTextInPlace(output);
+  return String(output.c_str());
+}
+
 String sanitizeText(String input) {
   String output = input;
 

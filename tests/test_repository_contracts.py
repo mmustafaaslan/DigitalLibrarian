@@ -13,6 +13,7 @@ WORKER = (ROOT / "BackgroundWorker.cpp").read_text(encoding="utf-8")
 NETWORK = (ROOT / "NetworkManager.cpp").read_text(encoding="utf-8")
 MEDIA = (ROOT / "MediaManager.cpp").read_text(encoding="utf-8")
 GLOBALS = (ROOT / "AppGlobals.cpp").read_text(encoding="utf-8")
+UTILS = (ROOT / "Utils.cpp").read_text(encoding="utf-8")
 TOUCH_PORT = (ROOT / "Waveshare_ST7262_LVGL.cpp").read_text(encoding="utf-8")
 
 
@@ -37,6 +38,23 @@ class RepositoryContracts(unittest.TestCase):
     def test_storage_writes_use_temporary_files(self):
         self.assertIn('String tmpPath = path + ".tmp";', STORAGE)
         self.assertIn("replaceFileWithRollback", STORAGE)
+
+    def test_sd_mount_failure_is_retried_and_never_shown_as_empty_library(self):
+        self.assertIn("bool mountLibrarySdCard()", SKETCH)
+        self.assertIn("frequencies[] = {4000000, 2000000, 1000000}", SKETCH)
+        self.assertIn("SD.end()", SKETCH)
+        self.assertIn("SD.cardType() != CARD_NONE", SKETCH)
+        self.assertIn("sd_card_ready = mountLibrarySdCard()", SKETCH)
+        self.assertIn('"SD card unavailable"', UI)
+        self.assertIn("no data was erased", UI)
+
+        save_handler = UI[UI.index("void perform_save_item() {"):]
+        save_handler = save_handler[:save_handler.index("void save_new_item_cb")]
+        self.assertIn("if (!sd_card_ready)", save_handler)
+        self.assertLess(
+            save_handler.index("if (!sd_card_ready)"),
+            save_handler.index("BackgroundWorker::addJob"),
+        )
 
     def test_detail_updates_roll_back_when_index_save_fails(self):
         self.assertGreaterEqual(STORAGE.count("rollbackReplacedFile(path, hadDetail)"), 3)
@@ -75,8 +93,18 @@ class RepositoryContracts(unittest.TestCase):
         self.assertIn('getString("brand_sub", DEFAULT_BRAND_SUBTITLE)', GLOBALS)
         self.assertIn('putString("brand_title", setting_brand_title)', GLOBALS)
         self.assertIn('putString("brand_sub", setting_brand_subtitle)', GLOBALS)
-        self.assertIn("lv_label_set_text(label_brand_title, setting_brand_title.c_str())", UI)
-        self.assertIn("lv_label_set_text(label_brand_subtitle, setting_brand_subtitle.c_str())", UI)
+        self.assertIn("sanitizeLvglText(setting_brand_title).c_str()", UI)
+        self.assertIn("sanitizeLvglText(setting_brand_subtitle).c_str()", UI)
+
+    def test_lvgl_text_is_normalized_without_changing_cached_source_data(self):
+        self.assertIn("void sanitizeLvglTextInPlace(PsramString &text)", UTILS)
+        self.assertIn("decodeUtf8(text.data(), text.size(), offset)", UTILS)
+        self.assertIn("sanitizeLvglTextInPlace(popupData->lyrics)", UI)
+        self.assertIn("lv_label_set_text_static(chunkLabel", UI)
+        self.assertNotIn('labelStr += "  —  "', UI)
+        self.assertNotIn('labelStr += "  •  "', UI)
+        self.assertIn('labelStr += "  -  "', UI)
+        self.assertIn('labelStr += "  |  "', UI)
 
     def test_delete_cover_action_requires_explicit_cover_tap(self):
         cover_setup = UI[UI.index("img_cover = lv_img_create"):]
@@ -174,6 +202,120 @@ class RepositoryContracts(unittest.TestCase):
         self.assertIn("case JOB_LYRICS_FETCH_ONE", WORKER)
         self.assertIn("case JOB_LYRICS_FETCH_ALL", WORKER)
 
+    def test_slow_network_operations_are_cooperatively_cancellable(self):
+        worker_header = (ROOT / "BackgroundWorker.h").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("static void requestCancel()", worker_header)
+        self.assertIn("std::atomic<bool> _cancelRequested", worker_header)
+        self.assertIn("static void requestSkipCurrent()", worker_header)
+        self.assertIn("std::atomic<bool> _skipRequested", worker_header)
+        self.assertIn("BackgroundWorker::requestCancel()", UI)
+        self.assertIn("Cancelling at the next safe checkpoint", UI)
+        self.assertIn(
+            'setStatus("Cancelling at the next safe checkpoint..."',
+            WORKER,
+        )
+        self.assertIn('lv_label_set_text_static(label, "CANCELLING")', UI)
+        self.assertIn("isCancellationRequested()", MEDIA)
+
+        response_reader = MEDIA[MEDIA.index(
+            "bool readHttpResponseToPsram"
+        ):MEDIA.index("bool extractLyricsFromResponse")]
+        self.assertIn("networkAbortRequested()", response_reader)
+        self.assertIn("body.clear()", response_reader)
+        abort_helper = MEDIA[MEDIA.index("bool networkAbortRequested()"):]
+        abort_helper = abort_helper[:abort_helper.index(
+            "bool readHttpResponseToPsram"
+        )]
+        self.assertIn("isCancellationRequested()", abort_helper)
+        self.assertIn("isSkipRequested()", abort_helper)
+
+        metadata_handler = UI[UI.index("void fetch_barcode_cb"):]
+        metadata_handler = metadata_handler[:metadata_handler.index(
+            "void close_add_item_ui"
+        )]
+        self.assertIn(
+            '"Please wait; the interface is responsive.", true',
+            metadata_handler,
+        )
+
+        save_handler = UI[UI.index("void perform_save_item() {"):]
+        save_handler = save_handler[:save_handler.index(
+            "void save_new_item_cb"
+        )]
+        self.assertIn("Writing and verifying the SD card", save_handler)
+        self.assertNotIn("Writing and verifying the SD card; controls remain responsive.\", true", save_handler)
+
+        bulk_sync = WORKER[WORKER.index("case JOB_BULK_SYNC"):]
+        bulk_sync = bulk_sync[:bulk_sync.index("case JOB_COVER_DOWNLOAD")]
+        self.assertIn("isCancellationRequested()", bulk_sync)
+        self.assertIn("_skipRequested.exchange", bulk_sync)
+        self.assertIn("!isSkipRequested()", bulk_sync)
+        self.assertIn("Sync stopped: WiFi disconnected", bulk_sync)
+        self.assertIn("String(i + 1)", bulk_sync)
+        self.assertIn("item.coverUrl", bulk_sync)
+
+        cover_download = NETWORK[NETWORK.index(
+            "bool AppNetworkManager::downloadCoverImage"
+        ):NETWORK.index("void AppNetworkManager::forceUpdateWLED")]
+        self.assertIn("BackgroundWorker::isCancellationRequested()", cover_download)
+        self.assertIn("BackgroundWorker::isSkipRequested()", cover_download)
+        self.assertIn("bool quickMode", cover_download)
+        self.assertIn("quickMode ? 3000 : 8000", cover_download)
+        self.assertIn("quickMode ? 3UL : 8UL", cover_download)
+        self.assertIn(
+            "setHandshakeTimeout(handshakeTimeoutSeconds)", cover_download
+        )
+        self.assertIn("quickMode ? 7000 : 15000", cover_download)
+        self.assertIn("quickMode ? 2500 : 5000", cover_download)
+        self.assertIn("millis() - startedAt < streamTimeoutMs", cover_download)
+        self.assertIn("millis() - lastDataAt < idleTimeoutMs", cover_download)
+        self.assertIn(
+            "downloadCoverImage(downloadUrl, savePath,\n                                                        true)",
+            bulk_sync,
+        )
+
+        generic_progress = UI[UI.index("// --- Progress Monitor Timer ---"):]
+        self.assertIn("progressJob == JOB_BULK_SYNC", generic_progress)
+        self.assertIn("Weak WiFi can slow individual records", generic_progress)
+        self.assertIn("BackgroundWorker::requestSkipCurrent()", generic_progress)
+        self.assertIn('lv_label_set_text_static(progress_skip_label, "SKIP ITEM")', generic_progress)
+
+        # Skip/cancel is observed by the network worker at safe checkpoints.
+        # Closing its live TLS client from the UI core can race the ESP32
+        # networking stack and reboot the board.
+        self.assertNotIn("abortActiveRequest", WORKER)
+        self.assertNotIn("activeRequestClient->stop()", NETWORK)
+        self.assertNotIn("ScopedActiveRequest", NETWORK)
+        self.assertNotIn("ScopedActiveMediaRequest", MEDIA)
+
+        # ESP32 NetworkClientSecure takes handshake timeouts in seconds.
+        # Millisecond-looking values here made Skip appear stuck for minutes.
+        self.assertNotRegex(
+            MEDIA + NETWORK,
+            r"setHandshakeTimeout\((?:2000|3000|8000|10000|15000)\)",
+        )
+
+    def test_item_save_transaction_never_runs_in_touch_callback(self):
+        save_handler = UI[UI.index("void perform_save_item() {"):]
+        save_handler = save_handler[:save_handler.index(
+            "void save_new_item_cb"
+        )]
+        self.assertIn("JOB_ITEM_SAVE", save_handler)
+        self.assertIn("BackgroundWorker::addJob(saveJob)", save_handler)
+        self.assertNotIn("saveCurrentEditItem", save_handler)
+        self.assertNotIn("Storage.saveCD", save_handler)
+        self.assertNotIn("Storage.saveBook", save_handler)
+        self.assertIn("getItemAtRAM(i)", save_handler)
+
+        save_job = WORKER[WORKER.index("case JOB_ITEM_SAVE"):]
+        save_job = save_job[:save_job.index("case JOB_BULK_SYNC")]
+        self.assertIn("saveItemViewToStorage", save_job)
+        self.assertIn("delete payload", save_job)
+        self.assertIn("takeItemSaveCompletion", UI)
+        self.assertIn("initNavigationCache()", UI)
+
     def test_offline_network_actions_fail_before_queueing(self):
         track_handler = UI[UI.index("static void trackClickHandler"):]
         track_handler = track_handler[:track_handler.index(
@@ -249,7 +391,65 @@ class RepositoryContracts(unittest.TestCase):
 
         progress_monitor = UI[UI.index("// --- Progress Monitor Timer ---"):]
         self.assertIn("if (progress_bar)", progress_monitor)
-        self.assertIn("!compact_lyrics_progress_active", progress_monitor)
+        self.assertIn("!compact_tls_progress_active", progress_monitor)
+
+    def test_metadata_fetch_is_psram_backed_and_only_stages_edits(self):
+        release_lookup = MEDIA[MEDIA.index(
+            "MBRelease MediaManager::fetchReleaseByBarcode"
+        ):MEDIA.index("// Discogs API Fallback")]
+        discogs_lookup = MEDIA[MEDIA.index(
+            "MBRelease MediaManager::fetchReleaseFromDiscogs"
+        ):MEDIA.index("std::vector<Track> MediaManager::fetchTracklist")]
+        book_lookup = MEDIA[MEDIA.index(
+            "bool MediaManager::fetchBookByISBN"
+        ):MEDIA.index("// Metadata Fetching (Online)")]
+        cd_metadata = MEDIA[MEDIA.index(
+            "bool MediaManager::fetchMetadataForBarcode"
+        ):MEDIA.index("bool MediaManager::fetchMetadataForISBN")]
+        book_metadata = MEDIA[MEDIA.index(
+            "bool MediaManager::fetchMetadataForISBN"
+        ):MEDIA.index("String MediaManager::fetchAlbumCoverUrl")]
+
+        for lookup in (release_lookup, discogs_lookup, book_lookup):
+            self.assertIn("readHttpResponseToPsram", lookup)
+            self.assertNotIn("http.getString()", lookup)
+        self.assertNotIn("Storage.saveCD(cd)", cd_metadata)
+        self.assertNotIn("Storage.saveBook(book)", book_metadata)
+        self.assertIn("getItemAtSD(currentJob.index)", WORKER)
+        self.assertIn('startsWith("discogs_")', cd_metadata)
+        self.assertIn("BackgroundWorker::reportProgress", MEDIA)
+        self.assertIn("client.setTimeout(15000)", MEDIA)
+        self.assertIn("http.setTimeout(15000)", MEDIA)
+        self.assertNotIn(
+            "Fetching genre from Discogs to supplement", release_lookup
+        )
+
+        metadata_handler = UI[UI.index("void fetch_barcode_cb"):]
+        metadata_handler = metadata_handler[:metadata_handler.index(
+            "void close_add_item_ui"
+        )]
+        self.assertIn("show_compact_network_progress(", metadata_handler)
+        self.assertIn("progressTitle.c_str(), true", metadata_handler)
+        self.assertIn("Checking MusicBrainz...", UI)
+        self.assertIn("Loading songs and duration...", UI)
+        progress_update = UI[UI.index("// Update"):UI.index("// Close")]
+        self.assertLess(
+            progress_update.index("BackgroundWorker::getProgress()"),
+            progress_update.index("if (progress_bar)"),
+        )
+        self.assertGreater(
+            progress_update.index("compact_metadata_progress_active"),
+            progress_update.index("if (progress_bar)"),
+        )
+
+    def test_tracklist_json_buffer_outlives_zero_copy_parse(self):
+        track_fetch = MEDIA[MEDIA.index(
+            "std::vector<Track> MediaManager::fetchTracklist"
+        ):MEDIA.index("bool MediaManager::fetchBookByISBN")]
+        self.assertIn("PsramString response", track_fetch)
+        self.assertIn("deserializeJson(doc, response.data(), response.size())",
+                      track_fetch)
+        self.assertNotIn("free(psBuffer)", track_fetch)
 
     def test_opening_song_list_never_reads_or_parses_sd_on_ui_thread(self):
         open_handler = UI[UI.index("void show_tracklist_ui(int idx) {"):]

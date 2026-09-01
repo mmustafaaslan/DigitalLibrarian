@@ -12,19 +12,31 @@ bool MediaManager::_taskBusy = false;
 
 namespace {
 static constexpr size_t MAX_LYRICS_RESPONSE_BYTES = 128 * 1024;
+static constexpr size_t MAX_METADATA_RESPONSE_BYTES = 256 * 1024;
+
+bool networkAbortRequested() {
+  return BackgroundWorker::isCancellationRequested() ||
+         BackgroundWorker::isSkipRequested();
+}
+
 
 // HTTPClient::getString() stores the complete response in scarce internal
-// heap. Lyrics providers can return unexpectedly large JSON (or an HTML error
-// page), which used to overlap with TLS and ArduinoJson allocations and reboot
-// the ESP32-S3. Stream into PSRAM with a hard bound instead.
-bool readLyricsResponseToPsram(HTTPClient &http, PsramString &body) {
+// heap. API providers can return unexpectedly large JSON (or an HTML error
+// page), which can overlap with TLS and ArduinoJson allocations and reboot the
+// ESP32-S3. Stream into PSRAM with a hard bound instead.
+bool readHttpResponseToPsram(HTTPClient &http, PsramString &body,
+                             size_t maximumBytes,
+                             uint32_t idleTimeoutMs = 10000) {
   body.clear();
+  if (networkAbortRequested())
+    return false;
   const int expectedLength = http.getSize();
-  if (expectedLength > (int)MAX_LYRICS_RESPONSE_BYTES)
+  if (expectedLength > (int)maximumBytes)
     return false;
 
   const size_t initialCapacity =
-      expectedLength > 0 ? (size_t)expectedLength : 16 * 1024;
+      expectedLength > 0 ? (size_t)expectedLength
+                         : std::min(maximumBytes, (size_t)16 * 1024);
   body.reserve(initialCapacity);
   WiFiClient *stream = http.getStreamPtr();
   if (!stream)
@@ -33,16 +45,20 @@ bool readLyricsResponseToPsram(HTTPClient &http, PsramString &body) {
   uint32_t lastDataAt = millis();
   char chunk[1024];
   while ((http.connected() || stream->available()) &&
-         body.size() < MAX_LYRICS_RESPONSE_BYTES) {
+         body.size() < maximumBytes) {
+    if (networkAbortRequested()) {
+      body.clear();
+      return false;
+    }
     const int available = stream->available();
     if (available <= 0) {
-      if (millis() - lastDataAt > 10000)
+      if (millis() - lastDataAt > idleTimeoutMs)
         break;
       delay(1);
       continue;
     }
 
-    const size_t remaining = MAX_LYRICS_RESPONSE_BYTES - body.size();
+    const size_t remaining = maximumBytes - body.size();
     const size_t toRead =
         std::min(remaining, std::min((size_t)available, sizeof(chunk)));
     const int bytesRead = stream->read((uint8_t *)chunk, toRead);
@@ -52,6 +68,7 @@ bool readLyricsResponseToPsram(HTTPClient &http, PsramString &body) {
     }
     body.append(chunk, (size_t)bytesRead);
     lastDataAt = millis();
+    delay(1); // Keep WiFi/system tasks responsive during a continuous stream.
   }
 
   if (body.empty())
@@ -60,7 +77,7 @@ bool readLyricsResponseToPsram(HTTPClient &http, PsramString &body) {
     return false;
   // An unknown-length response that fills the entire bound is treated as
   // truncated; never attempt to parse or retain it.
-  if (expectedLength < 0 && body.size() == MAX_LYRICS_RESPONSE_BYTES)
+  if (expectedLength < 0 && body.size() == maximumBytes)
     return false;
   return true;
 }
@@ -69,7 +86,7 @@ bool extractLyricsFromResponse(HTTPClient &http, const char *primaryField,
                                const char *fallbackField,
                                PsramString &lyrics) {
   PsramString response;
-  if (!readLyricsResponseToPsram(http, response))
+  if (!readHttpResponseToPsram(http, response, MAX_LYRICS_RESPONSE_BYTES))
     return false;
 
   const size_t jsonCapacity = response.size() + 4096;
@@ -168,20 +185,24 @@ MBRelease MediaManager::fetchReleaseByBarcode(const char *barcode) {
   MBRelease result;
   result.success = false;
 
-  if (WiFi.status() != WL_CONNECTED) {
+  if (WiFi.status() != WL_CONNECTED ||
+      BackgroundWorker::isCancellationRequested()) {
     ErrorHandler::logWarn(ERR_CAT_NETWORK, "WiFi not connected",
                           "fetchReleaseByBarcode");
     return result;
   }
 
+  BackgroundWorker::reportProgress(0.22f);
+
   HTTPClient http;
   WiFiClientSecure client;
   configureTrustedTlsClient(client);
-  client.setHandshakeTimeout(10000);
+  // NetworkClientSecure expects seconds here, unlike HTTPClient::setTimeout.
+  client.setHandshakeTimeout(10);
 
   String url =
       "https://musicbrainz.org/ws/2/release/?query=barcode:" + String(barcode) +
-      "&fmt=json";
+      "&fmt=json&limit=1";
 
   Serial.printf("MediaManager: MusicBrainz Searching barcode %s\n", barcode);
 
@@ -190,34 +211,46 @@ MBRelease MediaManager::fetchReleaseByBarcode(const char *barcode) {
   http.setTimeout(10000);
 
   int httpCode = http.GET();
+  if (BackgroundWorker::isCancellationRequested()) {
+    http.end();
+    client.stop();
+    return result;
+  }
 
   if (httpCode == 200) {
-    String payload = http.getString();
+    PsramString payload;
+    const bool bodyRead = readHttpResponseToPsram(
+        http, payload, MAX_METADATA_RESPONSE_BYTES);
     http.end();
     client.stop();
 
-    int releasesIdx = payload.indexOf("\"releases\":[");
-    if (releasesIdx < 0) {
+    if (!bodyRead) {
+      ErrorHandler::logWarn(ERR_CAT_NETWORK,
+                            "MusicBrainz response was empty or too large",
+                            "fetchReleaseByBarcode");
+      return fetchReleaseFromDiscogs(barcode);
+    }
+
+    // Parse directly from the mutable PSRAM response so JSON strings can be
+    // referenced in place instead of copied into internal RAM.
+    BasicJsonDocument<SpiRamAllocator> doc(16384);
+    const DeserializationError parseError =
+        deserializeJson(doc, payload.data(), payload.size());
+    JsonArray releases = doc["releases"].as<JsonArray>();
+    if (parseError || releases.isNull() || releases.size() == 0) {
       Serial.println("MediaManager: No releases found in MusicBrainz, trying "
                      "Discogs fallback...");
       return fetchReleaseFromDiscogs(barcode);
     }
 
-    int releaseStart = payload.indexOf("{", releasesIdx);
-    if (releaseStart < 0) {
-      Serial.println(
-          "MediaManager: Invalid release format, trying Discogs fallback...");
-      return fetchReleaseFromDiscogs(barcode);
-    }
-
-    result.releaseMbid = extractJSONString(payload, "id", releaseStart);
-    result.title = extractJSONString(payload, "title", releaseStart);
+    JsonObject release = releases[0];
+    result.releaseMbid = release["id"] | "";
+    result.title = release["title"] | "";
     decodeHTMLEntities(result.title);
 
-    // Artist
-    int artistIdx = payload.indexOf("\"artist-credit\"", releaseStart);
-    if (artistIdx > 0) {
-      result.artist = extractJSONString(payload, "name", artistIdx);
+    JsonArray artistCredit = release["artist-credit"].as<JsonArray>();
+    if (!artistCredit.isNull() && artistCredit.size() > 0) {
+      result.artist = artistCredit[0]["name"] | "";
       decodeHTMLEntities(result.artist);
       result.artist = toTitleCase(result.artist); // Capitalize first letters
     }
@@ -225,10 +258,9 @@ MBRelease MediaManager::fetchReleaseByBarcode(const char *barcode) {
     result.title = toTitleCase(result.title); // Capitalize Album Title
 
     // Year
-    int dateIdx = payload.indexOf("\"date\":\"", releaseStart);
-    if (dateIdx > 0) {
-      result.year = payload.substring(dateIdx + 8, dateIdx + 12).toInt();
-    }
+    const char *releaseDate = release["date"] | "";
+    if (releaseDate && strlen(releaseDate) >= 4)
+      result.year = String(releaseDate).substring(0, 4).toInt();
 
     result.success = (result.releaseMbid.length() > 0);
 
@@ -258,17 +290,6 @@ MBRelease MediaManager::fetchReleaseByBarcode(const char *barcode) {
                         result.genre.c_str());
         }
       }
-    } else {
-      // Even if year is present, try to get genre from Discogs
-      // since MusicBrainz barcode search doesn't include genre
-      Serial.println("MediaManager: Fetching genre from Discogs to supplement "
-                     "MusicBrainz...");
-      MBRelease discogsData = fetchReleaseFromDiscogs(barcode);
-      if (discogsData.success && discogsData.genre.length() > 0) {
-        result.genre = discogsData.genre;
-        Serial.printf("MediaManager: Got genre from Discogs: %s\n",
-                      result.genre.c_str());
-      }
     }
   } else {
     http.end();
@@ -289,17 +310,20 @@ MBRelease MediaManager::fetchReleaseFromDiscogs(const char *barcode) {
   MBRelease result;
   result.success = false;
 
-  if (WiFi.status() != WL_CONNECTED) {
+  if (WiFi.status() != WL_CONNECTED ||
+      BackgroundWorker::isCancellationRequested()) {
     ErrorHandler::logWarn(ERR_CAT_NETWORK,
                           "WiFi not connected for Discogs fallback",
                           "fetchReleaseFromDiscogs");
     return result;
   }
 
+  BackgroundWorker::reportProgress(0.42f);
+
   HTTPClient http;
   WiFiClientSecure client;
   configureTrustedTlsClient(client);
-  client.setHandshakeTimeout(10000);
+  client.setHandshakeTimeout(10);
 
   // Discogs barcode search endpoint with API token
   String url =
@@ -313,15 +337,30 @@ MBRelease MediaManager::fetchReleaseFromDiscogs(const char *barcode) {
   http.setTimeout(10000);
 
   int httpCode = http.GET();
+  if (BackgroundWorker::isCancellationRequested()) {
+    http.end();
+    client.stop();
+    return result;
+  }
 
   if (httpCode == 200) {
-    String payload = http.getString();
+    PsramString payload;
+    const bool bodyRead = readHttpResponseToPsram(
+        http, payload, MAX_METADATA_RESPONSE_BYTES);
     http.end();
     client.stop();
 
+    if (!bodyRead) {
+      ErrorHandler::logWarn(ERR_CAT_NETWORK,
+                            "Discogs response was empty or too large",
+                            "fetchReleaseFromDiscogs");
+      return result;
+    }
+
     // Use PSRAM for JSON to save Heap
     BasicJsonDocument<SpiRamAllocator> doc(32768);
-    DeserializationError error = deserializeJson(doc, payload);
+    DeserializationError error =
+        deserializeJson(doc, payload.data(), payload.size());
 
     if (!error) {
       JsonArray results = doc["results"];
@@ -394,14 +433,18 @@ std::vector<Track> MediaManager::fetchTracklist(const char *releaseMbid,
   std::vector<Track> tracks;
   if (WiFi.status() != WL_CONNECTED || !releaseMbid)
     return tracks;
+  if (BackgroundWorker::isCancellationRequested())
+    return tracks;
+
+  BackgroundWorker::reportProgress(0.68f);
 
   delay(1000); // MusicBrainz rate limit
 
   HTTPClient http;
   WiFiClientSecure client;
   configureTrustedTlsClient(client);
-  client.setHandshakeTimeout(10000);
-  client.setTimeout(30000); // 30s TCP timeout (Increase to fix IncompleteInput)
+  client.setHandshakeTimeout(10);
+  client.setTimeout(15000);
 
   // Fetch release with included recordings and genres
   String url = "https://musicbrainz.org/ws/2/release/" + String(releaseMbid) +
@@ -409,7 +452,7 @@ std::vector<Track> MediaManager::fetchTracklist(const char *releaseMbid,
 
   http.begin(client, url);
   http.addHeader("User-Agent", "DigitalLibrarian/1.0");
-  http.setTimeout(30000); // Increased timeout for large JSON
+  http.setTimeout(15000);
 
   int httpCode = http.GET();
   int contentLen = http.getSize();
@@ -419,61 +462,27 @@ std::vector<Track> MediaManager::fetchTracklist(const char *releaseMbid,
                 ESP.getFreeHeap(), ESP.getFreePsram());
 
   if (httpCode == 200) {
-    // Robust Download to PSRAM Buffer:
-    // 1. Allocate buffer in PSRAM
-    // 2. Read entire stream
-    // 3. Deserialize from buffer
-
-    // Safety check for size
-    if (contentLen <= 0) {
-      // Chunked transfer or unknown size - fallback to old method or just try
-      // reading For MusicBrainz, we usually get a Content-Length. If 0 or -1,
-      // we can't safely malloc. But usually MB returns size. Let's assume size
-      // is valid for now or default to a safe max for Stream (e.g. 128KB) if
-      // unknown.
-      if (contentLen < 0)
-        contentLen = 128 * 1024; // Cap at 128KB if unknown
-    }
-
-    char *psBuffer = (char *)ps_malloc(contentLen + 1);
-    if (!psBuffer) {
-      Serial.println("fetchTracklist: PSRAM Allocation Failed!");
-      http.end();
-      client.stop();
+    PsramString response;
+    const bool bodyRead = readHttpResponseToPsram(
+        http, response, MAX_METADATA_RESPONSE_BYTES, 15000);
+    // Release MbedTLS internal buffers before constructing/parsing the JSON
+    // tree. The response itself remains safely resident in PSRAM.
+    http.end();
+    client.stop();
+    if (!bodyRead) {
+      Serial.println("fetchTracklist: response was incomplete or too large");
       return tracks;
     }
 
-    // Read loop
-    WiFiClient *stream = http.getStreamPtr();
-    int totalRead = 0;
-    unsigned long startRead = millis();
-    while (http.connected() && (totalRead < contentLen || contentLen == -1)) {
-      size_t avail = stream->available();
-      if (avail) {
-        int toRead = avail;
-        if (contentLen > 0 && totalRead + toRead > contentLen) {
-          toRead = contentLen - totalRead;
-        }
-        int readBytes = stream->readBytes(psBuffer + totalRead, toRead);
-        totalRead += readBytes;
-      } else {
-        delay(10);
-        if (millis() - startRead > 30000) { // 30s Hard Timeout
-          Serial.println("fetchTracklist: Download Timeout!");
-          break;
-        }
-      }
-      if (contentLen > 0 && totalRead >= contentLen)
-        break;
-    }
-    psBuffer[totalRead] = 0; // Null Check
-
-    Serial.printf("fetchTracklist: Downloaded %d bytes to PSRAM\n", totalRead);
+    Serial.printf("fetchTracklist: Downloaded %u bytes to PSRAM\n",
+                  (unsigned)response.size());
 
     BasicJsonDocument<SpiRamAllocator> doc(98304);
-    DeserializationError error = deserializeJson(doc, psBuffer);
-
-    free(psBuffer); // Important!
+    // This overload is zero-copy. Keep `response` alive until every field has
+    // been extracted below; freeing it here used to leave ArduinoJson holding
+    // dangling pointers and caused intermittent freezes/reboots.
+    DeserializationError error =
+        deserializeJson(doc, response.data(), response.size());
 
     Serial.printf("fetchTracklist: deserializeJson result: %s\n",
                   error.c_str());
@@ -600,29 +609,46 @@ std::vector<Track> MediaManager::fetchTracklist(const char *releaseMbid,
 }
 
 bool MediaManager::fetchBookByISBN(const char *isbn, Book &book) {
-  if (WiFi.status() != WL_CONNECTED)
+  if (WiFi.status() != WL_CONNECTED || networkAbortRequested())
     return false;
 
   Serial.printf("Fetching book metadata for ISBN: %s\n", isbn);
+  BackgroundWorker::reportProgress(0.25f);
 
   HTTPClient http;
   WiFiClientSecure client;
   configureTrustedTlsClient(client);
+  if (networkAbortRequested())
+    return false;
+  client.setHandshakeTimeout(10);
   // client.setBufferSizes(1024, 512); // Optimize Buffers
 
   String url =
-      "https://www.googleapis.com/books/v1/volumes?q=isbn:" + String(isbn);
+      "https://www.googleapis.com/books/v1/volumes?q=isbn:" + String(isbn) +
+      "&maxResults=1";
   http.begin(client, url);
   http.setTimeout(10000);
 
   int httpCode = http.GET();
-  if (httpCode == 200) {
-    String payload = http.getString();
+  if (networkAbortRequested()) {
     http.end();
+    client.stop();
+    return false;
+  }
+  if (httpCode == 200) {
+    PsramString payload;
+    const bool bodyRead = readHttpResponseToPsram(
+        http, payload, MAX_METADATA_RESPONSE_BYTES);
+    http.end();
+    client.stop();
+    if (!bodyRead)
+      return false;
+
+    BackgroundWorker::reportProgress(0.85f);
 
     // Use PSRAM for JSON to save Heap
     BasicJsonDocument<SpiRamAllocator> doc(32768);
-    if (deserializeJson(doc, payload))
+    if (deserializeJson(doc, payload.data(), payload.size()))
       return false;
 
     if (doc["totalItems"] == 0) {
@@ -679,13 +705,15 @@ bool MediaManager::fetchBookByISBN(const char *isbn, Book &book) {
 // Metadata Fetching (Online)
 bool MediaManager::fetchMetadataForBarcode(const char *barcode,
                                            ItemView &outView) {
-  if (!barcode || WiFi.status() != WL_CONNECTED) {
+  if (!barcode || WiFi.status() != WL_CONNECTED ||
+      BackgroundWorker::isCancellationRequested()) {
     return false;
   }
 
   // Preservation logic...
   String itemID = outView.uniqueID;
   String preservedCover = outView.coverFile;
+  String preservedReleaseMbid = outView.releaseMbid;
 
   if (itemID.length() == 0) {
     // Find existing by barcode
@@ -706,8 +734,10 @@ bool MediaManager::fetchMetadataForBarcode(const char *barcode,
   }
 
   MBRelease release = fetchReleaseByBarcode(barcode);
-  if (!release.success)
+  if (!release.success || BackgroundWorker::isCancellationRequested())
     return false;
+
+  BackgroundWorker::reportProgress(0.60f);
 
   CD cd;
   cd.uniqueID = itemID.c_str();
@@ -724,20 +754,26 @@ bool MediaManager::fetchMetadataForBarcode(const char *barcode,
                   cd.genre.c_str());
   }
 
-  // MusicBrainz rate limit is 1 req/sec. Adding delay before tracklist fetch.
-  delay(1000);
+  // A Discogs search result has no MusicBrainz release ID. When editing an
+  // existing CD, retain its known MBID rather than replacing it with a
+  // placeholder that cannot be used by the track-list endpoint.
+  if (String(cd.releaseMbid.c_str()).startsWith("discogs_") &&
+      preservedReleaseMbid.length() > 0 &&
+      !preservedReleaseMbid.startsWith("discogs_"))
+    cd.releaseMbid = preservedReleaseMbid.c_str();
 
   String gen = "";
   std::vector<Track> tracks;
-  // Retry tracklist fetch up to 2 times
-  for (int i = 0; i < 2; i++) {
+  // Discogs placeholders are not valid MusicBrainz IDs. Previously they were
+  // sent to MusicBrainz twice, making FETCH look frozen for up to a minute.
+  // A track-list miss is non-fatal metadata, so make at most one request.
+  if (cd.releaseMbid.length() > 0 &&
+      !String(cd.releaseMbid.c_str()).startsWith("discogs_")) {
     tracks = fetchTracklist(cd.releaseMbid.c_str(), &gen);
-    if (!tracks.empty())
-      break;
-    Serial.printf("fetchMetadata: Track fetch empty, retrying (%d/2)...\n",
-                  i + 1);
-    delay(1000);
   }
+  if (BackgroundWorker::isCancellationRequested())
+    return false;
+  BackgroundWorker::reportProgress(0.88f);
 
   Serial.printf("fetchMetadata: Before tracklist - cd.genre = '%s'\n",
                 cd.genre.c_str());
@@ -800,6 +836,7 @@ bool MediaManager::fetchMetadataForBarcode(const char *barcode,
     tl.tracks.assign(tracks.begin(), tracks.end());
     Storage.saveTracklist(cd.releaseMbid.c_str(), &tl);
   }
+  BackgroundWorker::reportProgress(0.94f);
 
   // Merge with existing
   CD existing;
@@ -846,12 +883,9 @@ bool MediaManager::fetchMetadataForBarcode(const char *barcode,
 
   // Only mark as fully loaded if we actually got some meat
   cd.detailsLoaded = (cd.trackCount > 0 || cd.year > 0);
-  if (!Storage.saveCD(cd)) {
-    ErrorHandler::logError(ERR_CAT_STORAGE,
-                           "Could not persist fetched CD metadata",
-                           "MediaManager::fetchMetadataForBarcode");
-    return false;
-  }
+
+  // FETCH is a preview/staging action. Do not rewrite the CD detail or library
+  // index until the user explicitly presses SAVE in the Add/Edit page.
 
   // Update outView
   outView.title = cd.title.c_str();
@@ -874,7 +908,8 @@ bool MediaManager::fetchMetadataForBarcode(const char *barcode,
 }
 
 bool MediaManager::fetchMetadataForISBN(const char *isbn, ItemView &outView) {
-  if (!isbn || WiFi.status() != WL_CONNECTED)
+  if (!isbn || WiFi.status() != WL_CONNECTED ||
+      BackgroundWorker::isCancellationRequested())
     return false;
 
   String preservedCover = outView.coverFile;
@@ -898,7 +933,8 @@ bool MediaManager::fetchMetadataForISBN(const char *isbn, ItemView &outView) {
       book.uniqueID = (String(millis()) + "_" + String(random(9999))).c_str();
   }
 
-  if (!fetchBookByISBN(isbn, book))
+  if (!fetchBookByISBN(isbn, book) ||
+      BackgroundWorker::isCancellationRequested())
     return false;
 
   // Merge with existing
@@ -933,12 +969,8 @@ bool MediaManager::fetchMetadataForISBN(const char *isbn, ItemView &outView) {
   }
 
   book.detailsLoaded = true;
-  if (!Storage.saveBook(book)) {
-    ErrorHandler::logError(ERR_CAT_STORAGE,
-                           "Could not persist fetched book metadata",
-                           "MediaManager::fetchMetadataForISBN");
-    return false;
-  }
+
+  // As with CD lookup, leave persistence to the Add/Edit SAVE action.
 
   // Update outView
   outView.title = book.title.c_str();
@@ -965,10 +997,16 @@ String MediaManager::fetchAlbumCoverUrl(const char *artist, const char *album) {
 
   // Try up to 2 times only (reduced from 3 for faster bulk checks)
   for (int attempt = 1; attempt <= 2; attempt++) {
+    if (networkAbortRequested() || WiFi.status() != WL_CONNECTED)
+      break;
     HTTPClient http;
     WiFiClientSecure client;
     configureTrustedTlsClient(client);
-    client.setHandshakeTimeout(2000); // Reduced to 2s
+    if (networkAbortRequested())
+      break;
+    // This API is seconds, not milliseconds. The previous value of 2000
+    // allowed a stalled TLS handshake to hold bulk sync for over 30 minutes.
+    client.setHandshakeTimeout(2);
     client.setTimeout(5000);          // Read timeout
 
     String searchQuery = String(artist) + " " + String(album);
@@ -995,9 +1033,17 @@ String MediaManager::fetchAlbumCoverUrl(const char *artist, const char *album) {
     http.setTimeout(2000);
 
     int httpCode = http.GET();
+    if (networkAbortRequested()) {
+      http.end();
+      break;
+    }
 
     if (httpCode == 200) {
       String payload = http.getString();
+      if (networkAbortRequested()) {
+        http.end();
+        break;
+      }
       int artworkIndex = payload.indexOf("\"artworkUrl100\":\"");
       if (artworkIndex > 0) {
         int startIndex = artworkIndex + 17;
@@ -1129,6 +1175,7 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
     HTTPClient http;
     WiFiClientSecure client;
     configureTrustedTlsClient(client);
+    client.setHandshakeTimeout(10);
     client.setTimeout(10000);
 
     // Schema: https://api.lyrics.ovh/v1/artist/title
@@ -1159,7 +1206,7 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
     HTTPClient http;
     WiFiClientSecure client;
     configureTrustedTlsClient(client);
-    client.setHandshakeTimeout(10000);
+    client.setHandshakeTimeout(10);
     client.setTimeout(10000);
 
     String url = "https://lrclib.net/api/get?artist_name=" +

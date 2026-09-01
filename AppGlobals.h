@@ -81,6 +81,7 @@ extern uint32_t setting_theme_book;
 extern bool is_screen_off;
 extern bool filter_active;
 extern bool settings_reboot_needed;
+extern bool sd_card_ready;
 extern String filter_genre;
 extern int filter_decade;
 extern bool filter_favorites_only;

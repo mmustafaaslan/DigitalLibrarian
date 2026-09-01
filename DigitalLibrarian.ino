@@ -99,6 +99,50 @@ String getCookieValue(const String &cookieHeader, const String &name) {
   return "";
 }
 
+// The SD chip-select is driven through the shared CH422G expander rather than
+// a native GPIO. Immediately after the LCD/touch sequence, the card can still
+// be settling and a single SD.begin() occasionally reports no card. Retry with
+// a clean SPI bus and progressively lower clocks; never create or modify
+// library files until a real card is confirmed.
+bool mountLibrarySdCard() {
+  static constexpr uint32_t frequencies[] = {4000000, 2000000, 1000000};
+  SPI.setHwCs(false);
+
+  for (size_t attempt = 0;
+       attempt < sizeof(frequencies) / sizeof(frequencies[0]); ++attempt) {
+    if (attempt > 0) {
+      SD.end();
+      SPI.end();
+    }
+
+    if (sdExpander)
+      sdExpander->digitalWrite(SD_CS, HIGH);
+    delay(100 + (attempt * 150));
+
+    SPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_SS);
+    if (sdExpander)
+      sdExpander->digitalWrite(SD_CS, LOW);
+    delay(30);
+
+    Serial.printf("SD mount attempt %u/3 at %lu Hz...\n",
+                  (unsigned)(attempt + 1),
+                  (unsigned long)frequencies[attempt]);
+    if (SD.begin(SD_SS, SPI, frequencies[attempt]) &&
+        SD.cardType() != CARD_NONE) {
+      Serial.printf("SD card detected: %llu MB\n",
+                    SD.cardSize() / (1024ULL * 1024ULL));
+      return true;
+    }
+
+    Serial.printf("SD mount attempt %u failed\n", (unsigned)(attempt + 1));
+    if (sdExpander)
+      sdExpander->digitalWrite(SD_CS, HIGH);
+  }
+
+  SD.end();
+  return false;
+}
+
 String webSessionToken = "";
 String webSessionPinSnapshot = "";
 
@@ -2360,9 +2404,8 @@ void setup() {
 
   // 3. SD Card & Persistence
   Serial.println("SD Card Init...");
-  SPI.setHwCs(false);
-  SPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_SS);
-  if (SD.begin(SD_SS)) {
+  sd_card_ready = mountLibrarySdCard();
+  if (sd_card_ready) {
     Serial.println("✅ SD Card Mounted");
     Storage.begin();
 

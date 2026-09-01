@@ -25,13 +25,22 @@ StackType_t *BackgroundWorker::_taskStackBuffer = nullptr;
 StaticTask_t BackgroundWorker::_taskControlBlock;
 bool BackgroundWorker::_busy = false;
 bool BackgroundWorker::_showProgress = false;
+JobType BackgroundWorker::_currentJobType = JOB_NONE;
 String BackgroundWorker::_statusMsg = "Idle";
 float BackgroundWorker::_progress = 0.0f;
+std::atomic<bool> BackgroundWorker::_cancelRequested{false};
+std::atomic<bool> BackgroundWorker::_skipRequested{false};
 int BackgroundWorker::_totalJobs = 0;
 JobType BackgroundWorker::_lastCompletedJobType = JOB_NONE;
 bool BackgroundWorker::_lastJobSuccess = false;
 ItemView BackgroundWorker::_metadataResult;
 bool BackgroundWorker::_metadataResultReady = false;
+ItemView BackgroundWorker::_itemSaveResult;
+bool BackgroundWorker::_itemSaveCompletionReady = false;
+bool BackgroundWorker::_itemSaveCompletionSuccess = false;
+String BackgroundWorker::_itemSaveCompletionMessage = "";
+MediaMode BackgroundWorker::_itemSaveResultMode = MODE_CD;
+int BackgroundWorker::_itemSaveResultIndex = -1;
 String BackgroundWorker::_lyricsResultTitle = "";
 PsramString BackgroundWorker::_lyricsResultText;
 bool BackgroundWorker::_lyricsResultReady = false;
@@ -113,7 +122,7 @@ bool BackgroundWorker::addJob(const BackgroundJob &job) {
   const bool interactiveJob =
       job.type == JOB_TRACKLIST_LOAD || job.type == JOB_LYRICS_LOAD_CACHED ||
       job.type == JOB_LYRICS_FETCH_ONE || job.type == JOB_METADATA_LOOKUP ||
-      job.type == JOB_COVER_DOWNLOAD;
+      job.type == JOB_ITEM_SAVE || job.type == JOB_COVER_DOWNLOAD;
   if (interactiveJob && !_jobQueue.empty()) {
     // Touch-driven work should not wait behind maintenance tasks such as track
     // summaries, favorites, or WLED persistence.
@@ -145,6 +154,13 @@ bool BackgroundWorker::shouldShowProgress() {
   xSemaphoreGive(_queueMutex);
   return value;
 }
+JobType BackgroundWorker::getCurrentJobType() {
+  if (!_queueMutex || xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    return JOB_NONE;
+  const JobType value = _currentJobType;
+  xSemaphoreGive(_queueMutex);
+  return value;
+}
 int BackgroundWorker::getQueueSize() {
   if (!_queueMutex || xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
     return 0;
@@ -170,6 +186,28 @@ float BackgroundWorker::getProgress() {
   return value;
 }
 
+void BackgroundWorker::reportProgress(float progress) {
+  setProgress(progress);
+}
+
+void BackgroundWorker::requestCancel() {
+  _cancelRequested.store(true, std::memory_order_relaxed);
+  setStatus("Cancelling at the next safe checkpoint...");
+}
+
+bool BackgroundWorker::isCancellationRequested() {
+  return _cancelRequested.load(std::memory_order_relaxed);
+}
+
+void BackgroundWorker::requestSkipCurrent() {
+  _skipRequested.store(true, std::memory_order_relaxed);
+  setStatus("Skipping the current record...");
+}
+
+bool BackgroundWorker::isSkipRequested() {
+  return _skipRequested.load(std::memory_order_relaxed);
+}
+
 JobType BackgroundWorker::getLastCompletedJobType() {
   if (!_queueMutex || xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
     return JOB_NONE;
@@ -193,6 +231,26 @@ bool BackgroundWorker::takeMetadataResult(ItemView &result) {
   if (ready) {
     result = _metadataResult;
     _metadataResultReady = false;
+  }
+  xSemaphoreGive(_queueMutex);
+  return ready;
+}
+
+bool BackgroundWorker::takeItemSaveCompletion(bool &success, String &message,
+                                              ItemView &savedItem,
+                                              MediaMode &mode,
+                                              int &editIndex) {
+  if (!_queueMutex || xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    return false;
+  const bool ready = _itemSaveCompletionReady;
+  if (ready) {
+    success = _itemSaveCompletionSuccess;
+    message = _itemSaveCompletionMessage;
+    savedItem = _itemSaveResult;
+    mode = _itemSaveResultMode;
+    editIndex = _itemSaveResultIndex;
+    _itemSaveCompletionReady = false;
+    _itemSaveCompletionMessage = "";
   }
   xSemaphoreGive(_queueMutex);
   return ready;
@@ -292,12 +350,16 @@ void BackgroundWorker::workerTask(void *pvParameters) {
         currentJob = _jobQueue.front();
         _jobQueue.pop();
         hasJob = true;
+        _cancelRequested.store(false, std::memory_order_relaxed);
+        _skipRequested.store(false, std::memory_order_relaxed);
         _busy = true;
         _showProgress = currentJob.showProgress;
+        _currentJobType = currentJob.type;
         _progress = 0.0f;
       } else {
         _busy = false;
         _showProgress = false;
+        _currentJobType = JOB_NONE;
       }
       xSemaphoreGive(_queueMutex);
     }
@@ -315,7 +377,17 @@ void BackgroundWorker::workerTask(void *pvParameters) {
         setStatus("Looking up " + currentJob.id);
         setProgress(0.15f);
         ItemView staged;
+        // Seed an edit lookup from the existing record so a changed barcode
+        // cannot accidentally replace its unique ID, cover, LEDs, notes, or
+        // known MusicBrainz release ID. This SD read remains on the worker.
+        if (currentJob.index >= 0 && currentJob.index < getItemCount())
+          staged = getItemAtSD(currentJob.index);
         success = fetchModeMetadata(currentJob.id, staged);
+        if (isCancellationRequested()) {
+          success = false;
+          resultMsg = "Cancelled";
+          break;
+        }
         if (success) {
           if (_queueMutex &&
               xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -330,6 +402,37 @@ void BackgroundWorker::workerTask(void *pvParameters) {
         }
       } break;
 
+      case JOB_ITEM_SAVE: {
+        ItemSavePayload *payload = currentJob.savePayload;
+        if (!payload) {
+          resultMsg = "The save request was incomplete";
+          break;
+        }
+
+        setStatus(payload->mode == MODE_BOOK ? "Saving book to SD..."
+                                             : "Saving CD to SD...");
+        setProgress(0.25f);
+        success = saveItemViewToStorage(
+            payload->item, payload->mode,
+            payload->oldUniqueID.length() > 0
+                ? payload->oldUniqueID.c_str()
+                : nullptr);
+        setProgress(0.90f);
+
+        if (_queueMutex &&
+            xSemaphoreTake(_queueMutex, portMAX_DELAY) == pdTRUE) {
+          _itemSaveResult = payload->item;
+          _itemSaveResultMode = payload->mode;
+          _itemSaveResultIndex = payload->editIndex;
+          xSemaphoreGive(_queueMutex);
+        }
+
+        resultMsg = success ? "Saved and verified"
+                            : "The SD save could not be verified";
+        delete payload;
+        currentJob.savePayload = nullptr;
+      } break;
+
       case JOB_BULK_SYNC: {
         if (WiFi.status() != WL_CONNECTED) {
           resultMsg = "No WiFi connection. Cover sync was not started.";
@@ -339,10 +442,20 @@ void BackgroundWorker::workerTask(void *pvParameters) {
         int total = getItemCount();
         int downloadedCount = 0;
         bool persistenceFailed = false;
+        bool networkLost = false;
 
         for (int i = 0; i < total; i++) {
-          if (is_sync_stopping) {
+          if (is_sync_stopping || isCancellationRequested()) {
             Serial.println("BG_Worker: Sync stopping requested");
+            break;
+          }
+          if (_skipRequested.exchange(false, std::memory_order_relaxed)) {
+            Serial.printf("BG_Worker: Skipped sync item %d before work\n", i);
+            continue;
+          }
+          if (WiFi.status() != WL_CONNECTED) {
+            networkLost = true;
+            Serial.println("BG_Worker: Sync stopped because WiFi disconnected");
             break;
           }
 
@@ -373,7 +486,9 @@ void BackgroundWorker::workerTask(void *pvParameters) {
 
           if (!item.isValid)
             continue;
-          setStatus("Sync: " + item.title);
+          const String itemProgress = "Sync " + String(i + 1) + "/" +
+                                      String(total) + ": ";
+          setStatus(itemProgress + item.title);
 
           // 2. Hardware Check (I2C Lock only, NO Library Lock)
           bool missing = true;
@@ -434,28 +549,41 @@ void BackgroundWorker::workerTask(void *pvParameters) {
               item.title.c_str(), item.coverFile.c_str(),
               missing ? "YES" : "NO");
 
+          if (_skipRequested.exchange(false, std::memory_order_relaxed)) {
+            Serial.printf("BG_Worker: Skipped sync item %d after local check\n",
+                          i);
+            continue;
+          }
+
           // 3. Network & Persistence (NO Library Lock held during HTTP)
           if (missing) {
             String downloadUrl = item.coverUrl;
             Serial.printf("[SYNC] CoverUrl in DB: '%s' (length: %d)\n",
                           downloadUrl.c_str(), downloadUrl.length());
 
-            // Always re-fetch if we're missing the file, even if we have a URL
-            // This ensures we get fresh Google Books URLs instead of stale Open
-            // Library ones
-            Serial.printf(
-                "[SYNC] Cover file missing, re-fetching URL for item %d...\n",
-                i);
-            downloadUrl = fetchCoverUrlForIndex(i); // Internal locking
-            if (downloadUrl.length() > 0) {
-              setItemCoverUrl(i, downloadUrl);
-            } else {
-              Serial.printf("[SYNC] Failed to fetch cover URL\n");
+            // A persisted provider URL is normally sufficient. Re-querying
+            // the provider for every missing file doubled the network work and
+            // made individual records appear stuck on weak WiFi. A manual
+            // single-cover download still performs a fresh lookup when a URL
+            // needs to be replaced.
+            if (downloadUrl.length() == 0 &&
+                !isCancellationRequested() && !isSkipRequested()) {
+              setStatus(itemProgress + "Finding cover for " + item.title);
+              downloadUrl = fetchCoverUrlForIndex(i); // Internal locking
+              if (downloadUrl.length() > 0) {
+                setItemCoverUrl(i, downloadUrl);
+              } else {
+                Serial.printf("[SYNC] Failed to fetch cover URL\n");
+              }
             }
 
-            if (downloadUrl.length() > 0) {
-              if (AppNetworkManager::downloadCoverImage(downloadUrl,
-                                                        savePath)) {
+            if (downloadUrl.length() > 0 &&
+                !isCancellationRequested() &&
+                !isSkipRequested() &&
+                WiFi.status() == WL_CONNECTED) {
+              setStatus(itemProgress + "Downloading " + item.title);
+              if (AppNetworkManager::downloadCoverImage(downloadUrl, savePath,
+                                                        true)) {
                 downloadedCount++;
                 String prefix = getUidPrefix();
                 String fileName =
@@ -486,14 +614,23 @@ void BackgroundWorker::workerTask(void *pvParameters) {
             }
           }
 
+          if (_skipRequested.exchange(false, std::memory_order_relaxed))
+            Serial.printf("BG_Worker: Skipped sync item %d\n", i);
+
           delay(10); // Yield to other operations
         }
 
-        success = !is_sync_stopping && !persistenceFailed;
+        const bool cancelled =
+            is_sync_stopping || isCancellationRequested();
+        success = !cancelled && !networkLost && !persistenceFailed;
         setProgress(1.0f);
-        setStatus(success ? "Sync Complete"
-                          : (persistenceFailed ? "Sync save failed"
-                                               : "Sync Stopped"));
+        resultMsg =
+            success
+                ? "Sync Complete"
+                : (cancelled
+                       ? "Cancelled"
+                       : (networkLost ? "Sync stopped: WiFi disconnected"
+                                      : "Sync save failed"));
       } break;
 
       case JOB_COVER_DOWNLOAD: {
@@ -719,6 +856,7 @@ void BackgroundWorker::workerTask(void *pvParameters) {
           resultMsg = "No WiFi connection. Lyrics download was not started.";
           break;
         }
+        is_sync_stopping = false;
         String targetMbid = currentJob.id;
         if (targetMbid.length() > 0) {
           setStatus("Fetching lyrics for CD...");
@@ -732,7 +870,7 @@ void BackgroundWorker::workerTask(void *pvParameters) {
             tl = nullptr;
             int fetched = 0;
             for (int i = 0; i < trackCount; i++) {
-              if (is_sync_stopping)
+              if (is_sync_stopping || isCancellationRequested())
                 break;
               setProgress(trackCount > 0 ? (float)i / trackCount : 0.0f);
               setStatus("Lyrics: track " + String(i + 1) + " of " +
@@ -765,7 +903,7 @@ void BackgroundWorker::workerTask(void *pvParameters) {
           if (libraryMutex)
             xSemaphoreGiveRecursive(libraryMutex);
           for (int i = 0; i < cdCount; i++) {
-            if (is_sync_stopping)
+            if (is_sync_stopping || isCancellationRequested())
               break;
             setProgress(cdCount > 0 ? (float)i / cdCount : 0.0f);
             String mbid;
@@ -850,6 +988,16 @@ void BackgroundWorker::workerTask(void *pvParameters) {
         break;
       }
 
+      if (isCancellationRequested() &&
+          (currentJob.type == JOB_METADATA_LOOKUP ||
+           currentJob.type == JOB_LYRICS_FETCH_ONE ||
+           currentJob.type == JOB_LYRICS_FETCH_ALL ||
+           currentJob.type == JOB_COVER_DOWNLOAD ||
+           currentJob.type == JOB_BULK_SYNC)) {
+        success = false;
+        resultMsg = "Cancelled";
+      }
+
       if (resultMsg.length() > 0)
         setStatus(resultMsg);
 
@@ -866,6 +1014,10 @@ void BackgroundWorker::workerTask(void *pvParameters) {
           _tracklistCompletionReady = true;
           _tracklistCompletionSuccess = success;
           _tracklistCompletionMessage = resultMsg;
+        } else if (currentJob.type == JOB_ITEM_SAVE) {
+          _itemSaveCompletionReady = true;
+          _itemSaveCompletionSuccess = success;
+          _itemSaveCompletionMessage = resultMsg;
         }
         xSemaphoreGive(_queueMutex);
       }
@@ -873,6 +1025,8 @@ void BackgroundWorker::workerTask(void *pvParameters) {
       if (currentJob.onComplete) {
         currentJob.onComplete(success, resultMsg);
       }
+      _cancelRequested.store(false, std::memory_order_relaxed);
+      _skipRequested.store(false, std::memory_order_relaxed);
     } else {
       delay(100); // Wait longer when idle to reduce bus load
     }

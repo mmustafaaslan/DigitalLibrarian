@@ -1,10 +1,13 @@
 #ifndef UTILS_H
 #define UTILS_H
 
+#include "Core_Data.h"
 #include <Arduino.h>
 #include <lvgl.h>
 
 String sanitizeText(String text);
+String sanitizeLvglText(const String &text);
+void sanitizeLvglTextInPlace(PsramString &text);
 String sanitizeFilename(String filename);
 void decodeHTMLEntities(String &text);
 String escapeJSON(String text);

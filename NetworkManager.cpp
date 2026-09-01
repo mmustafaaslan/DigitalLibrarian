@@ -1,6 +1,7 @@
 // NetworkManager.cpp
 
 #include "NetworkManager.h"
+#include "BackgroundWorker.h"
 #include "TlsTrust.h"
 #include "AppGlobals.h"
 #include "ErrorHandler.h"
@@ -281,8 +282,13 @@ String AppNetworkManager::fetchURL(String url, int timeout) {
 
   if (url.startsWith("https://")) {
     configureTrustedTlsClient(clientSecure);
+    const unsigned long handshakeTimeoutSeconds =
+        timeout > 0 ? (unsigned long)(timeout + 999) / 1000UL : 5UL;
+    clientSecure.setHandshakeTimeout(handshakeTimeoutSeconds);
+    clientSecure.setTimeout(timeout);
     http.begin(clientSecure, url);
   } else {
+    clientInsecure.setTimeout(timeout);
     http.begin(clientInsecure, url);
   }
 
@@ -302,9 +308,12 @@ String AppNetworkManager::fetchURL(String url, int timeout) {
 }
 
 bool AppNetworkManager::downloadCoverImage(const String &url,
-                                           const String &savePath) {
+                                           const String &savePath,
+                                           bool quickMode) {
   static constexpr int MAX_COVER_BYTES = 2 * 1024 * 1024;
-  if (WiFi.status() != WL_CONNECTED)
+  if (WiFi.status() != WL_CONNECTED ||
+      BackgroundWorker::isCancellationRequested() ||
+      BackgroundWorker::isSkipRequested())
     return false;
   if (url.isEmpty())
     return false;
@@ -312,18 +321,32 @@ bool AppNetworkManager::downloadCoverImage(const String &url,
   HTTPClient http;
   WiFiClientSecure clientSecure;
   WiFiClient clientInsecure;
+  const uint32_t requestTimeoutMs = quickMode ? 3000 : 8000;
+  const unsigned long handshakeTimeoutSeconds = quickMode ? 3UL : 8UL;
+  const uint32_t streamTimeoutMs = quickMode ? 7000 : 15000;
+  const uint32_t idleTimeoutMs = quickMode ? 2500 : 5000;
 
   if (url.startsWith("https://")) {
     configureTrustedTlsClient(clientSecure);
+    // NetworkClientSecure uses seconds for TLS handshakes; socket and HTTP
+    // timeouts below use milliseconds.
+    clientSecure.setHandshakeTimeout(handshakeTimeoutSeconds);
+    clientSecure.setTimeout(requestTimeoutMs);
     http.begin(clientSecure, url);
   } else {
+    clientInsecure.setTimeout(requestTimeoutMs);
     http.begin(clientInsecure, url);
   }
 
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  http.setTimeout(15000);
+  http.setTimeout(requestTimeoutMs);
 
   int httpCode = http.GET();
+  if (BackgroundWorker::isCancellationRequested() ||
+      BackgroundWorker::isSkipRequested()) {
+    http.end();
+    return false;
+  }
   if (httpCode != HTTP_CODE_OK) {
     http.end();
     return false;
@@ -350,12 +373,23 @@ bool AppNetworkManager::downloadCoverImage(const String &url,
 
   WiFiClient *stream = http.getStreamPtr();
   int totalRead = 0;
-  unsigned long startT = millis();
-  while (http.connected() && totalRead < len && (millis() - startT < 20000)) {
+  unsigned long startedAt = millis();
+  unsigned long lastDataAt = startedAt;
+  while (http.connected() && totalRead < len &&
+         millis() - startedAt < streamTimeoutMs &&
+         millis() - lastDataAt < idleTimeoutMs) {
+    if (BackgroundWorker::isCancellationRequested() ||
+        BackgroundWorker::isSkipRequested()) {
+      http.end();
+      heap_caps_free(downloadBuffer);
+      return false;
+    }
     if (stream->available()) {
       int readSize = stream->read(downloadBuffer + totalRead, len - totalRead);
-      if (readSize > 0)
+      if (readSize > 0) {
         totalRead += readSize;
+        lastDataAt = millis();
+      }
     }
     delay(1);
   }
