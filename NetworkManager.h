@@ -21,6 +21,10 @@ public:
   static bool tryConnectToSavedNetworks();
   static void startConnection();
   static void serviceConnection();
+  static bool isConnectionInProgress();
+  static int getConnectionNetworkIndex();
+  static void cancelConnectionAttempts();
+  static void completeManualConnection();
 
   // Shared HTTP helper
   static String fetchURL(String url, int timeout = 5000);

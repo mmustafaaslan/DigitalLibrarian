@@ -7,11 +7,17 @@
 #include <ESPmDNS.h>
 #include <esp_heap_caps.h>
 
+#if __has_include("secrets.h")
+#include "secrets.h"
+#endif
+
 namespace {
 int connectionNetworkIndex = -1;
 unsigned long connectionAttemptStarted = 0;
 bool connectionServiceActive = false;
 bool networkReadyAnnounced = false;
+constexpr uint8_t WIFI_CREDENTIAL_SEED_VERSION = 3;
+constexpr unsigned long SAVED_NETWORK_ATTEMPT_TIMEOUT_MS = 30000;
 
 void beginNetworkAttempt(int index) {
   connectionNetworkIndex = index;
@@ -52,6 +58,8 @@ void AppNetworkManager::loadWiFiNetworks() {
 
   // Load network count
   int count = preferences.getInt("count", 0);
+  const uint8_t credentialSeedVersion =
+      preferences.getUChar("seed_ver", 0);
 
   if (count > 0) {
     Serial.printf("✅ Loading %d saved WiFi networks from flash\n", count);
@@ -80,6 +88,38 @@ void AppNetworkManager::loadWiFiNetworks() {
   }
 
   preferences.end();
+
+#if (defined(WIFI_SSID_2) && defined(WIFI_PASSWORD_2)) ||                  \
+    (defined(WIFI_SSID_3) && defined(WIFI_PASSWORD_3))
+  // Provision optional additional credentials once. Keeping the marker in the
+  // same NVS namespace lets users remove a network later without it being
+  // silently restored on every boot.
+  if (credentialSeedVersion < WIFI_CREDENTIAL_SEED_VERSION) {
+    auto seedNetwork = [](const char *ssid, const char *password) {
+      if (!ssid || String(ssid).isEmpty())
+        return;
+
+      for (WiFiNetwork &network : savedWiFiNetworks) {
+        if (network.ssid == ssid) {
+          network.password = password;
+          return;
+        }
+      }
+
+      if (savedWiFiNetworks.size() >= MAX_WIFI_NETWORKS)
+        savedWiFiNetworks.erase(savedWiFiNetworks.begin());
+      savedWiFiNetworks.push_back({String(ssid), String(password)});
+    };
+
+#if defined(WIFI_SSID_2) && defined(WIFI_PASSWORD_2)
+    seedNetwork(WIFI_SSID_2, WIFI_PASSWORD_2);
+#endif
+#if defined(WIFI_SSID_3) && defined(WIFI_PASSWORD_3)
+    seedNetwork(WIFI_SSID_3, WIFI_PASSWORD_3);
+#endif
+    saveWiFiNetworks();
+  }
+#endif
 }
 
 void AppNetworkManager::saveWiFiNetworks() {
@@ -94,6 +134,7 @@ void AppNetworkManager::saveWiFiNetworks() {
     count = MAX_WIFI_NETWORKS;
 
   preferences.putInt("count", count);
+  preferences.putUChar("seed_ver", WIFI_CREDENTIAL_SEED_VERSION);
 
   Serial.printf("✅ Saving %d WiFi networks to flash\n", count);
 
@@ -153,45 +194,11 @@ bool AppNetworkManager::tryConnectToSavedNetworks() {
     return false;
   }
 
-  Serial.printf("🔍 Trying %d saved WiFi networks...\n",
-                savedWiFiNetworks.size());
-
-  for (int i = 0; i < savedWiFiNetworks.size(); i++) {
-    WiFiNetwork &net = savedWiFiNetworks[i];
-
-    Serial.printf("   %d/%d Trying: %s ... ", i + 1, savedWiFiNetworks.size(),
-                  net.ssid.c_str());
-
-    WiFi.begin(net.ssid.c_str(), net.password.c_str());
-
-    // Wait for connection (max 10 seconds per network)
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-      delay(500);
-      Serial.print(".");
-      attempts++;
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.printf("\n✅ Connected to: %s\n", net.ssid.c_str());
-      Serial.printf("   IP: %s\n", WiFi.localIP().toString().c_str());
-      return true;
-    } else {
-      ErrorHandler::logWarn(ERR_CAT_NETWORK,
-                            String("Failed to connect to: ") + net.ssid,
-                            "tryConnectToSavedNetworks");
-      Serial.println(" ❌ Failed");
-      WiFi.disconnect();
-    }
-  }
-
-  ErrorHandler::logError(ERR_CAT_NETWORK,
-                         String("Could not connect to any of ") +
-                             String(savedWiFiNetworks.size()) +
-                             " saved networks",
-                         "tryConnectToSavedNetworks");
-  Serial.println("❌ Could not connect to any saved network");
-  return false;
+  // Compatibility wrapper for older callers. Connection attempts are serviced
+  // incrementally from loop(), never by waiting here on the UI/application
+  // thread.
+  startConnection();
+  return WiFi.status() == WL_CONNECTED;
 }
 
 void AppNetworkManager::startConnection() {
@@ -201,8 +208,33 @@ void AppNetworkManager::startConnection() {
     connectionServiceActive = false;
     return;
   }
+  WiFi.setAutoReconnect(false);
   connectionServiceActive = true;
   beginNetworkAttempt(0);
+}
+
+bool AppNetworkManager::isConnectionInProgress() {
+  return connectionServiceActive;
+}
+
+int AppNetworkManager::getConnectionNetworkIndex() {
+  return connectionNetworkIndex;
+}
+
+void AppNetworkManager::cancelConnectionAttempts() {
+  connectionServiceActive = false;
+  connectionNetworkIndex = -1;
+}
+
+void AppNetworkManager::completeManualConnection() {
+  cancelConnectionAttempts();
+  WiFi.setAutoReconnect(true);
+  if (!networkReadyAnnounced) {
+    networkReadyAnnounced = true;
+    if (mdns_name.length() == 0)
+      mdns_name = "digitallibrarian";
+    MDNS.begin(mdns_name.c_str());
+  }
 }
 
 void AppNetworkManager::serviceConnection() {
@@ -210,6 +242,7 @@ void AppNetworkManager::serviceConnection() {
     return;
   if (WiFi.status() == WL_CONNECTED) {
     connectionServiceActive = false;
+    WiFi.setAutoReconnect(true);
     if (!networkReadyAnnounced) {
       networkReadyAnnounced = true;
       Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
@@ -219,10 +252,13 @@ void AppNetworkManager::serviceConnection() {
     }
     return;
   }
-  if (millis() - connectionAttemptStarted < 8000)
+  if (millis() - connectionAttemptStarted <
+      SAVED_NETWORK_ATTEMPT_TIMEOUT_MS)
     return;
 
-  WiFi.disconnect();
+  Serial.printf("WiFi attempt timed out: %s\n",
+                savedWiFiNetworks[connectionNetworkIndex].ssid.c_str());
+  WiFi.disconnect(false, false);
   const int next = connectionNetworkIndex + 1;
   if (next < (int)savedWiFiNetworks.size()) {
     beginNetworkAttempt(next);

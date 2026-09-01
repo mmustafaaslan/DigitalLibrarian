@@ -4,6 +4,7 @@
 #include "Utils.h"
 #include "waveshare_sd_card.h" // For SD_CS and sdExpander
 #include <SD.h>
+#include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
@@ -859,20 +860,45 @@ TrackList *LibrarianStorage::loadTracklist(const char *releaseMbid) {
   }
 
   String filename = "/tracks/" + sanitizeFilename(String(releaseMbid)) + ".json";
-  ScopedSdAccess sd(2000);
-  if (!sd)
-    return nullptr;
+  static constexpr size_t MAX_TRACKLIST_BYTES = 512 * 1024;
+  char *jsonBuffer = nullptr;
+  size_t jsonSize = 0;
+  {
+    // SD chip-select and touch share the I2C expander. Hold that bus only for
+    // the physical read; JSON parsing can be comparatively expensive and must
+    // not prevent touch-release events from being sampled.
+    ScopedSdAccess sd(2000);
+    if (!sd)
+      return nullptr;
 
-  File file = SD.open(filename, FILE_READ);
-  if (!file)
-    return nullptr;
+    File file = SD.open(filename, FILE_READ);
+    if (!file)
+      return nullptr;
 
-  // Use PSRAM for the large JSON buffer (64KB)
-  // Converting 'file' to 'stream' avoids loading the whole string into Internal
-  // Heap
+    jsonSize = file.size();
+    if (jsonSize == 0 || jsonSize > MAX_TRACKLIST_BYTES) {
+      file.close();
+      return nullptr;
+    }
+    jsonBuffer = static_cast<char *>(heap_caps_malloc(
+        jsonSize + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!jsonBuffer) {
+      file.close();
+      return nullptr;
+    }
+    const size_t bytesRead = file.readBytes(jsonBuffer, jsonSize);
+    file.close();
+    if (bytesRead != jsonSize) {
+      heap_caps_free(jsonBuffer);
+      return nullptr;
+    }
+    jsonBuffer[jsonSize] = '\0';
+  }
+
+  // Parse after ScopedSdAccess has released the shared I2C guard.
   BasicJsonDocument<SpiRamAllocator> doc(65536);
-  DeserializationError error = deserializeJson(doc, file);
-  file.close();
+  DeserializationError error = deserializeJson(doc, jsonBuffer, jsonSize);
+  heap_caps_free(jsonBuffer);
 
   if (error) {
     Serial.printf("Storage: Tracklist JSON Error: %s\n", error.c_str());
@@ -1011,53 +1037,78 @@ void LibrarianStorage::deleteTracklist(TrackList *trackList) {
 // LYRICS MANAGEMENT
 // ============================================================================
 
-String LibrarianStorage::loadLyrics(const char *lyricsPath) {
+bool LibrarianStorage::loadLyrics(const char *lyricsPath,
+                                  PsramString &lyricsOut) {
+  lyricsOut.clear();
   if (!lyricsPath || strlen(lyricsPath) == 0)
-    return "";
+    return false;
 
   String path = String(lyricsPath);
   if (!path.startsWith("/")) {
     path = "/lyrics/" + path;
   }
 
-  String content;
-  ScopedSdAccess sd(2000);
-  if (!sd)
-    return "";
-  if (SD.exists(path)) {
-    File file = SD.open(path, FILE_READ);
-    if (file) {
-      content = file.readString();
+  static constexpr size_t MAX_LYRICS_FILE_BYTES = 512 * 1024;
+  char *jsonBuffer = nullptr;
+  size_t jsonSize = 0;
+  {
+    // Keep both the file buffer and parsed lyrics out of scarce internal RAM.
+    // The shared SD/touch I2C guard is held only for the physical file read.
+    ScopedSdAccess sd(2000);
+    if (!sd)
+      return false;
+
+    String resolvedPath = path;
+    if (!SD.exists(resolvedPath) && path.startsWith("/lyrics/")) {
+      String rootPath = "/" + String(lyricsPath);
+      if (SD.exists(rootPath))
+        resolvedPath = rootPath;
+    }
+    if (!SD.exists(resolvedPath))
+      return false;
+
+    File file = SD.open(resolvedPath, FILE_READ);
+    if (!file)
+      return false;
+    jsonSize = file.size();
+    if (jsonSize == 0 || jsonSize > MAX_LYRICS_FILE_BYTES) {
       file.close();
+      return false;
     }
-  } else if (path.startsWith("/lyrics/")) {
-    String rootPath = "/" + String(lyricsPath);
-    if (SD.exists(rootPath)) {
-      File file = SD.open(rootPath, FILE_READ);
-      if (file) {
-        content = file.readString();
-        file.close();
-      }
+    jsonBuffer = static_cast<char *>(heap_caps_malloc(
+        jsonSize + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!jsonBuffer) {
+      file.close();
+      return false;
     }
+    const size_t bytesRead = file.readBytes(jsonBuffer, jsonSize);
+    file.close();
+    if (bytesRead != jsonSize) {
+      heap_caps_free(jsonBuffer);
+      return false;
+    }
+    jsonBuffer[jsonSize] = '\0';
   }
 
-  if (content.length() == 0)
-    return "";
-
-  // Use DynamicJsonDocument for safe parsing
-  DynamicJsonDocument doc(16384);
-  DeserializationError error = deserializeJson(doc, content);
+  BasicJsonDocument<SpiRamAllocator> doc(16384);
+  DeserializationError error = deserializeJson(doc, jsonBuffer, jsonSize);
 
   if (error) {
     Serial.print("Storage: Failed to parse lyrics JSON: ");
     Serial.println(error.c_str());
-    return "";
+    heap_caps_free(jsonBuffer);
+    return false;
   }
 
-  return doc["text"].as<String>();
+  const char *text = doc["text"] | "";
+  if (text && text[0] != '\0')
+    lyricsOut.assign(text);
+  heap_caps_free(jsonBuffer);
+  return !lyricsOut.empty();
 }
 
-bool LibrarianStorage::saveLyrics(const char *lyricsPath, String lyricsText,
+bool LibrarianStorage::saveLyrics(const char *lyricsPath,
+                                  const PsramString &lyricsText,
                                   String lang) {
   if (!lyricsPath)
     return false;
@@ -1086,13 +1137,20 @@ bool LibrarianStorage::saveLyrics(const char *lyricsPath, String lyricsText,
   if (!file)
     return false;
 
-  DynamicJsonDocument doc(16384);
+  // The lyrics body can be much larger than the ESP32's free internal heap.
+  // Keep the JSON document and its duplicated string in PSRAM and size it from
+  // the already bounded provider response.
+  const size_t jsonCapacity = lyricsText.size() + 4096;
+  BasicJsonDocument<SpiRamAllocator> doc(jsonCapacity);
   doc["lang"] = lang;
   doc["fetchedAt"] = getCurrentISO8601Timestamp();
+  doc["text"] = lyricsText.c_str();
 
-  String cleanLyrics = lyricsText;
-  decodeHTMLEntities(cleanLyrics);
-  doc["text"] = sanitizeText(cleanLyrics);
+  if (doc.overflowed()) {
+    file.close();
+    SD.remove(tmpPath);
+    return false;
+  }
 
   if (!finishJsonWrite(file, serializeJson(doc, file)) ||
       !replaceFileWithRollback(tmpPath, path)) {

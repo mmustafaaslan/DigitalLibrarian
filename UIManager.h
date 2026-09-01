@@ -1,6 +1,7 @@
 #ifndef UI_MANAGER_H
 #define UI_MANAGER_H
 
+#include "Core_Data.h"
 #include "NetworkManager.h" // Ensure this is available or forward declare if possible, but UIManager seems to use it.
 #include <Arduino.h>
 #include <lvgl.h>
@@ -31,7 +32,7 @@ void close_filter_ui();
 void show_tracklist_ui(int index);
 void close_tracklist_ui();
 void show_chapter_list_ui(int index);
-void show_lyrics_popup(String trackTitle, String lyricsText);
+void show_lyrics_popup(String trackTitle, PsramString lyricsText);
 void close_lyrics_popup();
 void show_qr_ui();
 void close_qr_ui();

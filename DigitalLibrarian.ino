@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <esp_heap_caps.h>         // For detailed heap analysis
+#include <esp_system.h>
 #include <lvgl.h>                  // Verified with 8.4.0
 
 #include "AppGlobals.h"       // Global State & Settings
@@ -373,6 +374,7 @@ void setupWebHandlers() {
     doc["currentMode"] = (int)currentMode;
     doc["heap"] = ESP.getFreeHeap();
     doc["uptime"] = millis() / 1000;
+    doc["resetReason"] = boot_reset_reason;
     String out;
     serializeJson(doc, out);
     server.send(200, "application/json", out);
@@ -2301,6 +2303,8 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("[UPLOAD SMOKE TEST] Digital Librarian build 2026-08-31");
+  boot_reset_reason = (int)esp_reset_reason();
+  Serial.printf("[BOOT] ESP reset reason: %d\n", boot_reset_reason);
   logMemoryUsage("BOOT START");
 
   logMemoryUsage("BOOT START");
@@ -2399,7 +2403,7 @@ void setup() {
     lv_obj_clear_flag(accent, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *brand = lv_label_create(loading_card);
-    lv_label_set_text(brand, "DIGITAL LIBRARIAN");
+    lv_label_set_text(brand, setting_brand_title.c_str());
     lv_obj_set_pos(brand, 32, 34);
     lv_obj_set_style_text_color(brand, lv_color_hex(0xF4F7FA), 0);
     lv_obj_set_style_text_font(brand, &lv_font_montserrat_16, 0);

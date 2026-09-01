@@ -10,6 +10,86 @@
 
 bool MediaManager::_taskBusy = false;
 
+namespace {
+static constexpr size_t MAX_LYRICS_RESPONSE_BYTES = 128 * 1024;
+
+// HTTPClient::getString() stores the complete response in scarce internal
+// heap. Lyrics providers can return unexpectedly large JSON (or an HTML error
+// page), which used to overlap with TLS and ArduinoJson allocations and reboot
+// the ESP32-S3. Stream into PSRAM with a hard bound instead.
+bool readLyricsResponseToPsram(HTTPClient &http, PsramString &body) {
+  body.clear();
+  const int expectedLength = http.getSize();
+  if (expectedLength > (int)MAX_LYRICS_RESPONSE_BYTES)
+    return false;
+
+  const size_t initialCapacity =
+      expectedLength > 0 ? (size_t)expectedLength : 16 * 1024;
+  body.reserve(initialCapacity);
+  WiFiClient *stream = http.getStreamPtr();
+  if (!stream)
+    return false;
+
+  uint32_t lastDataAt = millis();
+  char chunk[1024];
+  while ((http.connected() || stream->available()) &&
+         body.size() < MAX_LYRICS_RESPONSE_BYTES) {
+    const int available = stream->available();
+    if (available <= 0) {
+      if (millis() - lastDataAt > 10000)
+        break;
+      delay(1);
+      continue;
+    }
+
+    const size_t remaining = MAX_LYRICS_RESPONSE_BYTES - body.size();
+    const size_t toRead =
+        std::min(remaining, std::min((size_t)available, sizeof(chunk)));
+    const int bytesRead = stream->read((uint8_t *)chunk, toRead);
+    if (bytesRead <= 0) {
+      delay(1);
+      continue;
+    }
+    body.append(chunk, (size_t)bytesRead);
+    lastDataAt = millis();
+  }
+
+  if (body.empty())
+    return false;
+  if (expectedLength >= 0 && body.size() != (size_t)expectedLength)
+    return false;
+  // An unknown-length response that fills the entire bound is treated as
+  // truncated; never attempt to parse or retain it.
+  if (expectedLength < 0 && body.size() == MAX_LYRICS_RESPONSE_BYTES)
+    return false;
+  return true;
+}
+
+bool extractLyricsFromResponse(HTTPClient &http, const char *primaryField,
+                               const char *fallbackField,
+                               PsramString &lyrics) {
+  PsramString response;
+  if (!readLyricsResponseToPsram(http, response))
+    return false;
+
+  const size_t jsonCapacity = response.size() + 4096;
+  BasicJsonDocument<SpiRamAllocator> doc(jsonCapacity);
+  const DeserializationError error =
+      deserializeJson(doc, response.data(), response.size());
+  if (error)
+    return false;
+
+  const char *value = doc[primaryField] | "";
+  if ((!value || value[0] == '\0' || strcmp(value, "null") == 0) &&
+      fallbackField)
+    value = doc[fallbackField] | "";
+  if (!value || value[0] == '\0' || strcmp(value, "null") == 0)
+    return false;
+  lyrics.assign(value);
+  return !lyrics.empty();
+}
+} // namespace
+
 void MediaManager::init() { _taskBusy = false; }
 
 void MediaManager::syncFromStorage() {
@@ -1010,7 +1090,7 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
     Serial.printf(
         "fetchLyricsIfNeeded: TrackIndex %d out of bounds (Size: %d)\n",
         trackIndex, (int)tl->tracks.size());
-    delete tl;
+    Storage.deleteTracklist(tl);
     return LYRICS_NOT_FOUND;
   }
 
@@ -1018,19 +1098,29 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
 
   if (!force) {
     if (track.lyrics.status == "cached") {
-      delete tl;
+      Storage.deleteTracklist(tl);
       return LYRICS_ALREADY_CACHED;
     }
 
     if (track.lyrics.status == "missing") {
-      delete tl;
+      Storage.deleteTracklist(tl);
       return LYRICS_NOT_FOUND; // Don't retry automatically
     }
   }
 
-  // 2. Fetch from API
-  // 2. Fetch from API
-  String finalLyrics = "";
+  // Retain only the small request fields while TLS is active. Keeping a full
+  // track list alive during the provider response needlessly raised the peak
+  // allocation and made large releases more vulnerable to fragmentation.
+  const String albumArtist = tl->cdArtist.c_str();
+  const String albumTitle = tl->cdTitle.c_str();
+  const String trackTitle = track.title.c_str();
+  const int trackNumber = track.trackNo;
+  Storage.deleteTracklist(tl);
+  tl = nullptr;
+
+  // 2. Fetch from API. The body, JSON document, and extracted lyrics all use
+  // PSRAM and are bounded independently from the TLS/internal heap.
+  PsramString finalLyrics;
   bool found = false;
 
   // --- STRATEGY 1: LYRICS.OVH ---
@@ -1043,8 +1133,7 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
 
     // Schema: https://api.lyrics.ovh/v1/artist/title
     String url = "https://api.lyrics.ovh/v1/" +
-                 urlEncode(tl->cdArtist.c_str()) + "/" +
-                 urlEncode(track.title.c_str());
+                 urlEncode(albumArtist) + "/" + urlEncode(trackTitle);
 
     Serial.printf("Query URL: %s\n", url.c_str());
 
@@ -1053,20 +1142,11 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
     int code = http.GET();
 
     if (code == 200) {
-      String payload = http.getString();
-      DynamicJsonDocument doc(8192); // Slightly larger buffer for full lyrics
-      DeserializationError err = deserializeJson(doc, payload);
-
-      if (!err) {
-        finalLyrics = doc["lyrics"].as<String>();
-        if (finalLyrics.length() > 0)
-          found = true;
-      }
+      found = extractLyricsFromResponse(http, "lyrics", nullptr, finalLyrics);
     } else {
       ErrorHandler::logError(ERR_CAT_NETWORK,
                              String("Lyrics.ovh HTTP Error: ") + String(code) +
-                                 " (Track: " + String(track.title.c_str()) +
-                                 ")",
+                                 " (Track: " + trackTitle + ")",
                              "fetchLyricsIfNeeded");
       Serial.printf("  -> Lyrics.ovh HTTP Error %d\n", code);
     }
@@ -1083,9 +1163,9 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
     client.setTimeout(10000);
 
     String url = "https://lrclib.net/api/get?artist_name=" +
-                 urlEncode(tl->cdArtist.c_str()) +
-                 "&track_name=" + urlEncode(track.title.c_str()) +
-                 "&album_name=" + urlEncode(tl->cdTitle.c_str());
+                 urlEncode(albumArtist) + "&track_name=" +
+                 urlEncode(trackTitle) + "&album_name=" +
+                 urlEncode(albumTitle);
 
     Serial.printf("Query URL (Fallback): %s\n", url.c_str());
 
@@ -1095,24 +1175,12 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
 
     int code = http.GET();
     if (code == 200) {
-      String payload = http.getString();
-      DynamicJsonDocument doc(4096);
-      DeserializationError err = deserializeJson(doc, payload);
-
-      if (!err) {
-        finalLyrics = doc["plainLyrics"].as<String>();
-
-        if (finalLyrics.length() == 0 || finalLyrics == "null")
-          finalLyrics = doc["syncedLyrics"].as<String>();
-
-        if (finalLyrics.length() > 0 && finalLyrics != "null")
-          found = true;
-      }
+      found = extractLyricsFromResponse(http, "plainLyrics", "syncedLyrics",
+                                        finalLyrics);
     } else {
       ErrorHandler::logError(ERR_CAT_NETWORK,
                              String("LRCLib HTTP Error: ") + String(code) +
-                                 " (Track: " + String(track.title.c_str()) +
-                                 ")",
+                                 " (Track: " + trackTitle + ")",
                              "fetchLyricsIfNeeded");
       Serial.printf("  -> LRCLib HTTP Error %d\n", code);
     }
@@ -1121,23 +1189,37 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
 
   if (found) {
     String filename = "/lyrics/" + String(releaseMbid) + "/" +
-                      padTrackNumber(track.trackNo) + ".json";
+                      padTrackNumber(trackNumber) + ".json";
     Serial.printf("Saving lyrics to %s, length: %d\n", filename.c_str(),
-                  finalLyrics.length());
-    Storage.saveLyrics(filename.c_str(), finalLyrics);
+                  (int)finalLyrics.length());
+    if (!Storage.saveLyrics(filename.c_str(), finalLyrics)) {
+      ErrorHandler::logError(ERR_CAT_STORAGE, "Could not save downloaded lyrics",
+                             "fetchLyricsIfNeeded");
+      return LYRICS_ERROR;
+    }
 
-    track.lyrics.status = "cached";
-    track.lyrics.path = filename.c_str();
-    track.lyrics.offset = 0;
-    Storage.saveTracklist(releaseMbid, tl);
+    tl = Storage.loadTracklist(releaseMbid);
+    if (!tl || trackIndex < 0 || trackIndex >= (int)tl->tracks.size()) {
+      if (tl)
+        Storage.deleteTracklist(tl);
+      return LYRICS_ERROR;
+    }
+    tl->tracks[trackIndex].lyrics.status = "cached";
+    tl->tracks[trackIndex].lyrics.path = filename.c_str();
+    tl->tracks[trackIndex].lyrics.offset = 0;
+    const bool tracklistSaved = Storage.saveTracklist(releaseMbid, tl);
     Serial.printf("  -> Found & Saved to %s\n", filename.c_str());
-    delete tl;
-    return LYRICS_FETCHED_NOW;
+    Storage.deleteTracklist(tl);
+    return tracklistSaved ? LYRICS_FETCHED_NOW : LYRICS_ERROR;
   } else {
-    track.lyrics.status = "missing";
-    Storage.saveTracklist(releaseMbid, tl);
+    tl = Storage.loadTracklist(releaseMbid);
+    if (tl && trackIndex >= 0 && trackIndex < (int)tl->tracks.size()) {
+      tl->tracks[trackIndex].lyrics.status = "missing";
+      Storage.saveTracklist(releaseMbid, tl);
+    }
+    if (tl)
+      Storage.deleteTracklist(tl);
     Serial.println("  -> Not found in any provider");
-    delete tl;
     return LYRICS_NOT_FOUND;
   }
 }

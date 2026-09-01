@@ -14,6 +14,9 @@ const char *DEFAULT_PASSWORD = "YOUR_WIFI_PASSWORD";
 const char *DISCOGS_TOKEN = "YOUR_DISCOGS_TOKEN";
 #endif
 
+const char *DEFAULT_BRAND_TITLE = "DIGITAL LIBRARIAN";
+const char *DEFAULT_BRAND_SUBTITLE = "YOUR COLLECTION, AT A GLANCE";
+
 Preferences preferences;
 ESP_IOExpander_CH422G *sdExpander = NULL;
 CRGB *leds = NULL;
@@ -22,7 +25,11 @@ std::vector<WiFiNetwork> savedWiFiNetworks;
 
 String web_pin = "cd1234";
 String mdns_name = "mylibrary";
+int boot_reset_reason = 0;
+String setting_brand_title = DEFAULT_BRAND_TITLE;
+String setting_brand_subtitle = DEFAULT_BRAND_SUBTITLE;
 int setting_screensaver_min = 0;
+bool setting_debug_overlay = false;
 bool backlight_on = true;
 bool setting_enable_cds = true;
 bool setting_enable_books = false;
@@ -121,11 +128,30 @@ ModeDefinition registry[] = {
      &setting_theme_book}};
 
 // --- Settings Persistence ---
+void normalizeBrandSettings() {
+  setting_brand_title.trim();
+  setting_brand_subtitle.trim();
+
+  if (setting_brand_title.isEmpty())
+    setting_brand_title = DEFAULT_BRAND_TITLE;
+  if (setting_brand_subtitle.isEmpty())
+    setting_brand_subtitle = DEFAULT_BRAND_SUBTITLE;
+
+  if (setting_brand_title.length() > BRAND_TITLE_MAX_LENGTH)
+    setting_brand_title.remove(BRAND_TITLE_MAX_LENGTH);
+  if (setting_brand_subtitle.length() > BRAND_SUBTITLE_MAX_LENGTH)
+    setting_brand_subtitle.remove(BRAND_SUBTITLE_MAX_LENGTH);
+}
+
 void loadSettings() {
   preferences.begin("settings", true); // Read-only
   const bool hasStoredWebPin = preferences.isKey("web_pin");
   web_pin = preferences.getString("web_pin", "");
   mdns_name = preferences.getString("mdns_name", "mylibrary");
+  setting_brand_title =
+      preferences.getString("brand_title", DEFAULT_BRAND_TITLE);
+  setting_brand_subtitle =
+      preferences.getString("brand_sub", DEFAULT_BRAND_SUBTITLE);
   led_brightness = constrain(preferences.getInt("led_bright", 50), 0, 255);
 
   // Colors stored as uint32_t (R << 16 | G << 8 | B)
@@ -139,6 +165,7 @@ void loadSettings() {
   COLOR_FILTERED = CRGB(filt);
 
   setting_screensaver_min = preferences.getInt("saver_min", 0);
+  setting_debug_overlay = preferences.getBool("debug_overlay", false);
 
   // Load LED Config
   configured_led_count =
@@ -175,6 +202,8 @@ void loadSettings() {
 
   preferences.end();
 
+  normalizeBrandSettings();
+
   if (!hasStoredWebPin || web_pin.length() < 4) {
     web_pin = String(100000 + (esp_random() % 900000));
     preferences.begin("settings", false);
@@ -189,9 +218,12 @@ void loadSettings() {
 }
 
 void saveSettings() {
+  normalizeBrandSettings();
   preferences.begin("settings", false); // Read-write
   preferences.putString("web_pin", web_pin);
   preferences.putString("mdns_name", mdns_name);
+  preferences.putString("brand_title", setting_brand_title);
+  preferences.putString("brand_sub", setting_brand_subtitle);
   preferences.putInt("led_bright", led_brightness);
 
   uint32_t fav = ((uint32_t)COLOR_FAVORITE.r << 16) |
@@ -207,6 +239,7 @@ void saveSettings() {
   preferences.putUInt("col_filt", filt);
 
   preferences.putInt("saver_min", setting_screensaver_min);
+  preferences.putBool("debug_overlay", setting_debug_overlay);
   preferences.putInt("led_count", configured_led_count);
   preferences.putInt("led_max_ma", led_max_milliamps);
   preferences.putBool("use_wled", led_use_wled);

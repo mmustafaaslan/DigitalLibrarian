@@ -3,7 +3,9 @@
 #include <SD.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <esp_heap_caps.h>
 #include <queue>
+#include <utility>
 
 #include "AppGlobals.h"
 #include "BackgroundWorker.h"
@@ -19,11 +21,29 @@
 std::queue<BackgroundJob> BackgroundWorker::_jobQueue;
 SemaphoreHandle_t BackgroundWorker::_queueMutex = NULL;
 TaskHandle_t BackgroundWorker::_taskHandle = NULL;
+StackType_t *BackgroundWorker::_taskStackBuffer = nullptr;
+StaticTask_t BackgroundWorker::_taskControlBlock;
 bool BackgroundWorker::_busy = false;
 bool BackgroundWorker::_showProgress = false;
 String BackgroundWorker::_statusMsg = "Idle";
 float BackgroundWorker::_progress = 0.0f;
 int BackgroundWorker::_totalJobs = 0;
+JobType BackgroundWorker::_lastCompletedJobType = JOB_NONE;
+bool BackgroundWorker::_lastJobSuccess = false;
+ItemView BackgroundWorker::_metadataResult;
+bool BackgroundWorker::_metadataResultReady = false;
+String BackgroundWorker::_lyricsResultTitle = "";
+PsramString BackgroundWorker::_lyricsResultText;
+bool BackgroundWorker::_lyricsResultReady = false;
+bool BackgroundWorker::_lyricsCompletionReady = false;
+bool BackgroundWorker::_lyricsCompletionSuccess = false;
+String BackgroundWorker::_lyricsCompletionMessage = "";
+TrackList *BackgroundWorker::_tracklistResult = nullptr;
+bool BackgroundWorker::_tracklistCompletionReady = false;
+bool BackgroundWorker::_tracklistCompletionSuccess = false;
+String BackgroundWorker::_tracklistCompletionMessage = "";
+int BackgroundWorker::_tracklistResultIndex = -1;
+String BackgroundWorker::_tracklistResultMbid = "";
 
 void BackgroundWorker::begin() {
   if (_taskHandle)
@@ -39,12 +59,27 @@ void BackgroundWorker::begin() {
     return;
   }
 
-  // Let FreeRTOS schedule the worker away from whichever core is currently
-  // busiest. This prevents long network/JSON work from being permanently tied
-  // to the LVGL loop core.
-  const BaseType_t created =
-      xTaskCreate(workerTask, "BG_Worker", 32768, NULL, 1, &_taskHandle);
-  if (created != pdPASS) {
+  // This board is an ESP32-S3 dual-core target. Keep network/SD/JSON work on
+  // core 0 so TLS handshakes and provider timeouts cannot starve LVGL/touch on
+  // core 1. The installed MbedTLS build must allocate its 16 KB record buffers
+  // from internal RAM, whereas ESP-IDF explicitly permits task stacks in
+  // external RAM on this target. Moving the unchanged 32 KB worker stack to
+  // PSRAM restores a contiguous internal block for TLS without reducing stack
+  // safety or changing the board package.
+  static constexpr uint32_t WORKER_STACK_BYTES = 32768;
+  _taskStackBuffer = static_cast<StackType_t *>(heap_caps_calloc(
+      WORKER_STACK_BYTES, sizeof(StackType_t),
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (_taskStackBuffer) {
+    _taskHandle = xTaskCreateStaticPinnedToCore(
+        workerTask, "BG_Worker", WORKER_STACK_BYTES, NULL, 1,
+        _taskStackBuffer, &_taskControlBlock, 0);
+  }
+  if (!_taskHandle) {
+    if (_taskStackBuffer) {
+      heap_caps_free(_taskStackBuffer);
+      _taskStackBuffer = nullptr;
+    }
     _taskHandle = NULL;
     vSemaphoreDelete(_queueMutex);
     _queueMutex = NULL;
@@ -75,7 +110,23 @@ bool BackgroundWorker::addJob(const BackgroundJob &job) {
                           "BackgroundWorker::addJob");
     return false;
   }
-  _jobQueue.push(job);
+  const bool interactiveJob =
+      job.type == JOB_TRACKLIST_LOAD || job.type == JOB_LYRICS_LOAD_CACHED ||
+      job.type == JOB_LYRICS_FETCH_ONE || job.type == JOB_METADATA_LOOKUP ||
+      job.type == JOB_COVER_DOWNLOAD;
+  if (interactiveJob && !_jobQueue.empty()) {
+    // Touch-driven work should not wait behind maintenance tasks such as track
+    // summaries, favorites, or WLED persistence.
+    std::queue<BackgroundJob> prioritized;
+    prioritized.push(job);
+    while (!_jobQueue.empty()) {
+      prioritized.push(_jobQueue.front());
+      _jobQueue.pop();
+    }
+    _jobQueue.swap(prioritized);
+  } else {
+    _jobQueue.push(job);
+  }
   xSemaphoreGive(_queueMutex);
   return true;
 }
@@ -101,6 +152,9 @@ int BackgroundWorker::getQueueSize() {
   xSemaphoreGive(_queueMutex);
   return value;
 }
+uint32_t BackgroundWorker::getStackHighWaterMark() {
+  return _taskHandle ? (uint32_t)uxTaskGetStackHighWaterMark(_taskHandle) : 0;
+}
 String BackgroundWorker::getStatusMessage() {
   if (!_queueMutex || xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
     return "Working...";
@@ -114,6 +168,96 @@ float BackgroundWorker::getProgress() {
   const float value = _progress;
   xSemaphoreGive(_queueMutex);
   return value;
+}
+
+JobType BackgroundWorker::getLastCompletedJobType() {
+  if (!_queueMutex || xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    return JOB_NONE;
+  const JobType value = _lastCompletedJobType;
+  xSemaphoreGive(_queueMutex);
+  return value;
+}
+
+bool BackgroundWorker::wasLastJobSuccessful() {
+  if (!_queueMutex || xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    return false;
+  const bool value = _lastJobSuccess;
+  xSemaphoreGive(_queueMutex);
+  return value;
+}
+
+bool BackgroundWorker::takeMetadataResult(ItemView &result) {
+  if (!_queueMutex || xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    return false;
+  const bool ready = _metadataResultReady;
+  if (ready) {
+    result = _metadataResult;
+    _metadataResultReady = false;
+  }
+  xSemaphoreGive(_queueMutex);
+  return ready;
+}
+
+bool BackgroundWorker::takeLyricsResult(String &trackTitle,
+                                        PsramString &lyricsText) {
+  if (!_queueMutex || xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    return false;
+  const bool ready = _lyricsResultReady;
+  if (ready) {
+    trackTitle = std::move(_lyricsResultTitle);
+    lyricsText = std::move(_lyricsResultText);
+    _lyricsResultReady = false;
+    _lyricsResultTitle = "";
+    _lyricsResultText.clear();
+  }
+  xSemaphoreGive(_queueMutex);
+  return ready;
+}
+
+bool BackgroundWorker::takeLyricsCompletion(bool &success, String &message,
+                                            String &trackTitle,
+                                            PsramString &lyricsText) {
+  if (!_queueMutex || xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    return false;
+  const bool ready = _lyricsCompletionReady;
+  if (ready) {
+    success = _lyricsCompletionSuccess;
+    message = _lyricsCompletionMessage;
+    if (success && _lyricsResultReady) {
+      trackTitle = std::move(_lyricsResultTitle);
+      lyricsText = std::move(_lyricsResultText);
+    }
+    _lyricsCompletionReady = false;
+    _lyricsResultReady = false;
+    _lyricsResultTitle = "";
+    _lyricsResultText.clear();
+    _lyricsCompletionMessage = "";
+  }
+  xSemaphoreGive(_queueMutex);
+  return ready;
+}
+
+bool BackgroundWorker::takeTracklistCompletion(bool &success, String &message,
+                                               int &itemIndex,
+                                               String &releaseMbid,
+                                               TrackList *&trackList) {
+  if (!_queueMutex || xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    return false;
+  const bool ready = _tracklistCompletionReady;
+  if (ready) {
+    success = _tracklistCompletionSuccess;
+    message = _tracklistCompletionMessage;
+    itemIndex = _tracklistResultIndex;
+    releaseMbid = _tracklistResultMbid;
+    trackList = _tracklistResult;
+    _tracklistResult = nullptr; // Ownership transfers to the UI.
+    _tracklistCompletionReady = false;
+    _tracklistCompletionMessage = "";
+    _tracklistResultIndex = -1;
+    _tracklistResultMbid = "";
+  }
+  xSemaphoreGive(_queueMutex);
+  return ready;
 }
 
 void BackgroundWorker::setStatus(const String &message) {
@@ -150,6 +294,7 @@ void BackgroundWorker::workerTask(void *pvParameters) {
         hasJob = true;
         _busy = true;
         _showProgress = currentJob.showProgress;
+        _progress = 0.0f;
       } else {
         _busy = false;
         _showProgress = false;
@@ -163,16 +308,33 @@ void BackgroundWorker::workerTask(void *pvParameters) {
 
       switch (currentJob.type) {
       case JOB_METADATA_LOOKUP: {
+        if (WiFi.status() != WL_CONNECTED) {
+          resultMsg = "No WiFi connection. Connect and try again.";
+          break;
+        }
         setStatus("Looking up " + currentJob.id);
+        setProgress(0.15f);
         ItemView staged;
-        success = MediaManager::fetchMetadataForBarcode(currentJob.id.c_str(),
-                                                        staged);
+        success = fetchModeMetadata(currentJob.id, staged);
         if (success) {
-          resultMsg = "Fetched: " + staged.title;
+          if (_queueMutex &&
+              xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            _metadataResult = staged;
+            _metadataResultReady = true;
+            xSemaphoreGive(_queueMutex);
+          }
+          setProgress(1.0f);
+          resultMsg = "Metadata found for " + staged.title;
+        } else {
+          resultMsg = "No metadata was found for that code";
         }
       } break;
 
       case JOB_BULK_SYNC: {
+        if (WiFi.status() != WL_CONNECTED) {
+          resultMsg = "No WiFi connection. Cover sync was not started.";
+          break;
+        }
         is_sync_stopping = false;
         int total = getItemCount();
         int downloadedCount = 0;
@@ -335,49 +497,246 @@ void BackgroundWorker::workerTask(void *pvParameters) {
       } break;
 
       case JOB_COVER_DOWNLOAD: {
-        setStatus("Downloading cover...");
-        String savePath = currentJob.extraData;
-        String url = currentJob.id;
+        if (WiFi.status() != WL_CONNECTED) {
+          resultMsg = "No WiFi connection. Connect and try again.";
+          break;
+        }
+        ItemView item = getItemAtSD(currentJob.index);
+        if (!item.isValid) {
+          resultMsg = "This item is no longer available";
+          break;
+        }
 
-        if (savePath.length() > 0 && url.length() > 0) {
-          if (AppNetworkManager::downloadCoverImage(url, savePath)) {
-            resultMsg = "Downloaded to " + savePath;
-            success = true;
-          } else {
-            ErrorHandler::logError(ERR_CAT_NETWORK,
-                                   String("Cover download failed: ") + savePath,
-                                   "BackgroundWorker::JOB_COVER_DOWNLOAD");
-            resultMsg = "Download Failed";
-            success = false;
+        setStatus("Finding a cover for " + item.title + "...");
+        setProgress(0.10f);
+        String url = fetchCoverUrlForIndex(currentJob.index);
+        if (url.length() == 0) {
+          resultMsg = "No cover was found online";
+          break;
+        }
+
+        String uid = item.uniqueID;
+        if (uid.length() == 0) {
+          uid = String(millis()) + "_" + String(random(9999));
+          setItemID(currentJob.index, uid);
+        }
+        const String fileName =
+            getUidPrefix() + sanitizeFilename(uid) + ".jpg";
+        const String savePath = "/covers/" + fileName;
+
+        setStatus("Downloading the cover image...");
+        setProgress(0.45f);
+        if (!AppNetworkManager::downloadCoverImage(url, savePath)) {
+          ErrorHandler::logError(ERR_CAT_NETWORK,
+                                 String("Cover download failed: ") + savePath,
+                                 "BackgroundWorker::JOB_COVER_DOWNLOAD");
+          resultMsg = "Cover download failed. Check WiFi and SD storage.";
+          break;
+        }
+
+        setStatus("Saving the cover...");
+        setProgress(0.85f);
+        setItemCoverUrl(currentJob.index, url);
+        setItemCoverFile(currentJob.index, fileName);
+        ensureItemDetailsLoaded(currentJob.index);
+
+        bool detailSaved = false;
+        if (!libraryMutex ||
+            xSemaphoreTakeRecursive(libraryMutex, pdMS_TO_TICKS(5000)) ==
+                pdPASS) {
+          switch (currentMode) {
+          case MODE_CD:
+            if (currentJob.index >= 0 &&
+                currentJob.index < (int)cdLibrary.size()) {
+              cdLibrary[currentJob.index].coverUrl = url.c_str();
+              cdLibrary[currentJob.index].coverFile = fileName.c_str();
+              detailSaved = Storage.saveCD(cdLibrary[currentJob.index]);
+            }
+            break;
+          case MODE_BOOK:
+            if (currentJob.index >= 0 &&
+                currentJob.index < (int)bookLibrary.size()) {
+              bookLibrary[currentJob.index].coverUrl = url.c_str();
+              bookLibrary[currentJob.index].coverFile = fileName.c_str();
+              detailSaved = Storage.saveBook(bookLibrary[currentJob.index]);
+            }
+            break;
+          default:
+            break;
           }
+          if (libraryMutex)
+            xSemaphoreGiveRecursive(libraryMutex);
+        }
+
+        const bool indexSaved = saveLibrary();
+        success = detailSaved && indexSaved;
+        setProgress(1.0f);
+        resultMsg = success ? "Cover downloaded and saved"
+                            : "Cover downloaded, but could not be fully saved";
+      } break;
+
+      case JOB_TRACKLIST_LOAD: {
+        setStatus("Opening songs...");
+        setProgress(0.15f);
+
+        String releaseMbid = currentJob.id;
+        if (releaseMbid.length() == 0 && currentJob.extraData.length() > 0) {
+          // Older/index-only records may not have their detail fields in RAM.
+          // Load that detail on the worker as well; never make the LVGL/touch
+          // task wait for SD access.
+          CD detail;
+          if (Storage.loadCDDetail(currentJob.extraData, detail))
+            releaseMbid = detail.releaseMbid.c_str();
+        }
+
+        TrackList *loaded = nullptr;
+        if (releaseMbid.length() == 0) {
+          resultMsg = "This CD has no saved MusicBrainz track-list data.";
         } else {
-          resultMsg = "Invalid Params";
-          success = false;
+          setProgress(0.40f);
+          loaded = Storage.loadTracklist(releaseMbid.c_str());
+          if (!loaded) {
+            resultMsg =
+                "No readable track list is saved for this CD. Edit it and "
+                "use FETCH to retrieve the metadata again.";
+          } else if (loaded->tracks.empty()) {
+            Storage.deleteTracklist(loaded);
+            loaded = nullptr;
+            resultMsg = "The saved track list is empty.";
+          }
+        }
+
+        if (_queueMutex &&
+            xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          if (_tracklistResult)
+            Storage.deleteTracklist(_tracklistResult);
+          _tracklistResult = loaded;
+          _tracklistResultIndex = currentJob.index;
+          _tracklistResultMbid = releaseMbid;
+          loaded = nullptr;
+          xSemaphoreGive(_queueMutex);
+          success = _tracklistResult != nullptr;
+        }
+        if (loaded)
+          Storage.deleteTracklist(loaded);
+
+        if (success) {
+          setProgress(1.0f);
+          resultMsg = "Songs ready";
+        } else if (resultMsg.length() == 0) {
+          resultMsg = "The track list could not be prepared.";
         }
       } break;
 
+      case JOB_LYRICS_LOAD_CACHED: {
+        setStatus("Opening cached lyrics...");
+        setProgress(0.35f);
+        PsramString lyricsText;
+        if (!Storage.loadLyrics(currentJob.id.c_str(), lyricsText)) {
+          resultMsg = "The cached lyrics file could not be read";
+          break;
+        }
+        if (_queueMutex &&
+            xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          _lyricsResultTitle = currentJob.extraData;
+          _lyricsResultText = std::move(lyricsText);
+          _lyricsResultReady = true;
+          xSemaphoreGive(_queueMutex);
+        }
+        setProgress(1.0f);
+        success = true;
+        resultMsg = "Lyrics ready";
+      } break;
+
       case JOB_LYRICS_FETCH_ONE: {
-        setStatus("Fetching lyrics...");
-        LyricsResult result =
-            fetchLyricsIfNeeded(currentJob.id.c_str(), currentJob.index, false);
-        success = result == LYRICS_FETCHED_NOW ||
-                  result == LYRICS_ALREADY_CACHED;
-        resultMsg = success ? "Lyrics ready" : "Lyrics not found";
+        String trackTitle = "";
+        String lyricsPath = "";
+        TrackList *trackList = Storage.loadTracklist(currentJob.id.c_str());
+        if (!trackList || currentJob.index < 0 ||
+            currentJob.index >= (int)trackList->tracks.size()) {
+          if (trackList)
+            Storage.deleteTracklist(trackList);
+          resultMsg = "The selected track could not be loaded";
+          break;
+        }
+
+        trackTitle = trackList->tracks[currentJob.index].title.c_str();
+        const bool alreadyCached =
+            trackList->tracks[currentJob.index].lyrics.status == "cached";
+        if (alreadyCached)
+          lyricsPath = trackList->tracks[currentJob.index].lyrics.path.c_str();
+        Storage.deleteTracklist(trackList);
+
+        if (alreadyCached) {
+          setStatus("Loading cached lyrics...");
+          setProgress(0.60f);
+        } else {
+          if (WiFi.status() != WL_CONNECTED) {
+            resultMsg = "No WiFi connection. Connect and try again.";
+            break;
+          }
+          setStatus("Downloading lyrics for " + trackTitle + "...");
+          setProgress(0.20f);
+          const LyricsResult result = fetchLyricsIfNeeded(
+              currentJob.id.c_str(), currentJob.index, false);
+          if (result != LYRICS_FETCHED_NOW &&
+              result != LYRICS_ALREADY_CACHED) {
+            resultMsg = "Lyrics were not found for this track";
+            break;
+          }
+
+          trackList = Storage.loadTracklist(currentJob.id.c_str());
+          if (trackList && currentJob.index >= 0 &&
+              currentJob.index < (int)trackList->tracks.size()) {
+            lyricsPath =
+                trackList->tracks[currentJob.index].lyrics.path.c_str();
+          }
+          if (trackList)
+            Storage.deleteTracklist(trackList);
+          setProgress(0.80f);
+        }
+
+        PsramString lyricsText;
+        if (!Storage.loadLyrics(lyricsPath.c_str(), lyricsText)) {
+          resultMsg = "The lyrics file was empty or could not be read";
+          break;
+        }
+
+        if (_queueMutex &&
+            xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          _lyricsResultTitle = trackTitle;
+          _lyricsResultText = std::move(lyricsText);
+          _lyricsResultReady = true;
+          xSemaphoreGive(_queueMutex);
+        }
+        setProgress(1.0f);
+        success = true;
+        resultMsg = "Lyrics ready";
       } break;
 
       case JOB_LYRICS_FETCH_ALL: {
+        if (WiFi.status() != WL_CONNECTED) {
+          resultMsg = "No WiFi connection. Lyrics download was not started.";
+          break;
+        }
         String targetMbid = currentJob.id;
         if (targetMbid.length() > 0) {
           setStatus("Fetching lyrics for CD...");
           TrackList *tl = Storage.loadTracklist(targetMbid.c_str());
           if (tl) {
             int trackCount = (int)tl->tracks.size();
+            // Do not retain one full list while fetchLyricsIfNeeded loads and
+            // saves another copy for every track. This was a large avoidable
+            // peak during TLS/JSON work on multi-disc releases.
+            Storage.deleteTracklist(tl);
+            tl = nullptr;
             int fetched = 0;
             for (int i = 0; i < trackCount; i++) {
               if (is_sync_stopping)
                 break;
               setProgress(trackCount > 0 ? (float)i / trackCount : 0.0f);
-              setStatus("Lyrics: " + String(tl->tracks[i].title.c_str()));
+              setStatus("Lyrics: track " + String(i + 1) + " of " +
+                        String(trackCount));
 
               // This will check cache first, then hit APIs if missing
               LyricsResult res =
@@ -385,11 +744,13 @@ void BackgroundWorker::workerTask(void *pvParameters) {
               if (res == LYRICS_FETCHED_NOW || res == LYRICS_ALREADY_CACHED) {
                 fetched++;
               }
-              delay(50); // Small gap between API requests
+              // Give TLS cleanup and the UI task breathing room between
+              // providers/tracks; repeated handshakes otherwise fragment the
+              // small internal heap very quickly.
+              delay(250);
             }
             resultMsg = "Fetched " + String(fetched) + "/" + String(trackCount);
             success = true;
-            delete tl;
           } else {
             resultMsg = "Tracklist missing";
             success = false;
@@ -487,6 +848,26 @@ void BackgroundWorker::workerTask(void *pvParameters) {
 
       default:
         break;
+      }
+
+      if (resultMsg.length() > 0)
+        setStatus(resultMsg);
+
+      if (_queueMutex &&
+          xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        _lastCompletedJobType = currentJob.type;
+        _lastJobSuccess = success;
+        if (currentJob.type == JOB_LYRICS_LOAD_CACHED ||
+            currentJob.type == JOB_LYRICS_FETCH_ONE) {
+          _lyricsCompletionReady = true;
+          _lyricsCompletionSuccess = success;
+          _lyricsCompletionMessage = resultMsg;
+        } else if (currentJob.type == JOB_TRACKLIST_LOAD) {
+          _tracklistCompletionReady = true;
+          _tracklistCompletionSuccess = success;
+          _tracklistCompletionMessage = resultMsg;
+        }
+        xSemaphoreGive(_queueMutex);
       }
 
       if (currentJob.onComplete) {

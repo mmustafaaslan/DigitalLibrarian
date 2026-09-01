@@ -5,6 +5,10 @@
 #include <Arduino.h>
 #include <ESP_Panel_Library.h>
 #include <lvgl.h>
+
+// Lightweight refresh statistics used by the optional on-screen diagnostics.
+uint32_t lvgl_port_get_last_render_time_ms();
+uint32_t lvgl_port_get_last_render_pixels();
 /*
  * SPDX-FileCopyrightText: 2024 Espressif Systems (Shanghai) CO LTD
  *
@@ -73,9 +77,7 @@
   (16 * 1024) // The stack size of the LVGL timer task, in bytes
 #define LVGL_PORT_TASK_PRIORITY (2) // The priority of the LVGL timer task
 #define LVGL_PORT_TASK_CORE                                                    \
-  (-1) // The core of the LVGL timer task, `-1` means the don't specify the core
-       // This can be set to `1` only if the SoCs support dual-core,
-       // otherwise it should be set to `-1` or `0`
+  (1) // Keep display/touch work isolated from network and SD worker activity.
 
 /**
  * Avoid tering related configurations, can be adjusted by users.
@@ -103,7 +105,11 @@
  * bytes_per_pixel` of SRAM memory.
  *
  */
-#define LVGL_PORT_RGB_BOUNCE_BUFFER_SIZE (LVGL_PORT_DISP_WIDTH * 10)
+// A slightly deeper DMA bounce buffer gives the RGB peripheral more headroom
+// during redraw-heavy gestures (long lists and lyrics). The height multiple
+// remains valid for the ESP LCD driver's even-transfer requirement while only
+// adding 16 KB of internal SRAM compared with the vendor default.
+#define LVGL_PORT_RGB_BOUNCE_BUFFER_SIZE (LVGL_PORT_DISP_WIDTH * 15)
 /**
  * When avoid tearing is enabled, the LVGL software rotation
  * `lv_disp_set_rotation()` is not supported. But users can set the rotation

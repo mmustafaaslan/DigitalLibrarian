@@ -15,10 +15,14 @@
 constexpr int LED_MIN_COUNT = 1;
 constexpr int LED_MAX_COUNT = 1200;
 constexpr int LED_DEFAULT_POWER_MA = 3000;
+constexpr size_t BRAND_TITLE_MAX_LENGTH = 32;
+constexpr size_t BRAND_SUBTITLE_MAX_LENGTH = 48;
 
 extern const char *DEFAULT_SSID;
 extern const char *DEFAULT_PASSWORD;
 extern const char *DISCOGS_TOKEN;
+extern const char *DEFAULT_BRAND_TITLE;
+extern const char *DEFAULT_BRAND_SUBTITLE;
 
 // --- Global Objects ---
 extern Preferences preferences;
@@ -45,7 +49,11 @@ extern std::vector<WiFiNetwork> savedWiFiNetworks;
 // --- Settings & Calibration ---
 extern String web_pin;
 extern String mdns_name;
+extern int boot_reset_reason;
+extern String setting_brand_title;
+extern String setting_brand_subtitle;
 extern int setting_screensaver_min;
+extern bool setting_debug_overlay;
 extern bool backlight_on;
 extern bool setting_enable_cds;
 extern bool setting_enable_books;
@@ -99,5 +107,6 @@ bool tjpg_output(int16_t x, int16_t y, uint16_t w, uint16_t h,
                  uint16_t *bitmap);
 void loadSettings();
 void saveSettings();
+void normalizeBrandSettings();
 
 #endif

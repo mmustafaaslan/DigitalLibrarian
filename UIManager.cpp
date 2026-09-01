@@ -17,7 +17,9 @@
 #include <WiFiClientSecure.h>
 #include <algorithm>
 #include <climits>
+#include <esp_heap_caps.h>
 #include <lvgl.h>
+#include <utility>
 
 // --- Image Loading Globals ---
 static uint16_t *img_buffer = NULL;
@@ -27,6 +29,18 @@ static lv_img_dsc_t raw_img_dsc;
 static lv_obj_t *progress_modal = NULL;
 static lv_obj_t *progress_bar = NULL;
 static lv_obj_t *progress_label = NULL;
+static lv_obj_t *progress_spinner = NULL;
+static bool compact_lyrics_progress_active = false;
+
+static void dismiss_progress_modal() {
+  if (progress_modal)
+    lv_obj_del(progress_modal);
+  progress_modal = NULL;
+  progress_bar = NULL;
+  progress_label = NULL;
+  progress_spinner = NULL;
+  compact_lyrics_progress_active = false;
+}
 
 // TJpg output callback
 bool tjpg_output(int16_t x, int16_t y, uint16_t w, uint16_t h,
@@ -70,6 +84,7 @@ lv_obj_t *btn_edit;
 
 // --- Panel Objects Implementation ---
 lv_obj_t *tracklist_panel = NULL;
+static lv_obj_t *tracklist_feedback_label = NULL;
 lv_obj_t *lyrics_panel = NULL;
 lv_obj_t *search_panel = NULL;
 lv_obj_t *add_item_panel = NULL;
@@ -103,6 +118,8 @@ lv_obj_t *btn_qr = NULL;
 lv_obj_t *label_qr = NULL;
 lv_obj_t *btn_restart_h = NULL;
 lv_obj_t *lbl_restart_h = NULL;
+static lv_obj_t *label_brand_title = NULL;
+static lv_obj_t *label_brand_subtitle = NULL;
 
 // --- Modal Specific Objects ---
 // Search UI
@@ -113,8 +130,14 @@ lv_obj_t *list_results = NULL;
 lv_obj_t *label_search_status = NULL;
 static lv_timer_t *search_timer = NULL;
 static lv_timer_t *wled_sync_timer = NULL;
+static lv_timer_t *wifi_indicator_timer = NULL;
 static lv_timer_t *cover_load_timer = NULL;
 static lv_timer_t *track_summary_timer = NULL;
+static bool lyrics_request_pending = false;
+static bool tracklist_request_pending = false;
+static lv_obj_t *debug_overlay = NULL;
+static lv_obj_t *debug_overlay_label = NULL;
+static lv_timer_t *debug_overlay_timer = NULL;
 static String pending_cover_file = "";
 static String displayed_cover_file = "";
 static String pending_track_summary_mbid = "";
@@ -125,6 +148,90 @@ static bool track_summary_result_ready = false;
 static String track_summary_result_mbid = "";
 static String track_summary_result_text = "";
 static bool track_summary_result_has_favorites = false;
+
+static void refresh_debug_overlay() {
+  if (!debug_overlay || !debug_overlay_label)
+    return;
+
+  const uint32_t freeInternal =
+      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const uint32_t largestInternal = heap_caps_get_largest_free_block(
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const uint32_t freePsram = ESP.getFreePsram();
+  const uint32_t totalPsram = ESP.getPsramSize();
+  const uint32_t uptimeSeconds = millis() / 1000;
+  const int32_t rssi = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
+  const bool workerBusy = BackgroundWorker::isBusy();
+  char wifiText[16];
+  if (WiFi.status() == WL_CONNECTED)
+    snprintf(wifiText, sizeof(wifiText), "%lddBm", (long)rssi);
+  else
+    snprintf(wifiText, sizeof(wifiText), "offline");
+
+  char text[256];
+  snprintf(text, sizeof(text),
+           "DEBUG  INT free %luK  largest %luK\n"
+           "Low-water %luK  PSRAM %lu/%luK\n"
+           "Render %lums / %luKpx  Job %s Q%d S%luK\n"
+           "WiFi %s  Reset %d  Up %02lu:%02lu:%02lu",
+           (unsigned long)(freeInternal / 1024),
+           (unsigned long)(largestInternal / 1024),
+           (unsigned long)(ESP.getMinFreeHeap() / 1024),
+           (unsigned long)(freePsram / 1024),
+           (unsigned long)(totalPsram / 1024),
+           (unsigned long)lvgl_port_get_last_render_time_ms(),
+           (unsigned long)(lvgl_port_get_last_render_pixels() / 1000),
+           workerBusy ? "BUSY" : "idle", BackgroundWorker::getQueueSize(),
+           (unsigned long)(BackgroundWorker::getStackHighWaterMark() / 1024),
+           wifiText, boot_reset_reason,
+           (unsigned long)(uptimeSeconds / 3600),
+           (unsigned long)((uptimeSeconds / 60) % 60),
+           (unsigned long)(uptimeSeconds % 60));
+  lv_label_set_text(debug_overlay_label, text);
+  // Keep diagnostics visible over temporary panels without intercepting touch.
+  lv_obj_move_foreground(debug_overlay);
+}
+
+static void set_debug_overlay_enabled(bool enabled) {
+  setting_debug_overlay = enabled;
+  if (!enabled) {
+    if (debug_overlay_timer) {
+      lv_timer_del(debug_overlay_timer);
+      debug_overlay_timer = NULL;
+    }
+    if (debug_overlay) {
+      lv_obj_del(debug_overlay);
+      debug_overlay = NULL;
+      debug_overlay_label = NULL;
+    }
+    return;
+  }
+
+  if (!debug_overlay) {
+    debug_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(debug_overlay, 296, 92);
+    lv_obj_align(debug_overlay, LV_ALIGN_TOP_RIGHT, -8, 72);
+    lv_obj_set_style_bg_color(debug_overlay, lv_color_hex(0x090D12), 0);
+    lv_obj_set_style_bg_opa(debug_overlay, LV_OPA_90, 0);
+    lv_obj_set_style_border_color(debug_overlay,
+                                  lv_color_hex(getCurrentThemeColor()), 0);
+    lv_obj_set_style_border_width(debug_overlay, 1, 0);
+    lv_obj_set_style_radius(debug_overlay, 8, 0);
+    lv_obj_set_style_pad_all(debug_overlay, 7, 0);
+    lv_obj_clear_flag(debug_overlay,
+                      LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+
+    debug_overlay_label = lv_label_create(debug_overlay);
+    lv_obj_set_size(debug_overlay_label, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_text_font(debug_overlay_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(debug_overlay_label, lv_color_hex(0xD7E2EC),
+                                0);
+  }
+  if (!debug_overlay_timer)
+    debug_overlay_timer = lv_timer_create(
+        [](lv_timer_t *timer) { refresh_debug_overlay(); }, 2000, NULL);
+  refresh_debug_overlay();
+}
 
 // Add/Edit UI
 lv_obj_t *ta_barcode = NULL;
@@ -138,6 +245,7 @@ lv_obj_t *ta_notes = NULL;
 lv_obj_t *ta_publisher = NULL;
 lv_obj_t *ta_page_count = NULL;
 lv_obj_t *ta_current_page = NULL;
+static lv_obj_t *btn_metadata_fetch = NULL;
 
 // WiFi UI
 lv_obj_t *ta_ssid = NULL;
@@ -149,6 +257,7 @@ static lv_timer_t *wifi_connect_timer = NULL;
 static String pending_wifi_ssid = "";
 static String pending_wifi_password = "";
 static int wifi_connect_attempts = 0;
+static constexpr int WIFI_CONNECT_TIMEOUT_TICKS = 60; // 30 s at 500 ms/tick
 
 int edit_item_index = -1;
 bool sort_by_artist = false;
@@ -202,7 +311,12 @@ static void style_list_control(lv_obj_t *list) {
 
 static void style_list_row(lv_obj_t *row) {
   lv_obj_add_style(row, &style_list_item, 0);
-  lv_obj_add_style(row, &style_icon_button_pressed, LV_STATE_PRESSED);
+  // Do not use style_icon_button_pressed here. Its transform shrinks the
+  // object while pressed, which makes a flex list reflow on every touch sample
+  // and is particularly visible as jitter while the RGB panel is scrolling.
+  lv_obj_set_style_bg_color(row, lv_color_hex(0x263B4D), LV_STATE_PRESSED);
+  lv_obj_set_style_border_color(row, lv_color_hex(getCurrentThemeColor()),
+                                LV_STATE_PRESSED);
 }
 
 static lv_obj_t *create_panel_header(lv_obj_t *parent, const char *title) {
@@ -238,6 +352,43 @@ static void prepare_modal_panel(lv_obj_t *panel, int width, int height,
   }
 }
 
+static void show_compact_lyrics_progress() {
+  if (progress_modal)
+    return;
+  compact_lyrics_progress_active = true;
+  progress_modal = lv_obj_create(lv_layer_top());
+  lv_obj_set_size(progress_modal, UiLayout::screenW, UiLayout::screenH);
+  lv_obj_set_pos(progress_modal, 0, 0);
+  lv_obj_add_style(progress_modal, &style_scrim, 0);
+  lv_obj_clear_flag(progress_modal, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Keep this deliberately small. MbedTLS uses internal RAM in the installed
+  // ESP32 core, so constructing the full generic progress dialog immediately
+  // before a handshake can leave too little contiguous heap.
+  lv_obj_t *panel = lv_obj_create(progress_modal);
+  prepare_modal_panel(panel, 430, 142);
+
+  progress_spinner = lv_spinner_create(panel, 900, 76);
+  lv_obj_set_size(progress_spinner, 44, 44);
+  lv_obj_set_pos(progress_spinner, 24, 48);
+  lv_obj_set_style_arc_color(progress_spinner, lv_color_hex(0x263544),
+                             LV_PART_MAIN);
+  lv_obj_set_style_arc_color(progress_spinner,
+                             lv_color_hex(getCurrentThemeColor()),
+                             LV_PART_INDICATOR);
+
+  lv_obj_t *title = lv_label_create(panel);
+  lv_label_set_text(title, "DOWNLOADING LYRICS");
+  lv_obj_set_pos(title, 88, 42);
+  lv_obj_add_style(title, &style_section_label, 0);
+
+  progress_label = lv_label_create(panel);
+  lv_label_set_text(progress_label, "Please wait; the interface is responsive.");
+  lv_obj_set_pos(progress_label, 88, 72);
+  lv_obj_set_width(progress_label, 318);
+  lv_obj_set_style_text_color(progress_label, lv_color_hex(0x98A6B5), 0);
+}
+
 // Forward declarations
 
 void btn_search_clicked(lv_event_t *e);
@@ -264,7 +415,7 @@ void clear_filters();
 void show_tracklist_ui(int index);
 void close_tracklist_ui();
 void show_chapter_list_ui(int index);
-void show_lyrics_popup(String trackTitle, String lyricsText);
+void show_lyrics_popup(String trackTitle, PsramString lyricsText);
 void close_lyrics_popup();
 void show_qr_ui();
 void close_qr_ui();
@@ -282,6 +433,8 @@ void update_filtered_leds();
 bool is_item_match(int index);
 void selectRandomWithEffect();
 void forceUpdateWLED();
+static void apply_metadata_result(const ItemView &staged);
+static void show_metadata_not_found();
 
 // Forward declarations for lyrics/chapter fetching
 LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex);
@@ -358,6 +511,41 @@ static void schedule_wled_sync(uint32_t debounceMs = 120) {
       },
       debounceMs, NULL);
   lv_timer_set_repeat_count(wled_sync_timer, 1);
+}
+
+static void refresh_wifi_indicators() {
+  const bool connected = WiFi.status() == WL_CONNECTED;
+
+  if (label_wifi) {
+    lv_label_set_text(label_wifi,
+                      connected ? LV_SYMBOL_WIFI : LV_SYMBOL_WARNING);
+    lv_obj_set_style_text_color(
+        label_wifi,
+        lv_color_hex(connected ? getCurrentThemeColor() : 0xff8800), 0);
+  }
+
+  if (!wifi_status_label || wifi_connect_timer)
+    return;
+
+  if (connected) {
+    lv_label_set_text_fmt(wifi_status_label, "Connected to: %s",
+                          WiFi.SSID().c_str());
+    lv_obj_set_style_text_color(wifi_status_label,
+                                lv_color_hex(getCurrentThemeColor()), 0);
+    return;
+  }
+
+  if (AppNetworkManager::isConnectionInProgress()) {
+    const int index = AppNetworkManager::getConnectionNetworkIndex();
+    if (index >= 0 && index < (int)savedWiFiNetworks.size()) {
+      lv_label_set_text_fmt(wifi_status_label,
+                            "Trying saved network %d of %d: %s",
+                            index + 1, savedWiFiNetworks.size(),
+                            savedWiFiNetworks[index].ssid.c_str());
+      lv_obj_set_style_text_color(wifi_status_label,
+                                  lv_color_hex(0xffdd00), 0);
+    }
+  }
 }
 
 static void schedule_cover_load(const String &filename) {
@@ -519,8 +707,11 @@ void close_tracklist_ui() {
   if (!tracklist_panel)
     return;
   lvgl_port_lock(-1);
-  lv_obj_del(tracklist_panel);
+  lv_obj_t *panelToDelete = tracklist_panel;
   tracklist_panel = NULL;
+  tracklist_feedback_label = NULL;
+  lv_obj_add_flag(panelToDelete, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_del_async(panelToDelete);
   lvgl_port_unlock();
 }
 
@@ -531,22 +722,37 @@ void close_lyrics_popup() {
   if (!lyrics_panel)
     return;
   lvgl_port_lock(-1);
-  lv_obj_del(lyrics_panel);
+  lv_obj_t *panelToDelete = lyrics_panel;
   lyrics_panel = NULL;
+  // Defer destruction until the current close-button event has fully
+  // unwound. Hiding immediately prevents the old panel flashing underneath a
+  // newly opened track list.
+  lv_obj_add_flag(panelToDelete, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_del_async(panelToDelete);
   lvgl_port_unlock();
 }
 
-void show_lyrics_popup(String trackTitle, String lyricsText) {
+struct LyricsPopupData {
+  String title;
+  PsramString lyrics;
+};
+
+void show_lyrics_popup(String trackTitle, PsramString lyricsText) {
   if (lyrics_panel)
     close_lyrics_popup();
   lvgl_port_lock(-1);
 
+  LyricsPopupData *popupData =
+      new LyricsPopupData{std::move(trackTitle), std::move(lyricsText)};
+
   // Use top layer to ensure visibility above other modals
   lyrics_panel = lv_obj_create(lv_layer_top());
+  lv_obj_add_flag(lyrics_panel, LV_OBJ_FLAG_HIDDEN);
   prepare_modal_panel(lyrics_panel, 744, 448);
 
   lv_obj_t *lblTitle =
-      create_panel_header(lyrics_panel, sanitizeText(trackTitle).c_str());
+      create_panel_header(lyrics_panel,
+                          sanitizeText(popupData->title).c_str());
   lv_obj_set_width(lblTitle, 640);
   lv_label_set_long_mode(lblTitle, LV_LABEL_LONG_DOT);
 
@@ -569,97 +775,325 @@ void show_lyrics_popup(String trackTitle, String lyricsText) {
   lv_obj_set_pos(cont, 20, 76);
   style_list_control(cont);
   lv_obj_set_scroll_dir(cont, LV_DIR_VER);
+  lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_all(cont, 16, 0);
+  lv_obj_set_style_pad_gap(cont, 14, 0);
 
-  lv_obj_t *lblLyrics = lv_label_create(cont);
-  lv_label_set_text(lblLyrics, lyricsText.length() > 0
-                                      ? lyricsText.c_str()
-                                      : "Lyrics are not available for this track.");
-  lv_obj_set_width(lblLyrics, 672);
-  lv_label_set_long_mode(lblLyrics, LV_LABEL_LONG_WRAP);
-  lv_obj_set_style_text_align(lblLyrics, LV_TEXT_ALIGN_LEFT, 0);
-  lv_obj_set_style_text_color(lblLyrics, lv_color_hex(0xD4DCE5), 0);
-  lv_obj_set_style_text_font(lblLyrics, &lv_font_montserrat_16, 0);
+  // A single multi-thousand-character LVGL label can monopolize rendering and
+  // fragment internal RAM. Split the persistent PSRAM buffer into bounded,
+  // zero-copy labels instead.
+  char *lyricsBuffer = popupData->lyrics.empty()
+                           ? nullptr
+                           : &popupData->lyrics[0];
+  const size_t lyricsLength = popupData->lyrics.size();
+  constexpr size_t LYRICS_CHUNK_CHARS = 900;
+  size_t chunkStart = 0;
+  while (lyricsBuffer && chunkStart < lyricsLength) {
+    size_t chunkEnd =
+        std::min(chunkStart + LYRICS_CHUNK_CHARS, lyricsLength);
+    if (chunkEnd < lyricsLength) {
+      size_t split = chunkEnd;
+      const size_t earliestSplit = chunkStart + LYRICS_CHUNK_CHARS / 2;
+      while (split > earliestSplit && lyricsBuffer[split] != '\n' &&
+             lyricsBuffer[split] != ' ')
+        split--;
+      if (split > earliestSplit)
+        chunkEnd = split;
+      lyricsBuffer[chunkEnd] = '\0';
+    }
+
+    lv_obj_t *chunkLabel = lv_label_create(cont);
+    lv_label_set_text_static(chunkLabel, lyricsBuffer + chunkStart);
+    lv_obj_set_width(chunkLabel, 656);
+    lv_obj_set_height(chunkLabel, LV_SIZE_CONTENT);
+    lv_label_set_long_mode(chunkLabel, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(chunkLabel, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_set_style_text_color(chunkLabel, lv_color_hex(0xD4DCE5), 0);
+    lv_obj_set_style_text_font(chunkLabel, &lv_font_montserrat_16, 0);
+
+    if (chunkEnd >= lyricsLength)
+      break;
+    chunkStart = chunkEnd + 1;
+    while (chunkStart < lyricsLength &&
+           (lyricsBuffer[chunkStart] == '\n' ||
+            lyricsBuffer[chunkStart] == ' '))
+      chunkStart++;
+  }
+
+  // LVGL sends a parent's DELETE event before deleting its children. Because
+  // the labels point directly into this PSRAM string, attach ownership to a
+  // final hidden child instead; it is deleted only after the earlier label
+  // children have released their pointers.
+  lv_obj_t *dataOwner = lv_obj_create(lyrics_panel);
+  lv_obj_set_size(dataOwner, 0, 0);
+  lv_obj_add_flag(dataOwner, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_event_cb(
+      dataOwner,
+      [](lv_event_t *e) {
+        delete (LyricsPopupData *)lv_event_get_user_data(e);
+      },
+      LV_EVENT_DELETE, popupData);
+
+  // Do not expose the panel while flex layout and label heights are changing;
+  // revealing one completed tree avoids repeated full-screen invalidations and
+  // visible framebuffer shaking.
+  lv_obj_update_layout(lyrics_panel);
+  lv_obj_clear_flag(lyrics_panel, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_invalidate(lyrics_panel);
 
   lvgl_port_unlock();
 }
 
+struct TrackClickData {
+  Track track;
+  String releaseMbid;
+};
+
+struct TrackFavData {
+  int idx;
+  TrackList *trackList;
+  String releaseMbid;
+};
+
+struct TracklistBuildState {
+  TrackList *trackList;
+  lv_obj_t *container;
+  lv_obj_t *pageLabel;
+  lv_obj_t *previousButton;
+  lv_obj_t *nextButton;
+  String releaseMbid;
+  PsramIntVector visibleTrackIndices;
+  int currentPage;
+};
+
+static constexpr int TRACKS_PER_PAGE = 4;
+
 static void trackClickHandler(lv_event_t *e) {
   Serial.println(">>> trackClickHandler CLICKED <<<");
-  Track *track = (Track *)lv_event_get_user_data(e);
-  int idx = getCurrentItemIndex();
+  TrackClickData *data = (TrackClickData *)lv_event_get_user_data(e);
+  Track *track = data ? &data->track : nullptr;
 
-  if (idx < 0 || idx >= (int)cdLibrary.size()) {
-    Serial.printf("Error: Invalid Index %d\n", idx);
-    return;
-  }
-
-  CD &cd = cdLibrary[idx];
-
-  if (!track || cd.releaseMbid.length() == 0) {
+  if (!track || data->releaseMbid.length() == 0) {
     return;
   }
   int trackIndex = track->trackNo - 1;
   Serial.printf("Status: '%s'\n", track->lyrics.status.c_str());
 
-  if (track->lyrics.status == "cached") {
-    Serial.println("Status is CACHED. Loading...");
-    Serial.printf("Loading from path: %s\n", track->lyrics.path.c_str());
-    String lyrics = Storage.loadLyrics(track->lyrics.path.c_str());
-    Serial.printf("Loaded Lyrics: %d bytes\n", lyrics.length());
+  const bool isCached = track->lyrics.status == "cached";
+  if (lyrics_request_pending) {
+    if (tracklist_feedback_label) {
+      lv_label_set_text(tracklist_feedback_label,
+                        LV_SYMBOL_REFRESH " Finishing the selected song...");
+      lv_obj_set_style_text_color(tracklist_feedback_label,
+                                  lv_color_hex(getCurrentThemeColor()), 0);
+    }
+    lv_obj_clear_state(lv_event_get_target(e), LV_STATE_PRESSED);
+    return;
+  }
+  if (!isCached && WiFi.status() != WL_CONNECTED) {
+    Serial.println("trackClickHandler: offline; returning without network job");
+    if (tracklist_feedback_label) {
+      lv_label_set_text(tracklist_feedback_label,
+                        LV_SYMBOL_WARNING " WiFi required for uncached lyrics");
+      lv_obj_set_style_text_color(tracklist_feedback_label,
+                                  lv_color_hex(0xFFB340), 0);
+    }
+    lv_obj_clear_state(lv_event_get_target(e), LV_STATE_PRESSED);
+    return;
+  }
 
-    if (lyrics.length() > 0) {
-      Serial.println("Calling popup...");
-      show_lyrics_popup(String(track->title.c_str()), lyrics);
-      return; // Done
-    } else {
-      Serial.println("Error: Cached lyrics empty? Treating as missing.");
-      track->lyrics.status = "missing";
-      // Fall through to missing logic below
+  Serial.println("trackClickHandler: queueing lyrics job");
+  const BackgroundJob lyricsJob =
+      isCached
+          ? BackgroundJob{JOB_LYRICS_LOAD_CACHED,
+                          String(track->lyrics.path.c_str()), trackIndex,
+                          String(track->title.c_str()), nullptr, false}
+          : BackgroundJob{JOB_LYRICS_FETCH_ONE,
+                          data->releaseMbid, trackIndex, "",
+                          nullptr, true};
+
+  if (!isCached) {
+    // The installed ESP32 core keeps MbedTLS buffers in internal RAM. Release
+    // the song window (rows, labels, styles, and its retained track list)
+    // before beginning the handshake, then use a much smaller progress UI.
+    // Queue on a later LVGL tick so lv_obj_del_async has actually reclaimed
+    // the panel first.
+    BackgroundJob *deferredJob = new BackgroundJob(lyricsJob);
+    lyrics_request_pending = true;
+    lv_obj_clear_state(lv_event_get_target(e), LV_STATE_PRESSED);
+    close_tracklist_ui();
+    lv_timer_create(
+        [](lv_timer_t *timer) {
+          BackgroundJob *job = (BackgroundJob *)timer->user_data;
+          show_compact_lyrics_progress();
+          const bool queued = BackgroundWorker::addJob(*job);
+          delete job;
+          lv_timer_del(timer);
+          if (!queued) {
+            lyrics_request_pending = false;
+            dismiss_progress_modal();
+            show_info_popup("Busy", "The lyrics request could not be queued.",
+                            NULL, NULL);
+          }
+        },
+        120, deferredJob);
+    Serial.println("trackClickHandler: deferred until song panel cleanup");
+    return;
+  }
+
+  const bool queued = BackgroundWorker::addJob(lyricsJob);
+  lyrics_request_pending = queued;
+  Serial.printf("trackClickHandler: queue result=%s\n", queued ? "OK" : "FULL");
+  if (queued && tracklist_feedback_label) {
+    lv_label_set_text(tracklist_feedback_label,
+                      LV_SYMBOL_REFRESH " Loading selected lyrics...");
+    lv_obj_set_style_text_color(tracklist_feedback_label,
+                                lv_color_hex(getCurrentThemeColor()), 0);
+  }
+  if (!queued) {
+    if (tracklist_feedback_label) {
+      lv_label_set_text(tracklist_feedback_label,
+                        LV_SYMBOL_WARNING " Busy; please try again");
+      lv_obj_set_style_text_color(tracklist_feedback_label,
+                                  lv_color_hex(0xFFB340), 0);
     }
   }
-
-  const bool queued = BackgroundWorker::addJob(
-      {JOB_LYRICS_FETCH_ONE, String(cd.releaseMbid.c_str()), trackIndex, "",
-       nullptr, true});
-  show_info_popup(queued ? "Fetching Lyrics" : "Busy",
-                  queued ? "The request is running in the background. Tap the "
-                           "track again when it completes."
-                         : "The background queue is full. Please try again.",
-                  NULL, NULL);
+  lv_obj_clear_state(lv_event_get_target(e), LV_STATE_PRESSED);
+  Serial.println("trackClickHandler: returned to LVGL");
 }
 
-void show_tracklist_ui(int idx) {
-  switch (currentMode) {
-  case MODE_BOOK:
-    return; // No tracklist/chapter support
-
-  case MODE_CD:
-  default:
-    break;
-  }
-  if (idx < 0 || idx >= (int)cdLibrary.size())
+static void append_tracklist_row(TracklistBuildState *state, int index) {
+  Track &track = state->trackList->tracks[index];
+  if (track.title.length() == 0 || track.title == " ")
     return;
-  ensureItemDetailsLoaded(idx);
-  CD &cd = cdLibrary[idx];
 
-  if (cd.releaseMbid.length() == 0) {
-    show_info_popup("No Tracklist", "This CD has no MusicBrainz data.", NULL,
-                    NULL);
+  const char *icon = getLyricsStatusIcon(track.lyrics.status.c_str());
+  constexpr int containerW = 672;
+
+  lv_obj_t *btn = lv_btn_create(state->container);
+  lv_obj_set_width(btn, lv_pct(100));
+  lv_obj_set_height(btn, 54);
+  style_list_row(btn);
+
+  lv_obj_t *btnFav = lv_btn_create(btn);
+  lv_obj_set_size(btnFav, 44, 44);
+  lv_obj_align(btnFav, LV_ALIGN_LEFT_MID, 6, 0);
+  lv_obj_set_style_radius(btnFav, 10, 0);
+  lv_obj_set_style_bg_color(btnFav,
+                            track.isFavoriteTrack ? lv_color_hex(0xFFD700)
+                                                  : lv_color_hex(0x555555),
+                            0);
+  lv_obj_t *lblBell = lv_label_create(btnFav);
+  lv_label_set_text(lblBell, LV_SYMBOL_BELL);
+  lv_obj_center(lblBell);
+  lv_obj_set_style_text_color(lblBell,
+                              track.isFavoriteTrack ? lv_color_hex(0x000000)
+                                                    : lv_color_hex(0xCCCCCC),
+                              0);
+
+  TrackFavData *favoriteData =
+      new TrackFavData{index, state->trackList, state->releaseMbid};
+  lv_obj_add_event_cb(
+      btnFav,
+      [](lv_event_t *e) {
+        TrackFavData *favorite =
+            (TrackFavData *)lv_event_get_user_data(e);
+        Track &selected = favorite->trackList->tracks[favorite->idx];
+        selected.isFavoriteTrack = !selected.isFavoriteTrack;
+
+        lv_obj_t *button = lv_event_get_target(e);
+        lv_obj_t *label = lv_obj_get_child(button, 0);
+        lv_obj_set_style_bg_color(
+            button, selected.isFavoriteTrack ? lv_color_hex(0xFFD700)
+                                             : lv_color_hex(0x555555),
+            0);
+        lv_obj_set_style_text_color(
+            label, selected.isFavoriteTrack ? lv_color_hex(0x000000)
+                                            : lv_color_hex(0xCCCCCC),
+            0);
+        cache_track_summary(favorite->releaseMbid, favorite->trackList);
+        apply_track_summary_label(cached_track_summary_text,
+                                  cached_track_summary_has_favorites);
+        BackgroundWorker::addJob(
+            {JOB_PERSIST_TRACK_FAVORITE, favorite->releaseMbid, favorite->idx,
+             selected.isFavoriteTrack ? "1" : "0", nullptr, false});
+      },
+      LV_EVENT_CLICKED, favoriteData);
+  lv_obj_add_event_cb(
+      btnFav,
+      [](lv_event_t *e) {
+        delete (TrackFavData *)lv_event_get_user_data(e);
+      },
+      LV_EVENT_DELETE, favoriteData);
+
+  lv_obj_t *lblLeft = lv_label_create(btn);
+  lv_label_set_text_fmt(lblLeft, "%d. %s", track.trackNo,
+                        sanitizeText(String(track.title.c_str())).c_str());
+  lv_obj_align(lblLeft, LV_ALIGN_LEFT_MID, 58, 0);
+  lv_obj_set_width(lblLeft, containerW - 196);
+  lv_label_set_long_mode(lblLeft, LV_LABEL_LONG_DOT);
+
+  lv_obj_t *lblRight = lv_label_create(btn);
+  lv_label_set_text_fmt(lblRight, "%s %s",
+                        formatDuration(track.durationMs).c_str(), icon);
+  lv_obj_align(lblRight, LV_ALIGN_RIGHT_MID, -10, 0);
+  lv_obj_set_style_text_color(lblRight, lv_color_hex(getCurrentThemeColor()),
+                              0);
+
+  TrackClickData *clickData = new TrackClickData{track, state->releaseMbid};
+  lv_obj_add_event_cb(btn, trackClickHandler, LV_EVENT_CLICKED, clickData);
+  lv_obj_add_event_cb(
+      btn,
+      [](lv_event_t *e) {
+        delete (TrackClickData *)lv_event_get_user_data(e);
+      },
+      LV_EVENT_DELETE, clickData);
+}
+
+static void render_tracklist_page(TracklistBuildState *state) {
+  if (!state || !state->container)
     return;
-  }
-  TrackList *trackList = Storage.loadTracklist(cd.releaseMbid.c_str());
-  if (!trackList || trackList->tracks.size() == 0) {
+
+  const int trackCount = (int)state->visibleTrackIndices.size();
+  const int pageCount = std::max(1, (trackCount + TRACKS_PER_PAGE - 1) /
+                                        TRACKS_PER_PAGE);
+  state->currentPage = constrain(state->currentPage, 0, pageCount - 1);
+
+  // Delete only the previous page's bounded row set. At no point does the
+  // songs window retain an object tree proportional to the album's length.
+  lv_obj_clean(state->container);
+  const int first = state->currentPage * TRACKS_PER_PAGE;
+  const int last = std::min(first + TRACKS_PER_PAGE, trackCount);
+  for (int position = first; position < last; position++)
+    append_tracklist_row(state, state->visibleTrackIndices[position]);
+
+  lv_label_set_text_fmt(state->pageLabel, "Page %d of %d  |  %d songs",
+                        state->currentPage + 1, pageCount, trackCount);
+  if (state->currentPage == 0)
+    lv_obj_add_state(state->previousButton, LV_STATE_DISABLED);
+  else
+    lv_obj_clear_state(state->previousButton, LV_STATE_DISABLED);
+  if (state->currentPage >= pageCount - 1)
+    lv_obj_add_state(state->nextButton, LV_STATE_DISABLED);
+  else
+    lv_obj_clear_state(state->nextButton, LV_STATE_DISABLED);
+}
+
+static void render_tracklist_ui(int idx, const String &releaseMbid,
+                                TrackList *trackList) {
+  if (!trackList || idx < 0 || idx >= (int)cdLibrary.size()) {
     if (trackList)
-      delete trackList;
-    show_info_popup("No Tracks", "Track file not found.", NULL, NULL);
+      Storage.deleteTracklist(trackList);
     return;
   }
+  CD &cd = cdLibrary[idx];
 
   if (tracklist_panel)
     close_tracklist_ui();
   lvgl_port_lock(-1);
 
   tracklist_panel = lv_obj_create(lv_scr_act());
+  lv_obj_add_flag(tracklist_panel, LV_OBJ_FLAG_HIDDEN);
   prepare_modal_panel(tracklist_panel, 704, 432);
 
   String tracklistTitle = sanitizeText(String(cd.title.c_str())) + " - " +
@@ -669,6 +1103,17 @@ void show_tracklist_ui(int idx) {
   lv_obj_set_pos(lblTitle, 76, 22);
   lv_obj_set_width(lblTitle, 540);
   lv_label_set_long_mode(lblTitle, LV_LABEL_LONG_DOT);
+
+  tracklist_feedback_label =
+      lv_label_create(lv_obj_get_parent(lblTitle));
+  lv_label_set_text(tracklist_feedback_label, "Tap a track to open its lyrics");
+  lv_obj_set_pos(tracklist_feedback_label, 76, 44);
+  lv_obj_set_width(tracklist_feedback_label, 540);
+  lv_label_set_long_mode(tracklist_feedback_label, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_font(tracklist_feedback_label,
+                             &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(tracklist_feedback_label,
+                              lv_color_hex(0x8FA1B3), 0);
 
   lv_obj_t *btnClose = lv_btn_create(tracklist_panel);
   lv_obj_set_size(btnClose, 44, 44);
@@ -683,11 +1128,9 @@ void show_tracklist_ui(int idx) {
   lv_obj_add_event_cb(
       btnClose,
       [](lv_event_t *e) {
-        TrackList *tl = (TrackList *)lv_event_get_user_data(e);
         close_tracklist_ui();
-        delete tl;
       },
-      LV_EVENT_CLICKED, trackList);
+      LV_EVENT_CLICKED, NULL);
 
   // Fetch All Lyrics button (Only for CDs)
   switch (currentMode) {
@@ -700,21 +1143,26 @@ void show_tracklist_ui(int idx) {
     lv_label_set_text(lblFetchAll, LV_SYMBOL_DOWNLOAD);
     lv_obj_center(lblFetchAll);
 
-    String *mbidCopy = new String(cd.releaseMbid.c_str());
+    String *mbidCopy = new String(releaseMbid);
     lv_obj_add_event_cb(
         btnFetchAll,
         [](lv_event_t *e) {
           String *mbid = (String *)lv_event_get_user_data(e);
+          if (WiFi.status() != WL_CONNECTED) {
+            show_info_popup("WiFi Required",
+                            "Connect in WiFi Settings before downloading "
+                            "lyrics.",
+                            NULL, NULL);
+            return;
+          }
           const bool queued = mbid && BackgroundWorker::addJob(
                                           {JOB_LYRICS_FETCH_ALL, *mbid, -1, "",
                                            nullptr, true});
           if (queued)
             lv_obj_add_state(lv_event_get_target(e), LV_STATE_DISABLED);
-          show_info_popup(queued ? "Fetching Lyrics" : "Busy",
-                          queued ? "All track lyrics are being fetched in the "
-                                   "background."
-                                 : "The request could not be queued.",
-                          NULL, NULL);
+          else
+            show_info_popup("Busy", "The request could not be queued.", NULL,
+                            NULL);
         },
         LV_EVENT_CLICKED, mbidCopy);
     lv_obj_add_event_cb(
@@ -728,101 +1176,128 @@ void show_tracklist_ui(int idx) {
 
   lv_obj_t *container = lv_obj_create(tracklist_panel);
   int containerW = 672;
-  int containerH = 340;
+  int containerH = 276;
   lv_obj_set_size(container, containerW, containerH);
   lv_obj_set_pos(container, 16, 76);
   style_list_control(container);
   lv_obj_set_flex_flow(container, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_gap(container, 6, 0);
   lv_obj_set_scroll_dir(container, LV_DIR_VER);
+  // Keep song-list scrolling deterministic. Elastic overscroll and momentum
+  // continue producing large redraws after the finger is released; on this
+  // RGB panel that can expose a persistent frame-sync drift.
+  lv_obj_clear_flag(container, LV_OBJ_FLAG_SCROLL_ELASTIC |
+                                   LV_OBJ_FLAG_SCROLL_MOMENTUM |
+                                   LV_OBJ_FLAG_SCROLL_CHAIN);
+  lv_obj_add_flag(container, LV_OBJ_FLAG_SCROLL_ONE);
+  lv_obj_add_event_cb(
+      container,
+      [](lv_event_t *e) {
+        lv_obj_t *list = lv_event_get_target(e);
+        const uint32_t childCount = lv_obj_get_child_cnt(list);
+        for (uint32_t childIndex = 0; childIndex < childCount; childIndex++)
+          lv_obj_clear_state(lv_obj_get_child(list, childIndex),
+                             LV_STATE_PRESSED);
+      },
+      LV_EVENT_SCROLL_BEGIN, nullptr);
 
-  for (int i = 0; i < (int)trackList->tracks.size(); i++) {
-    Track &track = trackList->tracks[i];
-    if (track.title.length() == 0 || track.title == " ")
-      continue;
+  lv_obj_t *previousButton = lv_btn_create(tracklist_panel);
+  lv_obj_set_size(previousButton, 156, 44);
+  lv_obj_set_pos(previousButton, 16, 364);
+  style_action_button(previousButton, &style_secondary_button);
+  lv_obj_t *previousLabel = lv_label_create(previousButton);
+  lv_label_set_text(previousLabel, LV_SYMBOL_LEFT " PREVIOUS");
+  lv_obj_center(previousLabel);
 
-    const char *icon = getLyricsStatusIcon(track.lyrics.status.c_str());
+  lv_obj_t *pageLabel = lv_label_create(tracklist_panel);
+  lv_obj_set_size(pageLabel, 320, 24);
+  lv_obj_set_pos(pageLabel, 192, 376);
+  lv_obj_set_style_text_align(pageLabel, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_color(pageLabel, lv_color_hex(0xB5C0CB), 0);
 
-    lv_obj_t *btn = lv_btn_create(container);
-    lv_obj_set_width(btn, lv_pct(100));
-    lv_obj_set_height(btn, 54);
-    style_list_row(btn);
+  lv_obj_t *nextButton = lv_btn_create(tracklist_panel);
+  lv_obj_set_size(nextButton, 156, 44);
+  lv_obj_set_pos(nextButton, 532, 364);
+  style_action_button(nextButton, &style_secondary_button);
+  lv_obj_t *nextLabel = lv_label_create(nextButton);
+  lv_label_set_text(nextLabel, "NEXT " LV_SYMBOL_RIGHT);
+  lv_obj_center(nextLabel);
 
-    lv_obj_t *btn_fav = lv_btn_create(btn);
-    lv_obj_set_size(btn_fav, 44, 44);
-    lv_obj_align(btn_fav, LV_ALIGN_LEFT_MID, 6, 0);
-    lv_obj_set_style_radius(btn_fav, 10, 0);
-    lv_obj_set_style_bg_color(btn_fav,
-                              track.isFavoriteTrack ? lv_color_hex(0xFFD700)
-                                                    : lv_color_hex(0x555555),
-                              0);
-    lv_obj_t *lbl_bell = lv_label_create(btn_fav);
-    lv_label_set_text(lbl_bell, LV_SYMBOL_BELL);
-    lv_obj_center(lbl_bell);
-    lv_obj_set_style_text_color(lbl_bell,
-                                track.isFavoriteTrack ? lv_color_hex(0x000000)
-                                                      : lv_color_hex(0xCCCCCC),
-                                0);
-
-    struct TrackFavData {
-      int idx;
-      TrackList *tl;
-      String mbid;
-    };
-    TrackFavData *fd = new TrackFavData{i, trackList, cd.releaseMbid.c_str()};
-    lv_obj_add_event_cb(
-        btn_fav,
-        [](lv_event_t *e) {
-          TrackFavData *data = (TrackFavData *)lv_event_get_user_data(e);
-          Track &t = data->tl->tracks[data->idx];
-          t.isFavoriteTrack = !t.isFavoriteTrack;
-
-          lv_obj_t *b = lv_event_get_target(e);
-          lv_obj_t *l = lv_obj_get_child(b, 0);
-
-          lv_obj_set_style_bg_color(b,
-                                    t.isFavoriteTrack ? lv_color_hex(0xFFD700)
-                                                      : lv_color_hex(0x555555),
-                                    0);
-          lv_obj_set_style_text_color(l,
-                                      t.isFavoriteTrack
-                                          ? lv_color_hex(0x000000)
-                                          : lv_color_hex(0xCCCCCC),
-                                      0);
-          cache_track_summary(data->mbid, data->tl);
-          apply_track_summary_label(cached_track_summary_text,
-                                    cached_track_summary_has_favorites);
-          BackgroundWorker::addJob(
-              {JOB_PERSIST_TRACK_FAVORITE, data->mbid, data->idx,
-               t.isFavoriteTrack ? "1" : "0", nullptr, false});
-        },
-        LV_EVENT_CLICKED, fd);
-    lv_obj_add_event_cb(
-        btn_fav,
-        [](lv_event_t *e) { delete (TrackFavData *)lv_event_get_user_data(e); },
-        LV_EVENT_DELETE, fd);
-
-    lv_obj_t *lblLeft = lv_label_create(btn);
-    lv_label_set_text_fmt(lblLeft, "%d. %s", track.trackNo,
-                          sanitizeText(String(track.title.c_str())).c_str());
-    lv_obj_align(lblLeft, LV_ALIGN_LEFT_MID, 58, 0);
-    lv_obj_set_width(lblLeft, containerW - 196);
-    lv_label_set_long_mode(lblLeft, LV_LABEL_LONG_DOT);
-
-    lv_obj_t *lblRight = lv_label_create(btn);
-    lv_label_set_text_fmt(lblRight, "%s %s",
-                          formatDuration(track.durationMs).c_str(), icon);
-    lv_obj_align(lblRight, LV_ALIGN_RIGHT_MID, -10, 0);
-    lv_obj_set_style_text_color(lblRight, lv_color_hex(getCurrentThemeColor()),
-                                0);
-
-    Track *trackCopy = new Track(track);
-    lv_obj_add_event_cb(btn, trackClickHandler, LV_EVENT_CLICKED, trackCopy);
-    lv_obj_add_event_cb(
-        btn, [](lv_event_t *e) { delete (Track *)lv_event_get_user_data(e); },
-        LV_EVENT_DELETE, trackCopy);
+  TracklistBuildState *buildState = new TracklistBuildState{
+      trackList, container, pageLabel, previousButton, nextButton,
+      releaseMbid, {}, 0};
+  buildState->visibleTrackIndices.reserve(trackList->tracks.size());
+  for (int trackIndex = 0; trackIndex < (int)trackList->tracks.size();
+       trackIndex++) {
+    const Track &track = trackList->tracks[trackIndex];
+    if (track.title.length() > 0 && track.title != " ")
+      buildState->visibleTrackIndices.push_back(trackIndex);
   }
+  lv_obj_add_event_cb(
+      tracklist_panel,
+      [](lv_event_t *e) {
+        TracklistBuildState *state =
+            (TracklistBuildState *)lv_event_get_user_data(e);
+        Storage.deleteTracklist(state->trackList);
+        delete state;
+      },
+      LV_EVENT_DELETE, buildState);
+  lv_obj_add_event_cb(
+      previousButton,
+      [](lv_event_t *e) {
+        TracklistBuildState *state =
+            (TracklistBuildState *)lv_event_get_user_data(e);
+        if (state->currentPage > 0) {
+          state->currentPage--;
+          render_tracklist_page(state);
+        }
+      },
+      LV_EVENT_CLICKED, buildState);
+  lv_obj_add_event_cb(
+      nextButton,
+      [](lv_event_t *e) {
+        TracklistBuildState *state =
+            (TracklistBuildState *)lv_event_get_user_data(e);
+        const int pageCount =
+            std::max(1, ((int)state->visibleTrackIndices.size() +
+                         TRACKS_PER_PAGE - 1) /
+                            TRACKS_PER_PAGE);
+        if (state->currentPage < pageCount - 1) {
+          state->currentPage++;
+          render_tracklist_page(state);
+        }
+      },
+      LV_EVENT_CLICKED, buildState);
+
+  render_tracklist_page(buildState);
+  lv_label_set_text(tracklist_feedback_label,
+                    "Tap a track to open its lyrics");
+  lv_obj_update_layout(tracklist_panel);
+  lv_obj_clear_flag(tracklist_panel, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_invalidate(tracklist_panel);
   lvgl_port_unlock();
+}
+
+void show_tracklist_ui(int idx) {
+  if (currentMode != MODE_CD || idx < 0 || idx >= (int)cdLibrary.size())
+    return;
+  if (tracklist_request_pending)
+    return;
+
+  // Only copy fields already in RAM here. If the MBID is not loaded yet, the
+  // worker uses the unique ID to load the CD detail before opening its track
+  // list.
+  const String releaseMbid = cdLibrary[idx].releaseMbid.c_str();
+  const String uniqueId = cdLibrary[idx].uniqueID.c_str();
+  tracklist_request_pending = BackgroundWorker::addJob(
+      {JOB_TRACKLIST_LOAD, releaseMbid, idx, uniqueId, nullptr, true});
+  if (tracklist_request_pending) {
+    if (btn_tracklist)
+      lv_obj_add_state(btn_tracklist, LV_STATE_DISABLED);
+  } else {
+    show_info_popup("Busy", "The songs request could not be queued.", NULL,
+                    NULL);
+  }
 }
 
 // show_chapter_list_ui removed
@@ -847,18 +1322,22 @@ void setupMainUI() {
   lv_obj_add_style(topbar, &style_topbar, 0);
   lv_obj_clear_flag(topbar, LV_OBJ_FLAG_SCROLLABLE);
 
-  lv_obj_t *brand = lv_label_create(topbar);
-  lv_label_set_text(brand, "DIGITAL LIBRARIAN");
-  lv_obj_set_pos(brand, 18, 13);
-  lv_obj_set_style_text_color(brand, lv_color_hex(0xF4F7FA), 0);
-  lv_obj_set_style_text_font(brand, &lv_font_montserrat_16, 0);
-  lv_obj_set_style_text_letter_space(brand, 1, 0);
+  label_brand_title = lv_label_create(topbar);
+  lv_label_set_text(label_brand_title, setting_brand_title.c_str());
+  lv_obj_set_pos(label_brand_title, 18, 13);
+  lv_obj_set_width(label_brand_title, 420);
+  lv_label_set_long_mode(label_brand_title, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_color(label_brand_title, lv_color_hex(0xF4F7FA), 0);
+  lv_obj_set_style_text_font(label_brand_title, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_letter_space(label_brand_title, 1, 0);
 
-  lv_obj_t *brand_subtitle = lv_label_create(topbar);
-  lv_label_set_text(brand_subtitle, "YOUR COLLECTION, AT A GLANCE");
-  lv_obj_set_pos(brand_subtitle, 18, 39);
-  lv_obj_add_style(brand_subtitle, &style_text_muted, 0);
-  lv_obj_set_style_text_font(brand_subtitle, &lv_font_montserrat_12, 0);
+  label_brand_subtitle = lv_label_create(topbar);
+  lv_label_set_text(label_brand_subtitle, setting_brand_subtitle.c_str());
+  lv_obj_set_pos(label_brand_subtitle, 18, 39);
+  lv_obj_set_width(label_brand_subtitle, 420);
+  lv_label_set_long_mode(label_brand_subtitle, LV_LABEL_LONG_DOT);
+  lv_obj_add_style(label_brand_subtitle, &style_text_muted, 0);
+  lv_obj_set_style_text_font(label_brand_subtitle, &lv_font_montserrat_12, 0);
 
   lv_obj_t *toolbar_separator = lv_obj_create(topbar);
   lv_obj_set_size(toolbar_separator, 1, 32);
@@ -1000,6 +1479,10 @@ void setupMainUI() {
   lv_obj_add_event_cb(
       btn_wifi, [](lv_event_t *e) { show_wifi_config_ui(); }, LV_EVENT_CLICKED,
       NULL);
+  if (!wifi_indicator_timer) {
+    wifi_indicator_timer = lv_timer_create(
+        [](lv_timer_t *timer) { refresh_wifi_indicators(); }, 1000, NULL);
+  }
   // Serial.println(">> WiFi Button Done");
 
   // Mode Switch Button
@@ -1155,8 +1638,18 @@ void setupMainUI() {
               Serial.println(
                   "UI: Library synced from storage. Updating display...");
               update_item_display();
-              Serial.println("UI: Display updated. Queueing bulk sync job...");
-              BackgroundWorker::addJob({JOB_BULK_SYNC, "", -1, "", NULL});
+              if (WiFi.status() == WL_CONNECTED) {
+                Serial.println(
+                    "UI: Display updated. Queueing bulk sync job...");
+                BackgroundWorker::addJob(
+                    {JOB_BULK_SYNC, "", -1, "", NULL});
+              } else {
+                show_info_popup(
+                    "Library Reloaded",
+                    "The local library is ready. Connect to WiFi before "
+                    "downloading missing covers.",
+                    NULL, NULL);
+              }
               Serial.println("UI: Job queued. Closing popup...");
             },
             [](lv_event_t *e) { // NO
@@ -1236,10 +1729,9 @@ void setupMainUI() {
         if (!btn_delete_cover)
           return;
 
-        if (lv_obj_has_flag(btn_delete_cover, LV_OBJ_FLAG_HIDDEN))
-          lv_obj_clear_flag(btn_delete_cover, LV_OBJ_FLAG_HIDDEN);
-        else
-          lv_obj_add_flag(btn_delete_cover, LV_OBJ_FLAG_HIDDEN);
+        // This destructive action is opt-in: it can only become visible after
+        // an intentional tap on the currently displayed cover.
+        lv_obj_clear_flag(btn_delete_cover, LV_OBJ_FLAG_HIDDEN);
       },
       LV_EVENT_CLICKED, NULL);
 
@@ -1417,6 +1909,64 @@ void setupMainUI() {
         bool isBusy = BackgroundWorker::isBusy();
         bool showProgress = BackgroundWorker::shouldShowProgress();
 
+        // Opening a songs window can involve SD access, detail loading, and a
+        // sizeable JSON parse. Its completion is consumed directly so none of
+        // that work (including failure handling) ever runs in a touch event.
+        bool tracklistSuccess = false;
+        String tracklistMessage;
+        int tracklistItemIndex = -1;
+        String tracklistMbid;
+        TrackList *loadedTracklist = nullptr;
+        if (BackgroundWorker::takeTracklistCompletion(
+                tracklistSuccess, tracklistMessage, tracklistItemIndex,
+                tracklistMbid, loadedTracklist)) {
+          tracklist_request_pending = false;
+          if (btn_tracklist)
+            lv_obj_clear_state(btn_tracklist, LV_STATE_DISABLED);
+          dismiss_progress_modal();
+
+          const bool requestStillCurrent =
+              currentMode == MODE_CD &&
+              tracklistItemIndex == getCurrentItemIndex();
+          if (tracklistSuccess && loadedTracklist && requestStillCurrent) {
+            render_tracklist_ui(tracklistItemIndex, tracklistMbid,
+                                loadedTracklist);
+          } else {
+            if (loadedTracklist)
+              Storage.deleteTracklist(loadedTracklist);
+            if (requestStillCurrent)
+              show_info_popup("Songs unavailable", tracklistMessage.c_str(),
+                              NULL, NULL);
+          }
+          return;
+        }
+
+        // Lyrics readiness is independent of the progress modal. Cached SD
+        // reads deliberately use only the inline status, so waiting for a
+        // modal to close would leave a completed result stranded until a
+        // second interaction happened to change the UI state.
+        bool lyricsSuccess = false;
+        String lyricsMessage;
+        String lyricsTitle;
+        PsramString lyricsText;
+        if (BackgroundWorker::takeLyricsCompletion(
+                lyricsSuccess, lyricsMessage, lyricsTitle, lyricsText)) {
+          lyrics_request_pending = false;
+          dismiss_progress_modal();
+          if (lyricsSuccess && !lyricsText.empty()) {
+            show_lyrics_popup(std::move(lyricsTitle), std::move(lyricsText));
+          } else if (tracklist_feedback_label) {
+            lv_label_set_text_fmt(tracklist_feedback_label, "%s %s",
+                                  LV_SYMBOL_WARNING, lyricsMessage.c_str());
+            lv_obj_set_style_text_color(tracklist_feedback_label,
+                                        lv_color_hex(0xFFB340), 0);
+          } else {
+            show_info_popup("Lyrics unavailable", lyricsMessage.c_str(), NULL,
+                            NULL);
+          }
+          return;
+        }
+
         // Create/Show Modal
         if (showProgress && !progress_modal) {
           progress_modal = lv_obj_create(lv_layer_top());
@@ -1426,17 +1976,33 @@ void setupMainUI() {
           lv_obj_clear_flag(progress_modal, LV_OBJ_FLAG_SCROLLABLE);
 
           lv_obj_t *panel = lv_obj_create(progress_modal);
-          prepare_modal_panel(panel, 520, 232);
-          create_panel_header(panel, LV_SYMBOL_REFRESH " BACKGROUND TASK");
+          prepare_modal_panel(panel, 560, 274);
+          create_panel_header(panel, LV_SYMBOL_REFRESH " PLEASE WAIT");
+
+          progress_spinner = lv_spinner_create(panel, 900, 76);
+          lv_obj_set_size(progress_spinner, 48, 48);
+          lv_obj_set_pos(progress_spinner, 32, 82);
+          lv_obj_set_style_arc_color(progress_spinner,
+                                     lv_color_hex(0x263544), LV_PART_MAIN);
+          lv_obj_set_style_arc_color(progress_spinner,
+                                     lv_color_hex(getCurrentThemeColor()),
+                                     LV_PART_INDICATOR);
 
           lv_obj_t *title = lv_label_create(panel);
-          lv_label_set_text(title, "PROCESSING LIBRARY");
-          lv_obj_set_pos(title, 32, 82);
+          lv_label_set_text(title, "STILL WORKING");
+          lv_obj_set_pos(title, 100, 82);
           lv_obj_add_style(title, &style_section_label, 0);
 
+          lv_obj_t *hint = lv_label_create(panel);
+          lv_label_set_text(hint,
+                            "You can safely wait; the app has not frozen.");
+          lv_obj_set_pos(hint, 100, 112);
+          lv_obj_set_width(hint, 428);
+          lv_obj_set_style_text_color(hint, lv_color_hex(0x98A6B5), 0);
+
           progress_bar = lv_bar_create(panel);
-          lv_obj_set_size(progress_bar, 456, 20);
-          lv_obj_set_pos(progress_bar, 32, 122);
+          lv_obj_set_size(progress_bar, 496, 16);
+          lv_obj_set_pos(progress_bar, 32, 158);
           lv_bar_set_range(progress_bar, 0, 100);
           lv_bar_set_value(progress_bar, 0, LV_ANIM_OFF);
           lv_obj_set_style_radius(progress_bar, 10, 0);
@@ -1446,46 +2012,84 @@ void setupMainUI() {
                                     LV_PART_INDICATOR);
 
           progress_label = lv_label_create(panel);
-          lv_label_set_text(progress_label, "Preparing...");
-          lv_obj_set_pos(progress_label, 32, 164);
+          lv_label_set_text(progress_label, "Preparing the request...");
+          lv_obj_set_pos(progress_label, 32, 194);
           lv_obj_set_style_text_color(progress_label, lv_color_hex(0xB5C0CB),
                                       0);
           lv_label_set_long_mode(progress_label, LV_LABEL_LONG_DOT);
-          lv_obj_set_width(progress_label, 456);
+          lv_obj_set_width(progress_label, 496);
           lv_obj_set_style_text_align(progress_label, LV_TEXT_ALIGN_LEFT, 0);
+
+          lv_obj_t *waitHint = lv_label_create(panel);
+          lv_label_set_text(waitHint,
+                            "Network requests can take a little while.");
+          lv_obj_set_pos(waitHint, 32, 230);
+          lv_obj_set_width(waitHint, 496);
+          lv_obj_set_style_text_color(waitHint, lv_color_hex(0x718092), 0);
         }
 
         // Update
         if (showProgress && progress_modal) {
-          int pct = (int)(BackgroundWorker::getProgress() * 100);
-          lv_bar_set_value(progress_bar, pct, LV_ANIM_ON);
-          String status = BackgroundWorker::getStatusMessage();
-          lv_label_set_text(progress_label, status.c_str());
+          if (progress_bar) {
+            int pct = (int)(BackgroundWorker::getProgress() * 100);
+            lv_bar_set_value(progress_bar, pct, LV_ANIM_ON);
+          }
+          // Keep the compact TLS dialog's text static. Updating LVGL label
+          // buffers during a handshake competes for the same internal heap.
+          if (progress_label && !compact_lyrics_progress_active) {
+            String status = BackgroundWorker::getStatusMessage();
+            lv_label_set_text(progress_label, status.c_str());
+          }
         }
 
         // Close
         if (!showProgress && progress_modal) {
-          lv_obj_del(progress_modal);
-          progress_modal = NULL; // Reset
-          progress_bar = NULL;
-          progress_label = NULL;
+          const JobType completedJob =
+              BackgroundWorker::getLastCompletedJobType();
+          const bool completedSuccessfully =
+              BackgroundWorker::wasLastJobSuccessful();
+          dismiss_progress_modal();
+          bool completionHandled = false;
+
+          if (completedJob == JOB_COVER_DOWNLOAD) {
+            if (btn_search)
+              lv_obj_clear_state(btn_search, LV_STATE_DISABLED);
+            update_item_display();
+          } else if (completedJob == JOB_METADATA_LOOKUP) {
+            if (btn_metadata_fetch)
+              lv_obj_clear_state(btn_metadata_fetch, LV_STATE_DISABLED);
+            ItemView metadata;
+            if (completedSuccessfully &&
+                BackgroundWorker::takeMetadataResult(metadata) &&
+                add_item_panel) {
+              apply_metadata_result(metadata);
+            } else if (add_item_panel) {
+              show_metadata_not_found();
+            }
+            completionHandled = true;
+          }
 
           // Show completion info
           // Note: using show_info_popup might act as double popup if multiple
           // jobs run But for Bulk Sync it's useful.
           String msg = BackgroundWorker::getStatusMessage();
-          if (!isBusy && msg.length() > 0 && msg != "Idle") {
+          if (!isBusy && !completionHandled && msg.length() > 0 &&
+              msg != "Idle") {
             if (msg == "Sync Complete") {
               show_info_popup(
                   "Task Finished", "Sync Complete. Tap OK to restart.",
                   [](lv_event_t *e) { ESP.restart(); }, NULL);
             } else {
-              show_info_popup("Task Finished", msg.c_str(), NULL, NULL);
+              show_info_popup(completedSuccessfully ? "Task Complete"
+                                                    : "Task Needs Attention",
+                              msg.c_str(), NULL, NULL);
             }
           }
         }
       },
       200, NULL);
+
+  set_debug_overlay_enabled(setting_debug_overlay);
 
   Serial.println(">> setupMainUI Done");
 }
@@ -1925,6 +2529,11 @@ void btn_favorite_clicked(lv_event_t *e) {
 }
 
 void btn_delete_cover_clicked(lv_event_t *e) {
+  // Return to the safe browsing state immediately. The confirmation dialog is
+  // still shown, but cancelling it must not leave the destructive action open.
+  if (btn_delete_cover)
+    lv_obj_add_flag(btn_delete_cover, LV_OBJ_FLAG_HIDDEN);
+
   int idx = getCurrentItemIndex();
   ItemView item = getItemAt(idx);
   if (item.coverFile.length() < 3)
@@ -1969,98 +2578,24 @@ void btn_search_clicked(lv_event_t *e) {
   if (getItemCount() == 0)
     return;
 
-  lvgl_port_lock(-1);
-  int idx = getCurrentItemIndex();
+  const int idx = getCurrentItemIndex();
   ItemView item = getItemAt(idx);
-  if (!item.isValid) {
-    lvgl_port_unlock();
+  if (!item.isValid)
     return;
-  }
 
   if (WiFi.status() != WL_CONNECTED) {
     lv_label_set_text(label_cover_url, "No WiFi\nConnection!");
-    lvgl_port_unlock();
     return;
   }
 
-  lv_label_set_text(label_cover_url, "Searching...\nPlease wait");
-  lv_refr_now(NULL);
-  lvgl_port_unlock();
-
-  String newUrl = "";
-
-  // Fetch cover URL based on current mode
-  switch (currentMode) {
-  case MODE_BOOK: {
-    Book tempBook;
-    if (MediaManager::fetchBookByISBN(item.codecOrIsbn.c_str(), tempBook)) {
-      newUrl = tempBook.coverUrl.c_str();
-    }
-    break;
-  }
-  case MODE_CD:
-  default:
-    newUrl = MediaManager::fetchAlbumCoverUrl(item.artistOrAuthor.c_str(),
-                                              item.title.c_str());
-    break;
-  }
-
-  lvgl_port_lock(-1);
-
-  if (newUrl.length() > 0) {
-    String uid = item.uniqueID;
-    if (uid.length() == 0) {
-      uid = String(millis()) + "_" + String(random(9999));
-    }
-
-    String fileName = getUidPrefix() + sanitizeFilename(uid) + ".jpg";
-    setItemCoverUrl(idx, newUrl);
-    setItemCoverFile(idx, fileName);
-
-    Serial.printf("Found: %s\n", newUrl.c_str());
-
-    lv_label_set_text(label_cover_url, "Downloading...\nPlease wait");
-    lv_refr_now(NULL);
-    lvgl_port_unlock();
-
-    if (AppNetworkManager::downloadCoverImage(newUrl, "/covers/" + fileName)) {
-      lvgl_port_lock(-1);
-      lv_label_set_text_fmt(label_cover_url, "Success!\nSaved as %s",
-                            fileName.c_str());
-
-      ensureItemDetailsLoaded(idx);
-      switch (currentMode) {
-      case MODE_CD:
-        cdLibrary[idx].coverFile = fileName.c_str();
-        Storage.saveCD(cdLibrary[idx]);
-        break;
-      case MODE_BOOK:
-        bookLibrary[idx].coverFile = fileName.c_str();
-        Storage.saveBook(bookLibrary[idx]);
-        break;
-      }
-      saveLibrary();
-      update_item_display();
-    } else {
-      lvgl_port_lock(-1);
-      lv_label_set_text(label_cover_url, "Download Failed!\nCheck WiFi/SD");
-    }
+  const bool queued = BackgroundWorker::addJob(
+      {JOB_COVER_DOWNLOAD, item.uniqueID, idx, "", nullptr, true});
+  if (queued) {
+    lv_obj_add_state(btn_search, LV_STATE_DISABLED);
+    lv_label_set_text(label_cover_url, "Preparing cover search...");
   } else {
-    setItemCoverFile(idx, "cover_default.jpg");
-    Serial.println("Cover not found. Setting to default.");
-
-    if (sdExpander)
-      sdExpander->digitalWrite(SD_CS, LOW);
-    if (SD.exists("/covers/cover_default.jpg")) {
-      lv_label_set_text(label_cover_url, "Not Found on Web\nUsing Default");
-    } else {
-      lv_label_set_text(label_cover_url,
-                        "Not Found.\n(Upload cover_default.jpg)");
-    }
-    saveLibrary();
-    update_item_display();
+    lv_label_set_text(label_cover_url, "Busy\nPlease try again");
   }
-  lvgl_port_unlock();
 }
 
 void close_search_ui() {
@@ -2815,6 +3350,26 @@ void show_wifi_config_ui() {
     lv_obj_add_style(net_container, &style_list_item, 0);
     lv_obj_set_style_pad_all(net_container, 4, 0);
     lv_obj_clear_flag(net_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(net_container, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_color(net_container, lv_color_hex(0x26394B),
+                              LV_STATE_PRESSED);
+    lv_obj_add_event_cb(
+        net_container,
+        [](lv_event_t *e) {
+          const int index = (int)(intptr_t)lv_event_get_user_data(e);
+          if (index < 0 || index >= (int)savedWiFiNetworks.size() ||
+              !ta_ssid || !ta_password || !wifi_connect_button)
+            return;
+
+          lv_textarea_set_text(ta_ssid,
+                               savedWiFiNetworks[index].ssid.c_str());
+          lv_textarea_set_text(ta_password,
+                               savedWiFiNetworks[index].password.c_str());
+          if (kb_wifi)
+            lv_obj_add_flag(kb_wifi, LV_OBJ_FLAG_HIDDEN);
+          lv_event_send(wifi_connect_button, LV_EVENT_CLICKED, NULL);
+        },
+        LV_EVENT_CLICKED, (void *)(intptr_t)i);
 
     // Network name label
     lv_obj_t *net_label = lv_label_create(net_container);
@@ -2834,10 +3389,17 @@ void show_wifi_config_ui() {
     lv_label_set_text(net_label, displayText.c_str());
     lv_obj_align(net_label, LV_ALIGN_LEFT_MID, 5, 0);
 
+    lv_obj_t *connect_hint = lv_label_create(net_container);
+    lv_label_set_text(connect_hint, LV_SYMBOL_WIFI);
+    lv_obj_align(connect_hint, LV_ALIGN_RIGHT_MID, -52, 0);
+    lv_obj_set_style_text_color(connect_hint,
+                                lv_color_hex(getCurrentThemeColor()), 0);
+
     // Delete button
     lv_obj_t *btn_delete = lv_btn_create(net_container);
-    lv_obj_set_size(btn_delete, 44, 44);
-    lv_obj_align(btn_delete, LV_ALIGN_RIGHT_MID, -1, 0);
+    lv_obj_set_size(btn_delete, 36, 36);
+    lv_obj_set_ext_click_area(btn_delete, 4); // Keep a 44 px touch target.
+    lv_obj_align(btn_delete, LV_ALIGN_RIGHT_MID, -5, 0);
     style_action_button(btn_delete, &style_danger_button);
 
     lv_obj_t *label_delete = lv_label_create(btn_delete);
@@ -2925,6 +3487,7 @@ void show_wifi_config_ui() {
   lv_obj_align_to(wifi_status_label, ta_password, LV_ALIGN_OUT_BOTTOM_LEFT, 0,
                   20);
   lv_obj_set_style_text_font(wifi_status_label, &lv_font_montserrat_12, 0);
+  refresh_wifi_indicators();
 
   // Keyboard (positioned after status label in content flow)
   kb_wifi = lv_keyboard_create(wifi_config_panel);
@@ -2991,12 +3554,17 @@ void show_wifi_config_ui() {
           return;
 
         Serial.printf("Connecting to WiFi: %s\n", pending_wifi_ssid.c_str());
-        WiFi.disconnect();
+        AppNetworkManager::cancelConnectionAttempts();
+        // Startup fallback can leave the radio in AP-only mode. Manual setup
+        // must always switch back to station mode before starting an attempt.
+        WiFi.mode(WIFI_STA);
+        WiFi.disconnect(false, false);
+        WiFi.setAutoReconnect(true);
         WiFi.begin(pending_wifi_ssid.c_str(), pending_wifi_password.c_str());
         wifi_connect_attempts = 0;
         lv_obj_add_state(wifi_connect_button, LV_STATE_DISABLED);
         if (wifi_status_label) {
-          lv_label_set_text(wifi_status_label, "Connecting... 0 / 20");
+          lv_label_set_text(wifi_status_label, "Connecting... 0 / 30 seconds");
           lv_obj_set_style_text_color(wifi_status_label,
                                       lv_color_hex(0xffdd00), 0);
         }
@@ -3005,6 +3573,7 @@ void show_wifi_config_ui() {
             [](lv_timer_t *timer) {
               wifi_connect_attempts++;
               if (WiFi.status() == WL_CONNECTED) {
+                AppNetworkManager::completeManualConnection();
                 AppNetworkManager::addWiFiNetwork(pending_wifi_ssid,
                                                   pending_wifi_password);
                 if (wifi_status_label) {
@@ -3026,13 +3595,24 @@ void show_wifi_config_ui() {
                 return;
               }
 
-              if (wifi_connect_attempts >= 20) {
+              if (wifi_connect_attempts >= WIFI_CONNECT_TIMEOUT_TICKS) {
                 if (wifi_status_label) {
-                  lv_label_set_text(wifi_status_label,
-                                    "Connection failed. Check credentials.");
+                  const wl_status_t status = WiFi.status();
+                  if (status == WL_NO_SSID_AVAIL) {
+                    lv_label_set_text(
+                        wifi_status_label,
+                        "Network not found. Check SSID and use 2.4 GHz.");
+                  } else if (status == WL_CONNECT_FAILED) {
+                    lv_label_set_text(wifi_status_label,
+                                      "Authentication failed. Check password.");
+                  } else {
+                    lv_label_set_text(wifi_status_label,
+                                      "Connection timed out. Please try again.");
+                  }
                   lv_obj_set_style_text_color(wifi_status_label,
                                               lv_color_hex(0xff4444), 0);
                 }
+                WiFi.disconnect();
                 if (wifi_connect_button)
                   lv_obj_clear_state(wifi_connect_button, LV_STATE_DISABLED);
                 lv_timer_del(timer);
@@ -3042,13 +3622,26 @@ void show_wifi_config_ui() {
 
               if (wifi_status_label) {
                 lv_label_set_text_fmt(wifi_status_label,
-                                      "Connecting... %d / 20",
-                                      wifi_connect_attempts);
+                                      "Connecting... %d / 30 seconds",
+                                      wifi_connect_attempts / 2);
               }
             },
             500, NULL);
       },
       LV_EVENT_CLICKED, NULL);
+
+  // The scrollable network list, form, and keyboard are created after the
+  // header. Restore the fixed header's z-order so scrolled content is clipped
+  // visually behind its opaque surface instead of painting over the title and
+  // action buttons. This mirrors the Add/Edit form behavior.
+  lv_obj_t *fixed_header = lv_obj_get_parent(title);
+  lv_obj_set_height(fixed_header, 72);
+  lv_obj_set_style_bg_opa(fixed_header, LV_OPA_COVER, 0);
+  lv_obj_add_flag(fixed_header, LV_OBJ_FLAG_FLOATING);
+  lv_obj_move_foreground(fixed_header);
+  lv_obj_move_foreground(wifi_connect_button);
+  lv_obj_move_foreground(btn_toggle_kb_wifi);
+  lv_obj_move_foreground(btn_close);
 
   lvgl_port_unlock();
 }
@@ -3230,44 +3823,66 @@ void manual_entry_confirm_cb(lv_event_t *e) {
   lv_msgbox_close(mbox);
 }
 
+static void apply_metadata_result(const ItemView &staged) {
+  updateCurrentEditItem(staged);
+  if (ta_title)
+    lv_textarea_set_text(ta_title, staged.title.c_str());
+  if (ta_artist)
+    lv_textarea_set_text(ta_artist, staged.artistOrAuthor.c_str());
+  if (ta_genre)
+    lv_textarea_set_text(ta_genre, staged.genre.c_str());
+  if (ta_year)
+    lv_textarea_set_text(ta_year, String(staged.year).c_str());
+
+  if (ta_uniqueID && staged.uniqueID.length() > 0)
+    lv_textarea_set_text(ta_uniqueID, staged.uniqueID.c_str());
+
+  if (ta_led_index && !staged.ledIndices.empty()) {
+    String ledStr = "";
+    for (size_t i = 0; i < staged.ledIndices.size(); i++) {
+      ledStr += String(staged.ledIndices[i]);
+      if (i < staged.ledIndices.size() - 1)
+        ledStr += ",";
+    }
+    lv_textarea_set_text(ta_led_index, ledStr.c_str());
+  }
+}
+
+static void show_metadata_not_found() {
+  show_confirmation_popup(
+      "NO MATCH FOUND",
+      "No metadata was found for this barcode. Continue with manual entry?",
+      [](lv_event_t *e) {
+        if (ta_title)
+          lv_obj_add_state(ta_title, LV_STATE_FOCUSED);
+      },
+      [](lv_event_t *e) {
+        if (ta_barcode)
+          lv_textarea_set_text(ta_barcode, "");
+      });
+}
+
 void fetch_barcode_cb(lv_event_t *e) {
   const char *barcode = lv_textarea_get_text(ta_barcode);
   if (strlen(barcode) == 0)
     return;
-  ItemView staged = getCurrentEditItem();
-  if (fetchModeMetadata(barcode, staged)) {
-    updateCurrentEditItem(staged);
-    lv_textarea_set_text(ta_title, staged.title.c_str());
-    lv_textarea_set_text(ta_artist, staged.artistOrAuthor.c_str());
-    lv_textarea_set_text(ta_genre, staged.genre.c_str());
-    lv_textarea_set_text(ta_year, String(staged.year).c_str());
 
-    // Update uniqueID field to show the actual ID (usually the barcode)
-    if (ta_uniqueID && staged.uniqueID.length() > 0) {
-      lv_textarea_set_text(ta_uniqueID, staged.uniqueID.c_str());
-    }
+  if (WiFi.status() != WL_CONNECTED) {
+    show_info_popup("WiFi Required",
+                    "Connect in WiFi Settings before looking up metadata.",
+                    NULL, NULL);
+    return;
+  }
 
-    if (!staged.ledIndices.empty()) {
-      String ledStr = "";
-      for (size_t i = 0; i < staged.ledIndices.size(); i++) {
-        ledStr += String(staged.ledIndices[i]);
-        if (i < staged.ledIndices.size() - 1)
-          ledStr += ",";
-      }
-      lv_textarea_set_text(ta_led_index, ledStr.c_str());
-    }
+  const bool queued = BackgroundWorker::addJob(
+      {JOB_METADATA_LOOKUP, String(barcode), edit_item_index, "", nullptr,
+       true});
+  if (queued) {
+    if (btn_metadata_fetch)
+      lv_obj_add_state(btn_metadata_fetch, LV_STATE_DISABLED);
   } else {
-    show_confirmation_popup(
-        "NO MATCH FOUND",
-        "No metadata was found for this barcode. Continue with manual entry?",
-        [](lv_event_t *e) {
-          if (ta_title)
-            lv_obj_add_state(ta_title, LV_STATE_FOCUSED);
-        },
-        [](lv_event_t *e) {
-          if (ta_barcode)
-            lv_textarea_set_text(ta_barcode, "");
-        });
+    show_info_popup("Busy", "The metadata request could not be queued.", NULL,
+                    NULL);
   }
 }
 
@@ -3280,6 +3895,7 @@ void close_add_item_ui() { // Renamed from close_add_item_ui
     ta_barcode = ta_title = ta_artist = ta_genre = ta_year = NULL;
     ta_led_index = ta_uniqueID = ta_notes = NULL;
     ta_publisher = ta_page_count = ta_current_page = NULL;
+    btn_metadata_fetch = NULL;
     lvgl_port_unlock();
     // Restore the selected item's LEDs (or the empty-library state) after the
     // Add/Edit preview temporarily illuminated a suggested shelf position.
@@ -3653,12 +4269,13 @@ void show_add_item_ui() {
   style_input_control(ta_barcode);
 
   // Fetch button
-  lv_obj_t *btn_fetch = lv_btn_create(add_item_panel);
-  lv_obj_set_size(btn_fetch, 144, 44);
-  lv_obj_set_pos(btn_fetch, 584, y_offset);
-  style_action_button(btn_fetch, &style_secondary_button);
-  lv_obj_add_event_cb(btn_fetch, fetch_barcode_cb, LV_EVENT_CLICKED, NULL);
-  lv_obj_t *label_fetch = lv_label_create(btn_fetch);
+  btn_metadata_fetch = lv_btn_create(add_item_panel);
+  lv_obj_set_size(btn_metadata_fetch, 144, 44);
+  lv_obj_set_pos(btn_metadata_fetch, 584, y_offset);
+  style_action_button(btn_metadata_fetch, &style_secondary_button);
+  lv_obj_add_event_cb(btn_metadata_fetch, fetch_barcode_cb, LV_EVENT_CLICKED,
+                      NULL);
+  lv_obj_t *label_fetch = lv_label_create(btn_metadata_fetch);
   lv_label_set_text(label_fetch, "FETCH");
   lv_obj_center(label_fetch);
   lv_obj_set_style_text_color(label_fetch, lv_color_hex(0x000000), 0);
@@ -4786,6 +5403,11 @@ void show_settings_ui() {
       [](lv_event_t *e) {
         lv_obj_del(lv_obj_get_parent(lv_event_get_target(e)));
         saveSettings();
+        if (label_brand_title)
+          lv_label_set_text(label_brand_title, setting_brand_title.c_str());
+        if (label_brand_subtitle)
+          lv_label_set_text(label_brand_subtitle,
+                            setting_brand_subtitle.c_str());
         if (settings_reboot_needed) {
           Serial.println("Rebooting for new settings...");
           show_info_popup("SETTINGS SAVED",
@@ -4820,6 +5442,7 @@ void show_settings_ui() {
   lv_obj_t *tab3 = lv_tabview_add_tab(tabview, LV_SYMBOL_SETTINGS " Features");
   lv_obj_t *tab4 = lv_tabview_add_tab(tabview, LV_SYMBOL_DRIVE " System");
   lv_obj_t *tab5 = lv_tabview_add_tab(tabview, LV_SYMBOL_EDIT " Theme");
+  lv_obj_t *tab6 = lv_tabview_add_tab(tabview, LV_SYMBOL_EDIT " Text");
 
   // === TAB 1: LED Settings ===
   int led_y = 15;
@@ -5041,6 +5664,72 @@ void show_settings_ui() {
       },
       LV_EVENT_VALUE_CHANGED, NULL);
 
+  // === TAB 6: Home Screen Text ===
+  lv_obj_t *lbl_brand_title = lv_label_create(tab6);
+  lv_label_set_text(lbl_brand_title, "Main title:");
+  lv_obj_align(lbl_brand_title, LV_ALIGN_TOP_LEFT, 20, 20);
+  lv_obj_set_style_text_color(lbl_brand_title, lv_color_hex(0xffffff), 0);
+
+  lv_obj_t *ta_brand_title = lv_textarea_create(tab6);
+  lv_obj_set_size(ta_brand_title, 500, 44);
+  lv_obj_align(ta_brand_title, LV_ALIGN_TOP_LEFT, 180, 12);
+  lv_textarea_set_one_line(ta_brand_title, true);
+  lv_textarea_set_max_length(ta_brand_title, BRAND_TITLE_MAX_LENGTH);
+  lv_textarea_set_text(ta_brand_title, setting_brand_title.c_str());
+  style_input_control(ta_brand_title);
+  lv_obj_add_event_cb(
+      ta_brand_title,
+      [](lv_event_t *e) {
+        lv_obj_t *kb = (lv_obj_t *)lv_event_get_user_data(e);
+        lv_obj_clear_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        lv_keyboard_set_textarea(kb, lv_event_get_target(e));
+        lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+        lv_obj_move_foreground(kb);
+      },
+      LV_EVENT_CLICKED, kb);
+  lv_obj_add_event_cb(
+      ta_brand_title,
+      [](lv_event_t *e) {
+        setting_brand_title = lv_textarea_get_text(lv_event_get_target(e));
+      },
+      LV_EVENT_VALUE_CHANGED, NULL);
+
+  lv_obj_t *lbl_brand_subtitle = lv_label_create(tab6);
+  lv_label_set_text(lbl_brand_subtitle, "Subtitle:");
+  lv_obj_align(lbl_brand_subtitle, LV_ALIGN_TOP_LEFT, 20, 78);
+  lv_obj_set_style_text_color(lbl_brand_subtitle, lv_color_hex(0xffffff), 0);
+
+  lv_obj_t *ta_brand_subtitle = lv_textarea_create(tab6);
+  lv_obj_set_size(ta_brand_subtitle, 500, 44);
+  lv_obj_align(ta_brand_subtitle, LV_ALIGN_TOP_LEFT, 180, 70);
+  lv_textarea_set_one_line(ta_brand_subtitle, true);
+  lv_textarea_set_max_length(ta_brand_subtitle, BRAND_SUBTITLE_MAX_LENGTH);
+  lv_textarea_set_text(ta_brand_subtitle, setting_brand_subtitle.c_str());
+  style_input_control(ta_brand_subtitle);
+  lv_obj_add_event_cb(
+      ta_brand_subtitle,
+      [](lv_event_t *e) {
+        lv_obj_t *kb = (lv_obj_t *)lv_event_get_user_data(e);
+        lv_obj_clear_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        lv_keyboard_set_textarea(kb, lv_event_get_target(e));
+        lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+        lv_obj_move_foreground(kb);
+      },
+      LV_EVENT_CLICKED, kb);
+  lv_obj_add_event_cb(
+      ta_brand_subtitle,
+      [](lv_event_t *e) {
+        setting_brand_subtitle =
+            lv_textarea_get_text(lv_event_get_target(e));
+      },
+      LV_EVENT_VALUE_CHANGED, NULL);
+
+  lv_obj_t *lbl_brand_hint = lv_label_create(tab6);
+  lv_label_set_text(lbl_brand_hint,
+                    "Leave a field empty to restore its default text.");
+  lv_obj_align(lbl_brand_hint, LV_ALIGN_TOP_LEFT, 180, 126);
+  lv_obj_set_style_text_color(lbl_brand_hint, lv_color_hex(0x8FA1B3), 0);
+
   // === TAB 3: Features ===
   lv_obj_t *lbl_cache = lv_label_create(tab3);
   lv_label_set_text(lbl_cache, "Nav Cache Size (per side):");
@@ -5194,6 +5883,25 @@ void show_settings_ui() {
   lv_obj_align(l_diag_title, LV_ALIGN_TOP_LEFT, 260, 20);
   lv_obj_set_style_text_color(l_diag_title,
                               lv_color_hex(getCurrentThemeColor()), 0);
+
+  lv_obj_t *lbl_debug_overlay = lv_label_create(tab4);
+  lv_label_set_text(lbl_debug_overlay, "Live overlay");
+  lv_obj_align(lbl_debug_overlay, LV_ALIGN_TOP_LEFT, 520, 20);
+  lv_obj_set_style_text_color(lbl_debug_overlay, lv_color_hex(0xD7E2EC), 0);
+
+  lv_obj_t *sw_debug_overlay = lv_switch_create(tab4);
+  lv_obj_set_size(sw_debug_overlay, 52, 28);
+  lv_obj_set_ext_click_area(sw_debug_overlay, 8);
+  lv_obj_align(sw_debug_overlay, LV_ALIGN_TOP_LEFT, 640, 12);
+  if (setting_debug_overlay)
+    lv_obj_add_state(sw_debug_overlay, LV_STATE_CHECKED);
+  lv_obj_add_event_cb(
+      sw_debug_overlay,
+      [](lv_event_t *e) {
+        set_debug_overlay_enabled(
+            lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+      },
+      LV_EVENT_VALUE_CHANGED, NULL);
 
   lv_obj_t *l_diag_info = lv_label_create(tab4);
   char diag_buf[1024]; // Increased size for more info

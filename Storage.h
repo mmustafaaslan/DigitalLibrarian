@@ -72,8 +72,8 @@ public:
   bool replaceIndex(MediaMode mode, const IndexVector &items);
 
   // Lyrics Management
-  String loadLyrics(const char *lyricsPath);
-  bool saveLyrics(const char *lyricsPath, String lyricsText,
+  bool loadLyrics(const char *lyricsPath, PsramString &lyricsOut);
+  bool saveLyrics(const char *lyricsPath, const PsramString &lyricsText,
                   String lang = "en");
 
 private:

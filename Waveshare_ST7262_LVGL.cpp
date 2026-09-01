@@ -17,6 +17,19 @@
 static const char *TAG = "lvgl_port";
 static SemaphoreHandle_t lvgl_mux = nullptr; // LVGL mutex
 static TaskHandle_t lvgl_task_handle = nullptr;
+static volatile uint32_t last_render_time_ms = 0;
+static volatile uint32_t last_render_pixels = 0;
+
+static void display_monitor_callback(lv_disp_drv_t *disp_drv, uint32_t time_ms,
+                                     uint32_t pixels) {
+  (void)disp_drv;
+  last_render_time_ms = time_ms;
+  last_render_pixels = pixels;
+}
+
+uint32_t lvgl_port_get_last_render_time_ms() { return last_render_time_ms; }
+
+uint32_t lvgl_port_get_last_render_pixels() { return last_render_pixels; }
 
 extern SemaphoreHandle_t i2cMutex;
 
@@ -532,6 +545,7 @@ static lv_disp_t *display_init(ESP_PanelLcd *lcd) {
 #endif /* LVGL_PORT_AVOID_TEAR */
   disp_drv.draw_buf = &disp_buf;
   disp_drv.user_data = (void *)lcd;
+  disp_drv.monitor_cb = display_monitor_callback;
   // Only available when the coordinate alignment is enabled
   if (lcd->getXCoordAlign() > 1 || lcd->getYCoordAlign() > 1) {
     disp_drv.rounder_cb = rounder_callback;
@@ -542,6 +556,8 @@ static lv_disp_t *display_init(ESP_PanelLcd *lcd) {
 
 static void touchpad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data) {
   static bool last_pressed = false;
+  static bool suppress_until_release = false;
+  static uint8_t missed_reads = 0;
   static lv_point_t last_point = {0, 0};
 
   ESP_PanelTouch *tp = (ESP_PanelTouch *)indev_drv->user_data;
@@ -551,7 +567,16 @@ static void touchpad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data) {
   if (i2cMutex) {
     // Shorter timeout (30ms) is better for responsiveness
     if (xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(30)) == pdPASS) {
-      if (tp->readPoints(&point, 1) > 0) {
+      missed_reads = 0;
+      const bool has_point = tp->readPoints(&point, 1) > 0;
+      if (suppress_until_release) {
+        // A synthetic release was emitted after the shared I2C bus stayed
+        // busy. Ignore the remainder of that same physical touch so it cannot
+        // generate a duplicate click when SD access finishes.
+        last_pressed = false;
+        if (!has_point)
+          suppress_until_release = false;
+      } else if (has_point) {
         // FILTER: Only update if change is significant or it's a new press
         int dx = abs((int)point.x - (int)last_point.x);
         int dy = abs((int)point.y - (int)last_point.y);
@@ -565,6 +590,16 @@ static void touchpad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data) {
         last_pressed = false;
       }
       xSemaphoreGiveRecursive(i2cMutex);
+    } else {
+      // Never preserve a permanent PRESSED state just because an SD operation
+      // temporarily owns the shared I2C guard. Two missed samples synthesize a
+      // release, which lets LVGL finish the click and clear pressed styling.
+      if (missed_reads < UINT8_MAX)
+        missed_reads++;
+      if (last_pressed && missed_reads >= 2) {
+        last_pressed = false;
+        suppress_until_release = true;
+      }
     }
   } else {
     if (tp->readPoints(&point, 1) > 0) {

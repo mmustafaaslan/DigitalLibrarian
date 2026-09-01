@@ -9,6 +9,12 @@
 #define WIFI_SSID "Your_SSID"
 #define WIFI_PASSWORD "Your_Password"
 
+// Optional second saved network. Remove these two lines if unused.
+// #define WIFI_SSID_2 "Your_Second_SSID"
+// #define WIFI_PASSWORD_2 "Your_Second_Password"
+// #define WIFI_SSID_3 "Your_Third_SSID"
+// #define WIFI_PASSWORD_3 "Your_Third_Password"
+
 // Discogs API Token (Optional, for fallback metadata)
 #define DISCOGS_API_TOKEN "Your_Discogs_Token"
 
