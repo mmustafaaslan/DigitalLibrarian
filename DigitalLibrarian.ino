@@ -489,6 +489,33 @@ void setupWebHandlers() {
                 "Detailed heap info printed to Serial Console.");
   });
 
+  // Lightweight authenticated job diagnostics. This lets the physical UI's
+  // background actions be exercised and verified without generating the very
+  // large remote-library page on a weak WiFi connection.
+  server.on("/api/job", HTTP_GET, []() {
+    if (!requireWebAuth())
+      return;
+    DynamicJsonDocument doc(512);
+    doc["busy"] = BackgroundWorker::isBusy();
+    doc["queue"] = BackgroundWorker::getQueueSize();
+    doc["currentJob"] = (int)BackgroundWorker::getCurrentJobType();
+    doc["lastJob"] = (int)BackgroundWorker::getLastCompletedJobType();
+    doc["lastSuccess"] = BackgroundWorker::wasLastJobSuccessful();
+    doc["progress"] = BackgroundWorker::getProgress();
+    doc["status"] = BackgroundWorker::getStatusMessage();
+    uint32_t coverSequence = 0;
+    bool coverSuccess = false;
+    String coverMessage;
+    BackgroundWorker::getLastCoverCompletion(coverSequence, coverSuccess,
+                                             coverMessage);
+    doc["coverSequence"] = coverSequence;
+    doc["coverSuccess"] = coverSuccess;
+    doc["coverStatus"] = coverMessage;
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+  });
+
   // 3. Remote Control API
   server.on("/api/control", HTTP_POST, []() {
     String action = server.arg("action");
@@ -500,6 +527,36 @@ void setupWebHandlers() {
       selectRandomWithEffect();
       lvgl_port_unlock();
       server.send(200, "text/plain", "Random selected");
+
+    } else if (action == "coversearch") {
+      const int id = server.hasArg("id") ? server.arg("id").toInt()
+                                          : getCurrentItemIndex();
+      if (id < 0 || id >= getItemCount()) {
+        server.send(400, "text/plain", "Invalid ID");
+        return;
+      }
+      if (WiFi.status() != WL_CONNECTED) {
+        server.send(503, "text/plain", "No WiFi connection");
+        return;
+      }
+
+      const ItemView item = getItemAtRAM(id);
+      const bool queued = BackgroundWorker::addJob(
+          {JOB_COVER_DOWNLOAD, item.uniqueID, id, "", nullptr, true});
+      if (!queued) {
+        server.send(503, "text/plain", "Background queue is full");
+        return;
+      }
+
+      StaticJsonDocument<256> doc;
+      doc["status"] = "queued";
+      doc["id"] = id;
+      doc["title"] = item.title;
+      doc["hasSavedCoverUrl"] = item.coverUrl.length() > 0;
+      doc["hasCoverFile"] = item.coverFile.length() > 0;
+      String out;
+      serializeJson(doc, out);
+      server.send(202, "application/json", out);
 
     } else if (action == "select") {
       int id = server.arg("id").toInt();

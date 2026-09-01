@@ -47,7 +47,10 @@ public:
   static std::vector<Track> fetchTracklist(const char *releaseMbid,
                                            String *outGenre = NULL);
   static bool fetchBookByISBN(const char *isbn, Book &book);
-  static String fetchAlbumCoverUrl(const char *artist, const char *album);
+  static String fetchAlbumCoverUrl(const char *artist, const char *album,
+                                   bool quickMode = false,
+                                   bool *requestFailed = nullptr,
+                                   String *errorDetail = nullptr);
 
 private:
   static bool _taskBusy;

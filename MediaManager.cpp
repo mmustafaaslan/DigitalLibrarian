@@ -992,22 +992,38 @@ bool MediaManager::fetchMetadataForISBN(const char *isbn, ItemView &outView) {
 }
 
 // Fetch Album Cover URL from iTunes API
-String MediaManager::fetchAlbumCoverUrl(const char *artist, const char *album) {
+String MediaManager::fetchAlbumCoverUrl(const char *artist, const char *album,
+                                        bool quickMode,
+                                        bool *requestFailed,
+                                        String *errorDetail) {
   String coverUrl = "";
+  if (requestFailed)
+    *requestFailed = false;
+  if (errorDetail)
+    *errorDetail = "";
+  // Bulk sync must abandon weak records quickly. Manual search instead gets
+  // one realistic handshake window for the board's high-latency WiFi, without
+  // multiplying that delay through retries.
+  const int maxAttempts = 1;
+  const unsigned long handshakeTimeoutSeconds = quickMode ? 2UL : 20UL;
+  const uint32_t requestTimeoutMs = quickMode ? 3000UL : 20000UL;
 
-  // Try up to 2 times only (reduced from 3 for faster bulk checks)
-  for (int attempt = 1; attempt <= 2; attempt++) {
+  for (int attempt = 1; attempt <= maxAttempts; attempt++) {
     if (networkAbortRequested() || WiFi.status() != WL_CONNECTED)
       break;
     HTTPClient http;
     WiFiClientSecure client;
-    configureTrustedTlsClient(client);
+    if (!configureTrustedTlsClient(client)) {
+      if (requestFailed)
+        *requestFailed = true;
+      if (errorDetail)
+        *errorDetail = "TLS clock unavailable";
+      break;
+    }
     if (networkAbortRequested())
       break;
-    // This API is seconds, not milliseconds. The previous value of 2000
-    // allowed a stalled TLS handshake to hold bulk sync for over 30 minutes.
-    client.setHandshakeTimeout(2);
-    client.setTimeout(5000);          // Read timeout
+    client.setHandshakeTimeout(handshakeTimeoutSeconds);
+    client.setTimeout(requestTimeoutMs);
 
     String searchQuery = String(artist) + " " + String(album);
     String encodedQuery = urlEncode(searchQuery);
@@ -1029,8 +1045,7 @@ String MediaManager::fetchAlbumCoverUrl(const char *artist, const char *album) {
     http.addHeader("Accept", "*/*");
     http.addHeader("Connection", "close");
 
-    // Reduce timeout
-    http.setTimeout(2000);
+    http.setTimeout(requestTimeoutMs);
 
     int httpCode = http.GET();
     if (networkAbortRequested()) {
@@ -1056,12 +1071,30 @@ String MediaManager::fetchAlbumCoverUrl(const char *artist, const char *album) {
       }
       http.end();
       break; // Success!
-    } else if (httpCode == -1 || httpCode == -11) {
-      // Timeout or connection error - don't retry
-      Serial.printf("  ✗ Timeout/Connection Error: %d - Skipping\n", httpCode);
+    } else if (httpCode < 0) {
+      if (requestFailed)
+        *requestFailed = true;
+      char tlsErrorText[96] = {0};
+      const int tlsError = client.lastError(tlsErrorText,
+                                            sizeof(tlsErrorText));
+      String detail = HTTPClient::errorToString(httpCode);
+      if (tlsError != 0) {
+        detail += " / TLS " + String(tlsError) + " " + String(tlsErrorText);
+      }
+      if (errorDetail)
+        *errorDetail = detail;
+      Serial.printf("  Cover provider connection error: %d (%s)\n", httpCode,
+                    detail.c_str());
       http.end();
-      break; // Skip this album, don't retry
+      if (attempt >= maxAttempts)
+        break;
+      delay(250);
+      continue;
     } else {
+      if (requestFailed)
+        *requestFailed = true;
+      if (errorDetail)
+        *errorDetail = "HTTP " + String(httpCode);
       ErrorHandler::logError(ERR_CAT_NETWORK,
                              String("iTunes HTTP Error: ") + String(httpCode) +
                                  " (Query: " + String(artist) + " - " +
@@ -1070,7 +1103,7 @@ String MediaManager::fetchAlbumCoverUrl(const char *artist, const char *album) {
       Serial.printf("  ✗ HTTP Error: %d\n", httpCode);
       http.end();
     }
-    delay(100);
+    delay(quickMode ? 20 : 150);
   }
 
   return coverUrl;

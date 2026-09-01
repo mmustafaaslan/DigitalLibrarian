@@ -309,25 +309,38 @@ String AppNetworkManager::fetchURL(String url, int timeout) {
 
 bool AppNetworkManager::downloadCoverImage(const String &url,
                                            const String &savePath,
-                                           bool quickMode) {
+                                           bool quickMode,
+                                           String *errorDetail) {
   static constexpr int MAX_COVER_BYTES = 2 * 1024 * 1024;
+  if (errorDetail)
+    *errorDetail = "";
   if (WiFi.status() != WL_CONNECTED ||
       BackgroundWorker::isCancellationRequested() ||
-      BackgroundWorker::isSkipRequested())
+      BackgroundWorker::isSkipRequested()) {
+    if (errorDetail)
+      *errorDetail = "Network unavailable or request cancelled";
     return false;
-  if (url.isEmpty())
+  }
+  if (url.isEmpty()) {
+    if (errorDetail)
+      *errorDetail = "Cover URL is empty";
     return false;
+  }
 
   HTTPClient http;
   WiFiClientSecure clientSecure;
   WiFiClient clientInsecure;
-  const uint32_t requestTimeoutMs = quickMode ? 3000 : 8000;
-  const unsigned long handshakeTimeoutSeconds = quickMode ? 3UL : 8UL;
-  const uint32_t streamTimeoutMs = quickMode ? 7000 : 15000;
-  const uint32_t idleTimeoutMs = quickMode ? 2500 : 5000;
+  const uint32_t requestTimeoutMs = quickMode ? 3000 : 20000;
+  const unsigned long handshakeTimeoutSeconds = quickMode ? 3UL : 20UL;
+  const uint32_t streamTimeoutMs = quickMode ? 7000 : 30000;
+  const uint32_t idleTimeoutMs = quickMode ? 2500 : 8000;
 
   if (url.startsWith("https://")) {
-    configureTrustedTlsClient(clientSecure);
+    if (!configureTrustedTlsClient(clientSecure)) {
+      if (errorDetail)
+        *errorDetail = "TLS clock unavailable";
+      return false;
+    }
     // NetworkClientSecure uses seconds for TLS handshakes; socket and HTTP
     // timeouts below use milliseconds.
     clientSecure.setHandshakeTimeout(handshakeTimeoutSeconds);
@@ -348,6 +361,18 @@ bool AppNetworkManager::downloadCoverImage(const String &url,
     return false;
   }
   if (httpCode != HTTP_CODE_OK) {
+    if (errorDetail) {
+      *errorDetail = httpCode < 0 ? HTTPClient::errorToString(httpCode)
+                                  : "HTTP " + String(httpCode);
+      if (url.startsWith("https://") && httpCode < 0) {
+        char tlsErrorText[96] = {0};
+        const int tlsError =
+            clientSecure.lastError(tlsErrorText, sizeof(tlsErrorText));
+        if (tlsError != 0)
+          *errorDetail +=
+              " / TLS " + String(tlsError) + " " + String(tlsErrorText);
+      }
+    }
     http.end();
     return false;
   }
@@ -359,6 +384,14 @@ bool AppNetworkManager::downloadCoverImage(const String &url,
       (!contentType.isEmpty() && contentType.indexOf("image/jpeg") < 0 &&
        contentType.indexOf("image/jpg") < 0 &&
        contentType.indexOf("application/octet-stream") < 0)) {
+    if (errorDetail) {
+      if (len <= 0)
+        *errorDetail = "Image response has no content length";
+      else if (len > MAX_COVER_BYTES)
+        *errorDetail = "Image is larger than 2 MB";
+      else
+        *errorDetail = "Unexpected content type: " + contentType;
+    }
     http.end();
     return false;
   }
@@ -367,6 +400,8 @@ bool AppNetworkManager::downloadCoverImage(const String &url,
   uint8_t *downloadBuffer =
       (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!downloadBuffer) {
+    if (errorDetail)
+      *errorDetail = "Not enough PSRAM for image";
     http.end();
     return false;
   }
@@ -375,7 +410,10 @@ bool AppNetworkManager::downloadCoverImage(const String &url,
   int totalRead = 0;
   unsigned long startedAt = millis();
   unsigned long lastDataAt = startedAt;
-  while (http.connected() && totalRead < len &&
+  // Servers commonly close a Connection: close response immediately after
+  // writing the body. Bytes can still be buffered in WiFiClient at that point,
+  // so drain available data instead of treating socket close as end-of-body.
+  while ((http.connected() || stream->available() > 0) && totalRead < len &&
          millis() - startedAt < streamTimeoutMs &&
          millis() - lastDataAt < idleTimeoutMs) {
     if (BackgroundWorker::isCancellationRequested() ||
@@ -397,6 +435,13 @@ bool AppNetworkManager::downloadCoverImage(const String &url,
 
   if (totalRead < len || totalRead < 4 || downloadBuffer[0] != 0xFF ||
       downloadBuffer[1] != 0xD8) {
+    if (errorDetail) {
+      if (totalRead < len)
+        *errorDetail = "Image transfer stopped at " + String(totalRead) +
+                       "/" + String(len) + " bytes";
+      else
+        *errorDetail = "Downloaded data is not a JPEG image";
+    }
     heap_caps_free(downloadBuffer);
     return false;
   }
@@ -439,6 +484,8 @@ bool AppNetworkManager::downloadCoverImage(const String &url,
   }
 
   heap_caps_free(downloadBuffer);
+  if (!success && errorDetail && errorDetail->length() == 0)
+    *errorDetail = "SD write or file replacement failed";
   return success;
 }
 

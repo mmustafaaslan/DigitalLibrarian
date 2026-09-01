@@ -33,6 +33,9 @@ std::atomic<bool> BackgroundWorker::_skipRequested{false};
 int BackgroundWorker::_totalJobs = 0;
 JobType BackgroundWorker::_lastCompletedJobType = JOB_NONE;
 bool BackgroundWorker::_lastJobSuccess = false;
+uint32_t BackgroundWorker::_coverCompletionSequence = 0;
+bool BackgroundWorker::_lastCoverSuccess = false;
+String BackgroundWorker::_lastCoverMessage = "Not run";
 ItemView BackgroundWorker::_metadataResult;
 bool BackgroundWorker::_metadataResultReady = false;
 ItemView BackgroundWorker::_itemSaveResult;
@@ -222,6 +225,22 @@ bool BackgroundWorker::wasLastJobSuccessful() {
   const bool value = _lastJobSuccess;
   xSemaphoreGive(_queueMutex);
   return value;
+}
+
+void BackgroundWorker::getLastCoverCompletion(uint32_t &sequence,
+                                              bool &success,
+                                              String &message) {
+  if (!_queueMutex ||
+      xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+    sequence = 0;
+    success = false;
+    message = "Busy";
+    return;
+  }
+  sequence = _coverCompletionSequence;
+  success = _lastCoverSuccess;
+  message = _lastCoverMessage;
+  xSemaphoreGive(_queueMutex);
 }
 
 bool BackgroundWorker::takeMetadataResult(ItemView &result) {
@@ -558,32 +577,50 @@ void BackgroundWorker::workerTask(void *pvParameters) {
           // 3. Network & Persistence (NO Library Lock held during HTTP)
           if (missing) {
             String downloadUrl = item.coverUrl;
+            const String archiveUrl = getCoverArtArchiveUrl(item);
+            bool usingArchiveCandidate = false;
             Serial.printf("[SYNC] CoverUrl in DB: '%s' (length: %d)\n",
                           downloadUrl.c_str(), downloadUrl.length());
 
-            // A persisted provider URL is normally sufficient. Re-querying
-            // the provider for every missing file doubled the network work and
-            // made individual records appear stuck on weak WiFi. A manual
-            // single-cover download still performs a fresh lookup when a URL
-            // needs to be replaced.
+            // Prefer the record's exact MusicBrainz release before a fuzzy
+            // artist/title search. Do not persist this candidate until its
+            // image has actually downloaded successfully.
             if (downloadUrl.length() == 0 &&
                 !isCancellationRequested() && !isSkipRequested()) {
+              downloadUrl = archiveUrl;
+              usingArchiveCandidate = downloadUrl.length() > 0;
+            }
+
+            bool coverDownloaded = false;
+            if (downloadUrl.length() > 0 && !isCancellationRequested() &&
+                !isSkipRequested() && WiFi.status() == WL_CONNECTED) {
+              setStatus(itemProgress + "Downloading " + item.title);
+              coverDownloaded = AppNetworkManager::downloadCoverImage(
+                  downloadUrl, savePath, true);
+            }
+
+            // A release can legitimately have no archived front image. Keep
+            // the existing short iTunes lookup as a bounded fallback.
+            if (!coverDownloaded && item.coverUrl.length() == 0 &&
+                !isCancellationRequested() && !isSkipRequested() &&
+                WiFi.status() == WL_CONNECTED) {
               setStatus(itemProgress + "Finding cover for " + item.title);
-              downloadUrl = fetchCoverUrlForIndex(i); // Internal locking
-              if (downloadUrl.length() > 0) {
-                setItemCoverUrl(i, downloadUrl);
-              } else {
-                Serial.printf("[SYNC] Failed to fetch cover URL\n");
+              String providerUrl =
+                  fetchCoverUrlForIndex(i, true); // Internal locking
+              if (providerUrl.length() > 0 && providerUrl != downloadUrl) {
+                downloadUrl = providerUrl;
+                usingArchiveCandidate = false;
+                setStatus(itemProgress + "Downloading " + item.title);
+                coverDownloaded = AppNetworkManager::downloadCoverImage(
+                    downloadUrl, savePath, true);
               }
             }
 
-            if (downloadUrl.length() > 0 &&
-                !isCancellationRequested() &&
-                !isSkipRequested() &&
-                WiFi.status() == WL_CONNECTED) {
-              setStatus(itemProgress + "Downloading " + item.title);
-              if (AppNetworkManager::downloadCoverImage(downloadUrl, savePath,
-                                                        true)) {
+            if (coverDownloaded) {
+              setItemCoverUrl(i, downloadUrl);
+              if (usingArchiveCandidate)
+                Serial.printf("[SYNC] Cover found by MusicBrainz release ID\n");
+              if (!isCancellationRequested() && !isSkipRequested()) {
                 downloadedCount++;
                 String prefix = getUidPrefix();
                 String fileName =
@@ -644,11 +681,29 @@ void BackgroundWorker::workerTask(void *pvParameters) {
           break;
         }
 
-        setStatus("Finding a cover for " + item.title + "...");
-        setProgress(0.10f);
-        String url = fetchCoverUrlForIndex(currentJob.index);
-        if (url.length() == 0) {
-          resultMsg = "No cover was found online";
+        // Re-running Cover Search for an item that already has a valid local
+        // JPEG needlessly repeats several TLS handshakes and rewrites the same
+        // SD file. The cover can still be replaced deliberately by tapping it,
+        // deleting it, and searching again.
+        bool localCoverReady = false;
+        if (item.coverFile.length() > 4 && sdExpander && i2cMutex &&
+            xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(1000)) == pdPASS) {
+          sdExpander->digitalWrite(SD_CS, LOW);
+          File localCover = SD.open("/covers/" + item.coverFile, FILE_READ);
+          if (localCover && localCover.size() >= 4) {
+            const int first = localCover.read();
+            const int second = localCover.read();
+            localCoverReady = first == 0xFF && second == 0xD8;
+          }
+          if (localCover)
+            localCover.close();
+          sdExpander->digitalWrite(SD_CS, HIGH);
+          xSemaphoreGiveRecursive(i2cMutex);
+        }
+        if (localCoverReady) {
+          success = true;
+          setProgress(1.0f);
+          resultMsg = "Cover is already available";
           break;
         }
 
@@ -661,18 +716,82 @@ void BackgroundWorker::workerTask(void *pvParameters) {
             getUidPrefix() + sanitizeFilename(uid) + ".jpg";
         const String savePath = "/covers/" + fileName;
 
-        setStatus("Downloading the cover image...");
-        setProgress(0.45f);
-        if (!AppNetworkManager::downloadCoverImage(url, savePath)) {
-          ErrorHandler::logError(ERR_CAT_NETWORK,
-                                 String("Cover download failed: ") + savePath,
-                                 "BackgroundWorker::JOB_COVER_DOWNLOAD");
-          resultMsg = "Cover download failed. Check WiFi and SD storage.";
+        // Bulk sync and manual Cover Search must agree. Sync can download a
+        // persisted provider URL, so try that same URL before asking the
+        // provider to discover the album again.
+        String url = item.coverUrl;
+        bool downloaded = false;
+        bool replacementFound = false;
+        bool lookupConnectionFailed = false;
+        String lookupErrorDetail;
+        String downloadErrorDetail;
+        const bool hadSavedUrl = url.length() > 0;
+        if (hadSavedUrl) {
+          setStatus("Trying the saved cover for " + item.title + "...");
+          setProgress(0.20f);
+          downloaded = AppNetworkManager::downloadCoverImage(
+              url, savePath, false, &downloadErrorDetail);
+        }
+
+        // CD records already carry an exact MusicBrainz release ID. The Cover
+        // Art Archive endpoint is both more precise and more consistent with
+        // metadata sync than a fuzzy Apple text search.
+        const String archiveUrl = getCoverArtArchiveUrl(item);
+        if (!downloaded && archiveUrl.length() > 0 && archiveUrl != url &&
+            !isCancellationRequested()) {
+          setStatus("Checking the release cover archive...");
+          setProgress(0.40f);
+          if (AppNetworkManager::downloadCoverImage(
+                  archiveUrl, savePath, false, &downloadErrorDetail)) {
+            url = archiveUrl;
+            replacementFound = true;
+            downloaded = true;
+          }
+        }
+
+        if (!downloaded && !isCancellationRequested()) {
+          setStatus(hadSavedUrl ? "Searching for a replacement cover..."
+                                : "Finding a cover for " + item.title + "...");
+          setProgress(0.45f);
+          String discoveredUrl = fetchCoverUrlForIndex(
+              currentJob.index, false, &lookupConnectionFailed,
+              &lookupErrorDetail);
+          if (discoveredUrl.length() > 0) {
+            replacementFound = true;
+            url = discoveredUrl;
+            setStatus("Downloading the cover image...");
+            setProgress(0.65f);
+            downloaded = AppNetworkManager::downloadCoverImage(
+                url, savePath, false, &downloadErrorDetail);
+          }
+        }
+
+        if (!downloaded) {
+          if (hadSavedUrl || replacementFound) {
+            ErrorHandler::logError(ERR_CAT_NETWORK,
+                                   String("Cover download failed: ") + savePath,
+                                   "BackgroundWorker::JOB_COVER_DOWNLOAD");
+          }
+          if (hadSavedUrl && !replacementFound) {
+            resultMsg =
+                "The saved cover was unavailable and no replacement was found";
+          } else if (lookupConnectionFailed) {
+            resultMsg = "Cover service connection failed";
+            if (lookupErrorDetail.length() > 0)
+              resultMsg += ": " + lookupErrorDetail;
+          } else if (!hadSavedUrl && !replacementFound) {
+            resultMsg = "No cover was found online";
+          } else {
+            resultMsg =
+                "A cover was found, but it could not be downloaded or saved";
+            if (downloadErrorDetail.length() > 0)
+              resultMsg += ": " + downloadErrorDetail;
+          }
           break;
         }
 
         setStatus("Saving the cover...");
-        setProgress(0.85f);
+        setProgress(0.90f);
         setItemCoverUrl(currentJob.index, url);
         setItemCoverFile(currentJob.index, fileName);
         ensureItemDetailsLoaded(currentJob.index);
@@ -1005,6 +1124,11 @@ void BackgroundWorker::workerTask(void *pvParameters) {
           xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         _lastCompletedJobType = currentJob.type;
         _lastJobSuccess = success;
+        if (currentJob.type == JOB_COVER_DOWNLOAD) {
+          _coverCompletionSequence++;
+          _lastCoverSuccess = success;
+          _lastCoverMessage = resultMsg;
+        }
         if (currentJob.type == JOB_LYRICS_LOAD_CACHED ||
             currentJob.type == JOB_LYRICS_FETCH_ONE) {
           _lyricsCompletionReady = true;

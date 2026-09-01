@@ -86,6 +86,26 @@ inline String getExtraInfoKey() { return curr().extraInfoKey; }
 inline String getExtraInfoUnit() { return curr().extraInfoUnit; }
 inline bool hasTracklist() { return curr().hasTracklist; }
 
+// MusicBrainz release IDs map directly to Cover Art Archive's front-cover
+// endpoint. This gives CD cover search a deterministic first choice and avoids
+// depending solely on a text search provider. Validate the stored identifier
+// before placing it in a URL because library records are user-editable files.
+inline String getCoverArtArchiveUrl(const ItemView &item) {
+  if (currentMode != MODE_CD)
+    return "";
+  String mbid = item.releaseMbid;
+  mbid.trim();
+  if (mbid.length() != 36)
+    return "";
+  for (size_t i = 0; i < mbid.length(); i++) {
+    const char c = mbid[i];
+    const bool separator = i == 8 || i == 13 || i == 18 || i == 23;
+    if ((separator && c != '-') || (!separator && !isHexadecimalDigit(c)))
+      return "";
+  }
+  return "https://coverartarchive.org/release/" + mbid + "/front-250";
+}
+
 inline MediaMode getOtherMode() {
   return (currentMode == MODE_CD) ? MODE_BOOK : MODE_CD;
 }
@@ -1018,7 +1038,13 @@ inline bool fetchModeMetadata(String code, ItemView &out) {
 }
 
 // Fetch cover URL for an item at index
-inline String fetchCoverUrlForIndex(int index) {
+inline String fetchCoverUrlForIndex(int index, bool quickMode = false,
+                                    bool *requestFailed = nullptr,
+                                    String *errorDetail = nullptr) {
+  if (requestFailed)
+    *requestFailed = false;
+  if (errorDetail)
+    *errorDetail = "";
   ItemView item = getItemAtSD(index);
   if (!item.isValid)
     return "";
@@ -1040,7 +1066,8 @@ inline String fetchCoverUrlForIndex(int index) {
     break;
   case MODE_CD:
     return MediaManager::fetchAlbumCoverUrl(item.artistOrAuthor.c_str(),
-                                            item.title.c_str());
+                                            item.title.c_str(), quickMode,
+                                            requestFailed, errorDetail);
   default:
     break;
   }

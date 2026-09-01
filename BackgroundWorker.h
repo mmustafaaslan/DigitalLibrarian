@@ -61,6 +61,8 @@ public:
   static bool isSkipRequested();
   static JobType getLastCompletedJobType();
   static bool wasLastJobSuccessful();
+  static void getLastCoverCompletion(uint32_t &sequence, bool &success,
+                                     String &message);
   static bool takeMetadataResult(ItemView &result);
   static bool takeItemSaveCompletion(bool &success, String &message,
                                      ItemView &savedItem, MediaMode &mode,
@@ -90,6 +92,9 @@ private:
   static int _totalJobs;
   static JobType _lastCompletedJobType;
   static bool _lastJobSuccess;
+  static uint32_t _coverCompletionSequence;
+  static bool _lastCoverSuccess;
+  static String _lastCoverMessage;
   static ItemView _metadataResult;
   static bool _metadataResultReady;
   static ItemView _itemSaveResult;

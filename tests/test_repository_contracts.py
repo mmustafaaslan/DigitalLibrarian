@@ -26,6 +26,22 @@ class RepositoryContracts(unittest.TestCase):
         self.assertIn("ENABLE_DESTRUCTIVE_STORAGE_TESTS", SKETCH)
         self.assertIn('server.on("/api/tests/run", HTTP_POST', SKETCH)
 
+    def test_cover_search_can_be_exercised_through_authenticated_diagnostics(self):
+        diagnostics = SKETCH[SKETCH.index('server.on("/api/job", HTTP_GET'):]
+        diagnostics = diagnostics[:diagnostics.index("// 3. Remote Control API")]
+        self.assertIn("requireWebAuth()", diagnostics)
+        self.assertIn("BackgroundWorker::getLastCompletedJobType()", diagnostics)
+        self.assertIn("BackgroundWorker::getStatusMessage()", diagnostics)
+        self.assertIn("BackgroundWorker::getLastCoverCompletion", diagnostics)
+        self.assertIn('doc["coverSequence"]', diagnostics)
+        self.assertIn('doc["coverStatus"]', diagnostics)
+
+        control = SKETCH[SKETCH.index('server.on("/api/control", HTTP_POST'):]
+        control = control[:control.index("// LED Selector Web UI")]
+        self.assertIn('action == "coversearch"', control)
+        self.assertIn("JOB_COVER_DOWNLOAD", control)
+        self.assertIn("hasSavedCoverUrl", control)
+
     def test_generated_pages_do_not_put_pin_in_urls(self):
         self.assertNotIn("?pin=", SKETCH)
         self.assertNotIn("searchParams.set('pin'", SKETCH)
@@ -180,7 +196,29 @@ class RepositoryContracts(unittest.TestCase):
         self.assertNotIn("downloadCoverImage", cover_handler)
         self.assertNotIn("fetchAlbumCoverUrl", cover_handler)
         self.assertIn("case JOB_COVER_DOWNLOAD", WORKER)
-        self.assertIn("fetchCoverUrlForIndex(currentJob.index)", WORKER)
+        self.assertIn("fetchCoverUrlForIndex(", WORKER)
+
+        cover_job = WORKER[WORKER.index("case JOB_COVER_DOWNLOAD"):]
+        cover_job = cover_job[:cover_job.index("case JOB_TRACKLIST_LOAD")]
+        self.assertIn("String url = item.coverUrl", cover_job)
+        self.assertLess(
+            cover_job.index("String url = item.coverUrl"),
+            cover_job.index("fetchCoverUrlForIndex("),
+        )
+        self.assertIn("Trying the saved cover", cover_job)
+        self.assertIn("Searching for a replacement cover", cover_job)
+        self.assertIn("lookupConnectionFailed", cover_job)
+        self.assertIn("lookupErrorDetail", cover_job)
+        self.assertIn("downloadErrorDetail", cover_job)
+        self.assertIn("Cover service connection failed", cover_job)
+        self.assertIn("getCoverArtArchiveUrl(item)", cover_job)
+        self.assertIn("Checking the release cover archive", cover_job)
+        self.assertIn("bool localCoverReady = false", cover_job)
+        self.assertIn('resultMsg = "Cover is already available"', cover_job)
+        self.assertLess(
+            cover_job.index("bool localCoverReady = false"),
+            cover_job.index("AppNetworkManager::downloadCoverImage"),
+        )
 
     def test_network_progress_has_a_live_activity_indicator(self):
         progress_monitor = UI[UI.index("// --- Progress Monitor Timer ---"):]
@@ -255,6 +293,26 @@ class RepositoryContracts(unittest.TestCase):
         self.assertIn("Sync stopped: WiFi disconnected", bulk_sync)
         self.assertIn("String(i + 1)", bulk_sync)
         self.assertIn("item.coverUrl", bulk_sync)
+        self.assertIn("fetchCoverUrlForIndex(i, true)", bulk_sync)
+        self.assertIn("getCoverArtArchiveUrl(item)", bulk_sync)
+        self.assertLess(
+            bulk_sync.index("getCoverArtArchiveUrl(item)"),
+            bulk_sync.index("fetchCoverUrlForIndex(i, true)"),
+        )
+        self.assertIn("if (coverDownloaded)", bulk_sync)
+        self.assertLess(
+            bulk_sync.index("if (coverDownloaded)"),
+            bulk_sync.index("setItemCoverUrl(i, downloadUrl)"),
+        )
+
+        album_lookup = MEDIA[MEDIA.index(
+            "String MediaManager::fetchAlbumCoverUrl"
+        ):MEDIA.index("void MediaManager::sortByArtistOrAuthor")]
+        self.assertIn("const int maxAttempts = 1", album_lookup)
+        self.assertIn("quickMode ? 2UL : 20UL", album_lookup)
+        self.assertIn("quickMode ? 3000UL : 20000UL", album_lookup)
+        self.assertIn("HTTPClient::errorToString", album_lookup)
+        self.assertIn("client.lastError", album_lookup)
 
         cover_download = NETWORK[NETWORK.index(
             "bool AppNetworkManager::downloadCoverImage"
@@ -262,17 +320,23 @@ class RepositoryContracts(unittest.TestCase):
         self.assertIn("BackgroundWorker::isCancellationRequested()", cover_download)
         self.assertIn("BackgroundWorker::isSkipRequested()", cover_download)
         self.assertIn("bool quickMode", cover_download)
-        self.assertIn("quickMode ? 3000 : 8000", cover_download)
-        self.assertIn("quickMode ? 3UL : 8UL", cover_download)
+        self.assertIn("quickMode ? 3000 : 20000", cover_download)
+        self.assertIn("quickMode ? 3UL : 20UL", cover_download)
         self.assertIn(
             "setHandshakeTimeout(handshakeTimeoutSeconds)", cover_download
         )
-        self.assertIn("quickMode ? 7000 : 15000", cover_download)
-        self.assertIn("quickMode ? 2500 : 5000", cover_download)
+        self.assertIn("quickMode ? 7000 : 30000", cover_download)
+        self.assertIn("quickMode ? 2500 : 8000", cover_download)
+        self.assertIn("String *errorDetail", cover_download)
+        self.assertIn("Image transfer stopped at", cover_download)
+        self.assertIn("SD write or file replacement failed", cover_download)
         self.assertIn("millis() - startedAt < streamTimeoutMs", cover_download)
         self.assertIn("millis() - lastDataAt < idleTimeoutMs", cover_download)
         self.assertIn(
-            "downloadCoverImage(downloadUrl, savePath,\n                                                        true)",
+            "http.connected() || stream->available() > 0", cover_download
+        )
+        self.assertIn(
+            "downloadCoverImage(\n                  downloadUrl, savePath, true)",
             bulk_sync,
         )
 
