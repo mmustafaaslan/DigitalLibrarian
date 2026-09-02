@@ -5,10 +5,34 @@
 #include "Storage.h"
 #include "mode_abstraction.h" // Needed for ensureItemDetailsLoaded and getItemCount
 #include <Arduino.h>
+#include <esp_heap_caps.h>
+#include <new>
+
+inline bool ensureNavigationCacheAllocated() {
+  if (navCacheStorage)
+    return true;
+
+  void *storage = heap_caps_malloc(sizeof(NavigationCache),
+                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (storage) {
+    navCacheStorage = new (storage) NavigationCache{};
+    Serial.printf("Navigation cache allocated in PSRAM (%u bytes)\n",
+                  (unsigned)sizeof(NavigationCache));
+  } else {
+    // Retain a functional fallback if PSRAM is unexpectedly unavailable.
+    navCacheStorage = new (std::nothrow) NavigationCache{};
+    Serial.println("WARNING: Navigation cache fell back to internal RAM");
+  }
+  return navCacheStorage != nullptr;
+}
 
 // Initialize the cache for the current mode
 inline void initNavigationCache() {
   Serial.println("Initializing navigation cache...");
+  if (!ensureNavigationCacheAllocated()) {
+    Serial.println("ERROR: Navigation cache allocation failed");
+    return;
+  }
 
   // Set cache size based on user setting (default 5 items per side = 11 total)
   int itemsPerSide = constrain(setting_cache_size, 1, 15);
@@ -30,8 +54,25 @@ inline void initNavigationCache() {
   Serial.println("Navigation cache initialized");
 }
 
+inline void invalidateNavigationCache() {
+  if (!ensureNavigationCacheAllocated())
+    return;
+  if (libraryMutex)
+    xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
+  for (int i = 0; i < MAX_CACHE_WINDOW_SIZE; i++) {
+    navCache.cdCacheValid[i] = false;
+    navCache.bookCacheValid[i] = false;
+  }
+  navCache.cdCacheStartIndex = -1;
+  navCache.bookCacheStartIndex = -1;
+  if (libraryMutex)
+    xSemaphoreGiveRecursive(libraryMutex);
+}
+
 // Load an item from SD into cache at specific cache index
 inline bool loadItemIntoCache(int libraryIndex, int cacheIndex) {
+  if (!ensureNavigationCacheAllocated())
+    return false;
   if (cacheIndex < 0 || cacheIndex >= navCache.cacheSize) {
     return false;
   }
@@ -94,6 +135,8 @@ inline bool loadItemIntoCache(int libraryIndex, int cacheIndex) {
 
 // Rebuild cache centered on current index
 inline void rebuildNavigationCache(int centerIndex) {
+  if (!ensureNavigationCacheAllocated())
+    return;
   if (libraryMutex)
     xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
 
@@ -195,6 +238,24 @@ inline ItemView buildCachedBookView(const Book &detail, int libraryIndex) {
 
 // Get item from cache if available, otherwise load from SD
 inline ItemView getItemFromCache(int libraryIndex) {
+  ItemView result{};
+  result.isValid = false;
+  if (!ensureNavigationCacheAllocated())
+    return getItemAtSD(libraryIndex);
+  if (libraryMutex)
+    xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
+
+  const int totalItems = currentMode == MODE_CD
+                             ? (int)cdLibrary.size()
+                             : (currentMode == MODE_BOOK
+                                    ? (int)bookLibrary.size()
+                                    : 0);
+  if (libraryIndex < 0 || libraryIndex >= totalItems) {
+    if (libraryMutex)
+      xSemaphoreGiveRecursive(libraryMutex);
+    return result;
+  }
+
   int cacheStartIndex = (currentMode == MODE_CD) ? navCache.cdCacheStartIndex
                                                  : navCache.bookCacheStartIndex;
 
@@ -208,17 +269,23 @@ inline ItemView getItemFromCache(int libraryIndex) {
 
       if (isValid) {
         if (currentMode == MODE_CD) {
-          return buildCachedCDView(navCache.cdCache[cacheOffset], libraryIndex);
+          result = buildCachedCDView(navCache.cdCache[cacheOffset], libraryIndex);
         } else if (currentMode == MODE_BOOK) {
-          return buildCachedBookView(navCache.bookCache[cacheOffset],
-                                     libraryIndex);
+          result = buildCachedBookView(navCache.bookCache[cacheOffset],
+                                       libraryIndex);
         }
+        if (libraryMutex)
+          xSemaphoreGiveRecursive(libraryMutex);
+        return result;
       }
     }
   }
 
   // Cache MISS
-  return getItemAtSD(libraryIndex);
+  result = getItemAtSD(libraryIndex);
+  if (libraryMutex)
+    xSemaphoreGiveRecursive(libraryMutex);
+  return result;
 }
 
 extern bool filter_active;
@@ -230,6 +297,8 @@ inline ItemView getItemAt(int index) {
 
 // Shift cache window (for NEXT/PREV navigation)
 inline void shiftCacheWindow(bool forward) {
+  if (!ensureNavigationCacheAllocated())
+    return;
   if (filter_active)
     return; // No cache operations during filtering
 

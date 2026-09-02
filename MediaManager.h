@@ -51,6 +51,7 @@ public:
                                    bool quickMode = false,
                                    bool *requestFailed = nullptr,
                                    String *errorDetail = nullptr);
+  static bool stressTestLyricsTransport(int cycles, String &resultMessage);
 
 private:
   static bool _taskBusy;

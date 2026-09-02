@@ -294,33 +294,18 @@ inline int getItemCount() {
 
 // Ensure item details are loaded from SD
 inline void ensureItemDetailsLoaded(int index) {
+  if (libraryMutex)
+    xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
   switch (currentMode) {
   case MODE_BOOK:
     if (index >= 0 && index < (int)bookLibrary.size()) {
-      if (bookLibrary[index].detailsLoaded)
-        return;
-      if (libraryMutex)
-        xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
       if (!bookLibrary[index].detailsLoaded)
         Storage.loadBookDetail(bookLibrary[index].uniqueID.c_str(),
                                bookLibrary[index]);
-      if (libraryMutex)
-        xSemaphoreGiveRecursive(libraryMutex);
     }
     break;
   case MODE_CD:
     if (index >= 0 && index < (int)cdLibrary.size()) {
-      // Thread Safety: Double Checked Locking pattern
-      // 1. Check if already loaded to avoid mutex overhead
-      if (cdLibrary[index].detailsLoaded) {
-        return;
-      }
-
-      // 2. Lock
-      if (libraryMutex)
-        xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
-
-      // 3. Re-check state inside lock
       if (!cdLibrary[index].detailsLoaded) {
         Serial.printf("ensureItemDetailsLoaded: CD[%d] ID=%s detailsLoaded=%d. "
                       "Current Mbid='%s'\n",
@@ -334,66 +319,89 @@ inline void ensureItemDetailsLoaded(int index) {
         Serial.printf("  -> Load Complete. New Mbid='%s'\n",
                       cdLibrary[index].releaseMbid.c_str());
       }
-
-      if (libraryMutex)
-        xSemaphoreGiveRecursive(libraryMutex);
     }
     break;
   default:
     break;
   }
+  if (libraryMutex)
+    xSemaphoreGiveRecursive(libraryMutex);
 }
 
 // Get item title at specific index
 inline String getItemTitle(int index) {
+  if (libraryMutex)
+    xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
+  String result;
   switch (currentMode) {
   case MODE_BOOK:
-    return (index >= 0 && index < (int)bookLibrary.size())
-               ? bookLibrary[index].title.c_str()
-               : "Unknown Book";
+    result = (index >= 0 && index < (int)bookLibrary.size())
+                 ? bookLibrary[index].title.c_str()
+                 : "Unknown Book";
+    break;
   case MODE_CD:
-    return (index >= 0 && index < (int)cdLibrary.size())
-               ? cdLibrary[index].title.c_str()
-               : "Unknown CD";
+    result = (index >= 0 && index < (int)cdLibrary.size())
+                 ? cdLibrary[index].title.c_str()
+                 : "Unknown CD";
+    break;
   default:
-    return "Unknown Item";
+    result = "Unknown Item";
+    break;
   }
+  if (libraryMutex)
+    xSemaphoreGiveRecursive(libraryMutex);
+  return result;
 }
 
 inline String getItemUniqueID(int index) {
+  if (libraryMutex)
+    xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
+  String result;
   switch (currentMode) {
   case MODE_BOOK:
-    return (index >= 0 && index < (int)bookLibrary.size())
-               ? bookLibrary[index].uniqueID.c_str()
-               : "";
+    if (index >= 0 && index < (int)bookLibrary.size())
+      result = bookLibrary[index].uniqueID.c_str();
+    break;
   case MODE_CD:
-    return (index >= 0 && index < (int)cdLibrary.size())
-               ? cdLibrary[index].uniqueID.c_str()
-               : "";
+    if (index >= 0 && index < (int)cdLibrary.size())
+      result = cdLibrary[index].uniqueID.c_str();
+    break;
   default:
-    return "";
+    break;
   }
+  if (libraryMutex)
+    xSemaphoreGiveRecursive(libraryMutex);
+  return result;
 }
 
 inline String getItemCodecOrIsbn(int index) {
+  if (libraryMutex)
+    xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
+  String result;
   switch (currentMode) {
   case MODE_BOOK:
-    return (index >= 0 && index < (int)bookLibrary.size())
-               ? bookLibrary[index].isbn.c_str()
-               : "";
+    if (index >= 0 && index < (int)bookLibrary.size())
+      result = bookLibrary[index].isbn.c_str();
+    break;
   case MODE_CD:
-    return (index >= 0 && index < (int)cdLibrary.size())
-               ? cdLibrary[index].barcode.c_str()
-               : "";
+    if (index >= 0 && index < (int)cdLibrary.size())
+      result = cdLibrary[index].barcode.c_str();
+    break;
   default:
-    return "";
+    break;
   }
+  if (libraryMutex)
+    xSemaphoreGiveRecursive(libraryMutex);
+  return result;
 }
 
-// Get item at specific index (RAM-only access, no SD hit, no mutex)
+// Get item at specific index without an SD hit. Copy under the library mutex so
+// readers never race worker-side String/vector updates.
 inline ItemView getItemAtRAM(int index) {
   ItemView view;
   view.isValid = false;
+  if (libraryMutex)
+    xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
 
   switch (currentMode) {
   case MODE_BOOK:
@@ -452,6 +460,8 @@ inline ItemView getItemAtRAM(int index) {
     // Future: handle mixed mode
     break;
   }
+  if (libraryMutex)
+    xSemaphoreGiveRecursive(libraryMutex);
   return view;
 }
 
@@ -752,47 +762,41 @@ inline bool deleteItemAt(int index) {
 
 // Toggle favorite status at index
 inline bool toggleFavoriteAt(int index) {
-  bool success = false;
-
-  switch (currentMode) {
-  case MODE_BOOK:
-    if (index >= 0 && index < bookLibrary.size()) {
-      // Toggle RAM
-      bookLibrary[index].favorite = !bookLibrary[index].favorite;
-      // Save deep storage
-      // Note: We need full detail to save? Storage.saveBook requires a full
-      // Book object. bookLibrary[index] only has Index data (plus maybe notes
-      // if lazy loaded). Ideally we load detail, toggle, save.
-      Book fullBook;
-      if (Storage.loadBookDetail(bookLibrary[index].uniqueID.c_str(),
-                                 fullBook)) {
-        fullBook.favorite = bookLibrary[index].favorite; // Apply toggle
-        success = Storage.saveBook(fullBook);
-      }
-    }
-    break;
-
-  case MODE_CD:
-    if (index >= 0 && index < cdLibrary.size()) {
-      cdLibrary[index].favorite = !cdLibrary[index].favorite;
-      CD fullCD;
-      if (Storage.loadCDDetail(cdLibrary[index].uniqueID.c_str(), fullCD)) {
-        fullCD.favorite = cdLibrary[index].favorite;
-        success = Storage.saveCD(fullCD);
-      }
-    }
-    break;
-
-  case MODE_ALL:
-    break;
+  if (libraryMutex)
+    xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
+  String uniqueID;
+  bool favorite = false;
+  bool valid = false;
+  const MediaMode mode = currentMode;
+  if (mode == MODE_BOOK && index >= 0 && index < (int)bookLibrary.size()) {
+    bookLibrary[index].favorite = !bookLibrary[index].favorite;
+    favorite = bookLibrary[index].favorite;
+    uniqueID = bookLibrary[index].uniqueID.c_str();
+    valid = true;
+  } else if (mode == MODE_CD && index >= 0 && index < (int)cdLibrary.size()) {
+    cdLibrary[index].favorite = !cdLibrary[index].favorite;
+    favorite = cdLibrary[index].favorite;
+    uniqueID = cdLibrary[index].uniqueID.c_str();
+    valid = true;
   }
 
+  const bool success = valid && Storage.updateFavorite(uniqueID, mode, favorite);
+  if (!success && valid) {
+    if (mode == MODE_BOOK)
+      bookLibrary[index].favorite = !favorite;
+    else
+      cdLibrary[index].favorite = !favorite;
+  }
+  if (libraryMutex)
+    xSemaphoreGiveRecursive(libraryMutex);
   return success;
 }
 
 // Get LED indices for item at index
 inline std::vector<int> getItemLedIndices(int index) {
   std::vector<int> indices;
+  if (libraryMutex)
+    xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
 
   switch (currentMode) {
   case MODE_BOOK:
@@ -812,6 +816,8 @@ inline std::vector<int> getItemLedIndices(int index) {
     break;
   }
 
+  if (libraryMutex)
+    xSemaphoreGiveRecursive(libraryMutex);
   return indices;
 }
 
@@ -1140,6 +1146,8 @@ inline void syncLibraryFromStorage() {
 // --- Sorting Functions ---
 
 inline void sortByArtistOrAuthor() {
+  if (libraryMutex)
+    xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
   switch (currentMode) {
   case MODE_BOOK:
     std::sort(bookLibrary.begin(), bookLibrary.end(),
@@ -1170,9 +1178,13 @@ inline void sortByArtistOrAuthor() {
     // Future: handle mixed mode sorting
     break;
   }
+  if (libraryMutex)
+    xSemaphoreGiveRecursive(libraryMutex);
 }
 
 inline void sortByLedIndex() {
+  if (libraryMutex)
+    xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
   switch (currentMode) {
   case MODE_BOOK:
     std::sort(bookLibrary.begin(), bookLibrary.end(),
@@ -1195,6 +1207,8 @@ inline void sortByLedIndex() {
     // Future: handle mixed mode sorting
     break;
   }
+  if (libraryMutex)
+    xSemaphoreGiveRecursive(libraryMutex);
 }
 
 // --- Future Extension Template ---

@@ -17,9 +17,9 @@ struct LibraryIndexItem {
   PsramString title;
   PsramString artist; // Author for books
   PsramString coverFile;
-  int year;
+  int year = 0;
   PsramString genre; // Useful for filtering
-  bool favorite;
+  bool favorite = false;
 
   // For mapping to physical shelf
   PsramIntVector ledIndices;
@@ -75,6 +75,10 @@ public:
   bool loadLyrics(const char *lyricsPath, PsramString &lyricsOut);
   bool saveLyrics(const char *lyricsPath, const PsramString &lyricsText,
                   String lang = "en");
+
+  // Restore a web-exported JSONL backup without holding the SD/touch bus for
+  // JSON parsing or rewriting the index once per imported item.
+  bool importBackup(const char *path, int &itemCount, int &tracklistCount);
 
 private:
   IndexVector _cdIndex;

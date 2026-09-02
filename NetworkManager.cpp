@@ -23,7 +23,7 @@ constexpr unsigned long SAVED_NETWORK_ATTEMPT_TIMEOUT_MS = 30000;
 void beginNetworkAttempt(int index) {
   connectionNetworkIndex = index;
   connectionAttemptStarted = millis();
-  WiFi.mode(WIFI_STA);
+  AppNetworkManager::prepareStationRadio();
   WiFi.begin(savedWiFiNetworks[index].ssid.c_str(),
              savedWiFiNetworks[index].password.c_str());
   Serial.printf("Trying WiFi: %s\n", savedWiFiNetworks[index].ssid.c_str());
@@ -42,10 +42,26 @@ void startSetupAccessPoint() {
 } // namespace
 
 void AppNetworkManager::init() {
-  // Initialize in station mode
-  WiFi.mode(WIFI_STA);
+  prepareStationRadio();
   loadWiFiNetworks();
   Serial.println("AppNetworkManager Initialized");
+}
+
+void AppNetworkManager::prepareStationRadio() {
+  WiFi.mode(WIFI_STA);
+  // TLS handshakes involve several latency-sensitive round trips. Modem sleep
+  // is counterproductive on the weak links commonly used by this appliance,
+  // so keep the station awake and request the highest level supported by the
+  // installed ESP32 core/board profile.
+  const bool sleepDisabled = WiFi.setSleep(false);
+  const bool txPowerApplied = WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  static bool resultLogged = false;
+  if (!resultLogged) {
+    Serial.printf("WiFi radio: sleep %s, TX power %s\n",
+                  sleepDisabled ? "disabled" : "unchanged",
+                  txPowerApplied ? "19.5 dBm" : "unchanged");
+    resultLogged = true;
+  }
 }
 
 bool AppNetworkManager::isConnected() { return WiFi.status() == WL_CONNECTED; }
@@ -229,6 +245,7 @@ void AppNetworkManager::cancelConnectionAttempts() {
 
 void AppNetworkManager::completeManualConnection() {
   cancelConnectionAttempts();
+  prepareStationRadio();
   WiFi.setAutoReconnect(true);
   if (!networkReadyAnnounced) {
     networkReadyAnnounced = true;
@@ -293,6 +310,7 @@ String AppNetworkManager::fetchURL(String url, int timeout) {
   }
 
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setConnectTimeout(timeout);
   http.setTimeout(timeout);
 
   int httpCode = http.GET();
@@ -310,7 +328,8 @@ String AppNetworkManager::fetchURL(String url, int timeout) {
 bool AppNetworkManager::downloadCoverImage(const String &url,
                                            const String &savePath,
                                            bool quickMode,
-                                           String *errorDetail) {
+                                           String *errorDetail,
+                                           bool allowRedirects) {
   static constexpr int MAX_COVER_BYTES = 2 * 1024 * 1024;
   if (errorDetail)
     *errorDetail = "";
@@ -351,7 +370,12 @@ bool AppNetworkManager::downloadCoverImage(const String &url,
     http.begin(clientInsecure, url);
   }
 
-  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  // Provider-generated URLs may redirect to their CDN. User-supplied manual
+  // URLs are deliberately fetched without redirects because the redirect
+  // destination cannot be revalidated before HTTPClient connects to it.
+  http.setFollowRedirects(allowRedirects ? HTTPC_FORCE_FOLLOW_REDIRECTS
+                                         : HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  http.setConnectTimeout(requestTimeoutMs);
   http.setTimeout(requestTimeoutMs);
 
   int httpCode = http.GET();
@@ -501,6 +525,7 @@ void AppNetworkManager::forceUpdateWLED() {
 
   String url = "http://" + wled_ip + "/json/state";
   http.begin(client, url);
+  http.setConnectTimeout(wled_timeout_ms);
   http.setTimeout(wled_timeout_ms);
   http.addHeader("Content-Type", "application/json");
 

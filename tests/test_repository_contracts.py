@@ -12,9 +12,14 @@ UI = (ROOT / "UIManager.cpp").read_text(encoding="utf-8")
 WORKER = (ROOT / "BackgroundWorker.cpp").read_text(encoding="utf-8")
 NETWORK = (ROOT / "NetworkManager.cpp").read_text(encoding="utf-8")
 MEDIA = (ROOT / "MediaManager.cpp").read_text(encoding="utf-8")
+CORE = (ROOT / "Core_Data.h").read_text(encoding="utf-8")
+NAVIGATION = (ROOT / "NavigationCache.h").read_text(encoding="utf-8")
 GLOBALS = (ROOT / "AppGlobals.cpp").read_text(encoding="utf-8")
 UTILS = (ROOT / "Utils.cpp").read_text(encoding="utf-8")
 TOUCH_PORT = (ROOT / "Waveshare_ST7262_LVGL.cpp").read_text(encoding="utf-8")
+RUNTIME_DIAGNOSTICS = (ROOT / "RuntimeDiagnostics.cpp").read_text(
+    encoding="utf-8"
+)
 
 
 class RepositoryContracts(unittest.TestCase):
@@ -25,6 +30,39 @@ class RepositoryContracts(unittest.TestCase):
     def test_destructive_storage_tests_are_compile_time_gated(self):
         self.assertIn("ENABLE_DESTRUCTIVE_STORAGE_TESTS", SKETCH)
         self.assertIn('server.on("/api/tests/run", HTTP_POST', SKETCH)
+
+    def test_lyrics_stress_test_is_read_only_and_reboot_trace_survives(self):
+        self.assertIn("RTC_DATA_ATTR RetainedDiagnosticState", RUNTIME_DIAGNOSTICS)
+        self.assertIn("previousInterrupted", RUNTIME_DIAGNOSTICS)
+        self.assertIn("heap_caps_get_largest_free_block", RUNTIME_DIAGNOSTICS)
+        self.assertIn("RuntimeDiagnostics::begin(boot_reset_reason)", SKETCH)
+        self.assertIn('doc["previousPhase"]', SKETCH)
+
+        stress_route = SKETCH[SKETCH.index(
+            'server.on("/api/debug/stress/lyrics", HTTP_POST'
+        ):]
+        stress_route = stress_route[:stress_route.index("// 3. Remote Control API")]
+        self.assertIn("requireWebAuth()", stress_route)
+        self.assertIn("JOB_DIAGNOSTIC_LYRICS_STRESS", stress_route)
+
+        stress = MEDIA[MEDIA.index("struct LyricsProbeOutcome"):]
+        stress = stress[:stress.index("void fetchAllLyrics")]
+        self.assertIn("LRCLIB probe", stress)
+        self.assertIn("extractLyricsFromResponse", stress)
+        self.assertIn("heap_caps_check_integrity_all", stress)
+        self.assertIn("runLyricsDiagnosticProbe", stress)
+        self.assertIn("http.setConnectTimeout(15000)", stress)
+        self.assertIn("waitForLyricsNetworkCooldown", stress)
+        self.assertIn("retrying LRCLIB", stress)
+        self.assertIn("trying Lyrics.ovh", stress)
+        self.assertIn("WiFi.RSSI()", stress)
+        self.assertIn("providerFallbacks", stress)
+        self.assertNotIn("Storage.save", stress)
+        self.assertNotIn("Storage.delete", stress)
+
+        self.assertIn("TEST LYRICS x5", UI)
+        self.assertIn("RuntimeDiagnostics::beginOperation", WORKER)
+        self.assertIn("RuntimeDiagnostics::clearOperation", WORKER)
 
     def test_cover_search_can_be_exercised_through_authenticated_diagnostics(self):
         diagnostics = SKETCH[SKETCH.index('server.on("/api/job", HTTP_GET'):]
@@ -146,7 +184,7 @@ class RepositoryContracts(unittest.TestCase):
         wifi_ui = UI[UI.index("void show_wifi_config_ui() {"):]
         wifi_ui = wifi_ui[:wifi_ui.index("void close_wifi_config_ui() {")]
         self.assertIn("WIFI_CONNECT_TIMEOUT_TICKS = 60", UI)
-        self.assertIn("WiFi.mode(WIFI_STA)", wifi_ui)
+        self.assertIn("AppNetworkManager::prepareStationRadio()", wifi_ui)
         self.assertIn("status == WL_NO_SSID_AVAIL", wifi_ui)
         self.assertIn("status == WL_CONNECT_FAILED", wifi_ui)
         self.assertNotIn("Connection failed. Check credentials.", wifi_ui)
@@ -176,6 +214,13 @@ class RepositoryContracts(unittest.TestCase):
         )]
         self.assertNotIn("while (WiFi.status()", legacy_connect)
         self.assertNotIn("delay(500)", legacy_connect)
+
+    def test_wifi_radio_is_tuned_for_weak_tls_links(self):
+        self.assertIn("void AppNetworkManager::prepareStationRadio()", NETWORK)
+        self.assertIn("WiFi.setSleep(false)", NETWORK)
+        self.assertIn("WiFi.setTxPower(WIFI_POWER_19_5dBm)", NETWORK)
+        self.assertIn("AppNetworkManager::prepareStationRadio()", UI)
+        self.assertIn("select a stronger saved network", MEDIA)
 
     def test_saved_wifi_rows_can_trigger_manual_connection(self):
         wifi_ui = UI[UI.index("void show_wifi_config_ui() {"):]
@@ -262,6 +307,13 @@ class RepositoryContracts(unittest.TestCase):
         ):MEDIA.index("bool extractLyricsFromResponse")]
         self.assertIn("networkAbortRequested()", response_reader)
         self.assertIn("body.clear()", response_reader)
+        self.assertIn("HTTP_EOF_SETTLE_MS", response_reader)
+        self.assertIn("!http.connected() && !body.empty()", response_reader)
+        self.assertIn(
+            "body.size() >= (size_t)expectedLength", response_reader
+        )
+        self.assertIn("response read failed", MEDIA)
+        self.assertIn("JSON %s at %u bytes", MEDIA)
         abort_helper = MEDIA[MEDIA.index("bool networkAbortRequested()"):]
         abort_helper = abort_helper[:abort_helper.index(
             "bool readHttpResponseToPsram"
@@ -313,6 +365,16 @@ class RepositoryContracts(unittest.TestCase):
         self.assertIn("quickMode ? 3000UL : 20000UL", album_lookup)
         self.assertIn("HTTPClient::errorToString", album_lookup)
         self.assertIn("client.lastError", album_lookup)
+        self.assertIn("cleanArtist.trim()", album_lookup)
+        self.assertIn("cleanAlbum.trim()", album_lookup)
+        self.assertIn("fetchMusicBrainzCoverGroup", album_lookup)
+        self.assertLess(
+            album_lookup.index("fetchMusicBrainzCoverGroup"),
+            album_lookup.index("itunes.apple.com"),
+        )
+        self.assertIn("coverartarchive.org/release-group/", MEDIA)
+        self.assertIn("readHttpResponseToPsram", album_lookup)
+        self.assertNotIn("http.getString()", album_lookup)
 
         cover_download = NETWORK[NETWORK.index(
             "bool AppNetworkManager::downloadCoverImage"
@@ -322,6 +384,7 @@ class RepositoryContracts(unittest.TestCase):
         self.assertIn("bool quickMode", cover_download)
         self.assertIn("quickMode ? 3000 : 20000", cover_download)
         self.assertIn("quickMode ? 3UL : 20UL", cover_download)
+        self.assertIn("http.setConnectTimeout(requestTimeoutMs)", cover_download)
         self.assertIn(
             "setHandshakeTimeout(handshakeTimeoutSeconds)", cover_download
         )
@@ -483,6 +546,7 @@ class RepositoryContracts(unittest.TestCase):
         self.assertIn('startsWith("discogs_")', cd_metadata)
         self.assertIn("BackgroundWorker::reportProgress", MEDIA)
         self.assertIn("client.setTimeout(15000)", MEDIA)
+        self.assertIn("http.setConnectTimeout(15000)", MEDIA)
         self.assertIn("http.setTimeout(15000)", MEDIA)
         self.assertNotIn(
             "Fetching genre from Discogs to supplement", release_lookup
@@ -630,6 +694,15 @@ class RepositoryContracts(unittest.TestCase):
         self.assertIn("extractLyricsFromResponse", lyrics_fetch)
         self.assertNotIn("http.getString()", lyrics_fetch)
         self.assertNotIn("DynamicJsonDocument", lyrics_fetch)
+        self.assertIn('http.addHeader("Connection", "close")', lyrics_fetch)
+        self.assertIn("http.setReuse(false)", lyrics_fetch)
+        self.assertIn("lyricsRequestTimeoutMs()", lyrics_fetch)
+        self.assertGreaterEqual(
+            lyrics_fetch.count("http.setConnectTimeout(requestTimeoutMs)"), 2
+        )
+        self.assertIn("closeLyricsRequest(http, client)", lyrics_fetch)
+        self.assertIn("canStartLyricsTlsRequest()", lyrics_fetch)
+        self.assertIn("return LYRICS_ERROR", lyrics_fetch)
 
         lyrics_saver = STORAGE[STORAGE.index(
             "bool LibrarianStorage::saveLyrics"
@@ -643,7 +716,9 @@ class RepositoryContracts(unittest.TestCase):
             "case JOB_PERSIST_FAVORITE"
         )]
         self.assertIn("Storage.deleteTracklist(tl)", fetch_all)
-        self.assertIn("delay(250)", fetch_all)
+        self.assertIn("WiFi.RSSI() <= -75 ? 2500 : 750", fetch_all)
+        self.assertIn("else if (res == LYRICS_ERROR)", fetch_all)
+        self.assertIn("Stopped safely at track", fetch_all)
 
     def test_song_list_avoids_persistent_scroll_drift(self):
         list_style = UI[UI.index("static void style_list_row"):]
@@ -695,6 +770,117 @@ class RepositoryContracts(unittest.TestCase):
         settings = UI[UI.index("void show_settings_ui"):]
         self.assertIn('lv_label_set_text(lbl_debug_overlay, "Live overlay")', settings)
         self.assertIn("set_debug_overlay_enabled", settings)
+
+    def test_lvgl_stack_stays_internal_and_reports_headroom(self):
+        display_cpp = (ROOT / "Waveshare_ST7262_LVGL.cpp").read_text(
+            encoding="utf-8", errors="replace"
+        )
+        self.assertNotIn("lvgl_task_stack_buffer", display_cpp)
+        self.assertIn("BaseType_t ret = xTaskCreatePinnedToCore", display_cpp)
+        self.assertIn("lvgl_port_get_stack_high_water_mark", display_cpp)
+        self.assertIn("lvgl_port_get_stack_high_water_mark", UI)
+
+    def test_navigation_cache_uses_psram_without_changing_cache_depth(self):
+        globals_cpp = (ROOT / "AppGlobals.cpp").read_text(encoding="utf-8")
+        self.assertIn("NavigationCache *navCacheStorage = nullptr", globals_cpp)
+        self.assertIn("ensureNavigationCacheAllocated", NAVIGATION)
+        self.assertIn("heap_caps_malloc(sizeof(NavigationCache)", NAVIGATION)
+        self.assertIn("MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT", NAVIGATION)
+        self.assertIn("new (storage) NavigationCache{}", NAVIGATION)
+        self.assertIn("setting_cache_size, 1, 15", NAVIGATION)
+
+    def test_interrupted_storage_transactions_are_recovered_on_read(self):
+        recovery = STORAGE[STORAGE.index("bool recoverInterruptedReplace"):]
+        recovery = recovery[:recovery.index("void rollbackReplacedFile")]
+        self.assertIn('path + ".bak"', recovery)
+        self.assertIn('path + ".delete.bak"', recovery)
+        self.assertIn('path + ".tmp"', recovery)
+        for loader in (
+            "loadIndex",
+            "loadCDDetail",
+            "loadBookDetail",
+            "loadTracklist",
+            "loadLyrics",
+        ):
+            start = STORAGE.index(f"LibrarianStorage::{loader}")
+            next_method = STORAGE.find("\nbool LibrarianStorage::", start + 1)
+            if next_method < 0:
+                next_method = len(STORAGE)
+            self.assertIn("recoverInterruptedReplace", STORAGE[start:next_method])
+
+    def test_web_metadata_and_cover_routes_only_queue_background_work(self):
+        lookup = SKETCH[SKETCH.index('server.on("/api/lookup", HTTP_POST'):]
+        lookup = lookup[:lookup.index("// 6. Remote Browser")]
+        self.assertIn("JOB_WEB_METADATA_ADD", lookup)
+        self.assertIn("server.send(202", lookup)
+        self.assertNotIn("fetchModeMetadata", lookup)
+        self.assertNotIn("saveLibrary()", lookup)
+
+        setcover = SKETCH[SKETCH.index('server.on("/api/setcover", HTTP_POST'):]
+        setcover = setcover[:setcover.index("// 5. Metadata Lookup API")]
+        self.assertIn("JOB_COVER_DOWNLOAD", setcover)
+        self.assertIn("server.send(202", setcover)
+        self.assertNotIn("downloadCoverImage", setcover)
+        self.assertNotIn("saveLibrary()", setcover)
+        self.assertIn("HTTPC_DISABLE_FOLLOW_REDIRECTS", NETWORK)
+
+    def test_cache_and_favorite_failures_cannot_leave_stale_ui_state(self):
+        self.assertIn("inline void invalidateNavigationCache", NAVIGATION)
+        self.assertIn("libraryIndex < 0 || libraryIndex >= totalItems", NAVIGATION)
+        delete_handler = UI[UI.index("if (deleteItemAt(edit_item_index))"):]
+        delete_handler = delete_handler[:delete_handler.index("} else {")]
+        self.assertIn("invalidateNavigationCache", delete_handler)
+        favorite_job = WORKER[WORKER.index("case JOB_PERSIST_FAVORITE"):]
+        favorite_job = favorite_job[:favorite_job.index("case JOB_PERSIST_TRACK_FAVORITE")]
+        self.assertIn("item.favorite = !favorite", favorite_job)
+        self.assertIn("_favoriteFailureReady = true", favorite_job)
+        self.assertIn("takeFavoritePersistenceFailure", UI)
+
+    def test_backup_restore_is_batched_and_runs_off_the_web_callback(self):
+        import_route = SKETCH[SKETCH.index('"/api/import_backup", HTTP_POST'):]
+        import_route = import_route[:import_route.index("// 3. User Manual")]
+        self.assertIn("JOB_BACKUP_IMPORT", import_route)
+        self.assertNotIn("deserializeJson", import_route)
+        self.assertNotIn("Storage.saveCD", import_route)
+        storage_import = STORAGE[STORAGE.index("LibrarianStorage::importBackup"):]
+        self.assertIn("MALLOC_CAP_SPIRAM", storage_import)
+        self.assertIn("saveCD(cd, nullptr, true)", storage_import)
+        self.assertIn("saveBook(book, nullptr, true)", storage_import)
+        self.assertEqual(storage_import.count("rewriteIndex(MODE_CD)"), 1)
+        self.assertEqual(storage_import.count("rewriteIndex(MODE_BOOK)"), 1)
+
+        bulk_sync = WORKER[WORKER.index("case JOB_BULK_SYNC"):]
+        bulk_sync = bulk_sync[:bulk_sync.index("case JOB_COVER_DOWNLOAD")]
+        self.assertIn("saveCD(cdLibrary[i], nullptr, true)", bulk_sync)
+        self.assertIn("saveBook(bookLibrary[i], nullptr, true)", bulk_sync)
+        self.assertEqual(bulk_sync.count("Storage.rewriteIndex(currentMode)"), 1)
+
+    def test_dynamic_web_content_is_html_escaped(self):
+        self.assertIn("${esc(cd.title)}", SKETCH)
+        self.assertIn("${esc(cd.artist)}", SKETCH)
+        self.assertIn("${esc(e.message)}", SKETCH)
+        self.assertIn("${esc(e.context||'-')}", SKETCH)
+        self.assertNotIn("${cd.title}</h3>", SKETCH)
+        self.assertNotIn("${e.message}</td>", SKETCH)
+
+    def test_scalar_models_have_deterministic_defaults(self):
+        for declaration in (
+            "int trackNo = 0",
+            "unsigned long durationMs = 0",
+            "int year = 0",
+            "bool success = false",
+            "bool isValid = false",
+        ):
+            self.assertIn(declaration, CORE)
+
+    def test_vendored_display_port_matches_the_compiled_sketch_copy(self):
+        vendored = ROOT / "libraries" / "Waveshare_ST7262_LVGL" / "src"
+        for filename in ("Waveshare_ST7262_LVGL.cpp", "Waveshare_ST7262_LVGL.h"):
+            self.assertEqual(
+                (ROOT / filename).read_bytes(),
+                (vendored / filename).read_bytes(),
+                f"stale vendored hardware port: {filename}",
+            )
 
 
 if __name__ == "__main__":

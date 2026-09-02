@@ -21,7 +21,11 @@ enum JobType {
   JOB_PERSIST_FAVORITE,
   JOB_PERSIST_TRACK_FAVORITE,
   JOB_TRACK_SUMMARY_LOAD,
-  JOB_SYNC_WLED
+  JOB_SYNC_WLED,
+  JOB_WEB_METADATA_ADD,
+  JOB_COVER_DELETE,
+  JOB_BACKUP_IMPORT,
+  JOB_DIAGNOSTIC_LYRICS_STRESS
 };
 
 struct ItemSavePayload {
@@ -55,6 +59,7 @@ public:
   static String getStatusMessage();
   static float getProgress(); // 0.0 to 1.0
   static void reportProgress(float progress);
+  static void reportStatus(const String &message);
   static void requestCancel();
   static bool isCancellationRequested();
   static void requestSkipCurrent();
@@ -62,7 +67,12 @@ public:
   static JobType getLastCompletedJobType();
   static bool wasLastJobSuccessful();
   static void getLastCoverCompletion(uint32_t &sequence, bool &success,
-                                     String &message);
+                                     String &message, String *itemId = nullptr);
+  static void getLastWebAddCompletion(uint32_t &sequence, bool &success,
+                                      String &message,
+                                      String *requestCode = nullptr);
+  static bool takeFavoritePersistenceFailure(String &itemId,
+                                             bool &attemptedValue);
   static bool takeMetadataResult(ItemView &result);
   static bool takeItemSaveCompletion(bool &success, String &message,
                                      ItemView &savedItem, MediaMode &mode,
@@ -95,6 +105,14 @@ private:
   static uint32_t _coverCompletionSequence;
   static bool _lastCoverSuccess;
   static String _lastCoverMessage;
+  static String _lastCoverItemId;
+  static uint32_t _webAddCompletionSequence;
+  static bool _lastWebAddSuccess;
+  static String _lastWebAddMessage;
+  static String _lastWebAddRequestCode;
+  static bool _favoriteFailureReady;
+  static String _favoriteFailureItemId;
+  static bool _favoriteFailureAttemptedValue;
   static ItemView _metadataResult;
   static bool _metadataResultReady;
   static ItemView _itemSaveResult;

@@ -9,6 +9,7 @@
 // Lightweight refresh statistics used by the optional on-screen diagnostics.
 uint32_t lvgl_port_get_last_render_time_ms();
 uint32_t lvgl_port_get_last_render_pixels();
+uint32_t lvgl_port_get_stack_high_water_mark();
 /*
  * SPDX-FileCopyrightText: 2024 Espressif Systems (Shanghai) CO LTD
  *

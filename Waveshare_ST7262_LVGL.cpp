@@ -31,6 +31,12 @@ uint32_t lvgl_port_get_last_render_time_ms() { return last_render_time_ms; }
 
 uint32_t lvgl_port_get_last_render_pixels() { return last_render_pixels; }
 
+uint32_t lvgl_port_get_stack_high_water_mark() {
+  return lvgl_task_handle
+             ? (uint32_t)uxTaskGetStackHighWaterMark(lvgl_task_handle)
+             : 0;
+}
+
 extern SemaphoreHandle_t i2cMutex;
 
 // Use the global expander from AppGlobals.h

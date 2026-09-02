@@ -10,6 +10,7 @@
 class AppNetworkManager {
 public:
   static void init();
+  static void prepareStationRadio();
   static bool isConnected();
   static String getLocalIP();
 
@@ -30,7 +31,8 @@ public:
   static String fetchURL(String url, int timeout = 5000);
   static bool downloadCoverImage(const String &url, const String &savePath,
                                  bool quickMode = false,
-                                 String *errorDetail = nullptr);
+                                 String *errorDetail = nullptr,
+                                 bool allowRedirects = true);
   static void forceUpdateWLED();
 };
 

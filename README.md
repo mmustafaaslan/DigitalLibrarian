@@ -91,6 +91,7 @@ Digital Librarian turns your media shelf into an interactive experience. Use the
 2.  **Configuration**:
     *   Rename `secrets.example.h` to `secrets.h` and add your WiFi credentials.
     *   Keep the repository's `/libraries` folder available to the sketch.
+    *   The sketch-root `Waveshare_ST7262_LVGL.cpp/.h` files are the authoritative display/touch port used by the verified build. Their vendored library copies are kept synchronized so Arduino IDE library discovery cannot select stale hardware code.
     *   See [`docs/BUILD_ENVIRONMENT.md`](docs/BUILD_ENVIRONMENT.md) for the complete verified versions and board options.
 
 3.  **Compiling**:

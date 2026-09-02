@@ -81,7 +81,7 @@ BookVector bookLibrary;
 int currentBookIndex = 0;
 
 // Navigation cache for fast browsing
-NavigationCache navCache = {.cdCacheStartIndex = -1, .bookCacheStartIndex = -1};
+NavigationCache *navCacheStorage = nullptr;
 
 // --- Registry Definition (Single Instance) ---
 ModeDefinition registry[] = {

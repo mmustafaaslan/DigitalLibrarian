@@ -3,6 +3,7 @@
 #include "BackgroundWorker.h"
 #include "ErrorHandler.h"
 #include "NavigationCache.h"
+#include "RuntimeDiagnostics.h"
 #include "TlsTrust.h"
 #include "mode_abstraction.h"
 #include <FastLED.h>
@@ -13,10 +14,72 @@ bool MediaManager::_taskBusy = false;
 namespace {
 static constexpr size_t MAX_LYRICS_RESPONSE_BYTES = 128 * 1024;
 static constexpr size_t MAX_METADATA_RESPONSE_BYTES = 256 * 1024;
+static constexpr uint32_t HTTP_EOF_SETTLE_MS = 750;
+static char lastLyricsResponseError[128] = {0};
+// MbedTLS needs a reasonably large contiguous internal block even though the
+// response body and JSON document live in PSRAM. Starting another handshake
+// below this point is much more likely to reset the board than to succeed.
+static constexpr size_t MIN_LYRICS_TLS_INTERNAL_BLOCK = 24 * 1024;
 
 bool networkAbortRequested() {
   return BackgroundWorker::isCancellationRequested() ||
          BackgroundWorker::isSkipRequested();
+}
+
+bool waitForLyricsNetworkCooldown(uint32_t normalMs, uint32_t weakLinkMs) {
+  const uint32_t waitMs =
+      WiFi.RSSI() <= -75 ? weakLinkMs : normalMs;
+  const uint32_t startedAt = millis();
+  while (millis() - startedAt < waitMs) {
+    if (networkAbortRequested() || WiFi.status() != WL_CONNECTED)
+      return false;
+    delay(50);
+  }
+  return true;
+}
+
+uint32_t lyricsRequestTimeoutMs() {
+  // HTTPClient has a separate connection timeout whose default is only five
+  // seconds. Weak links on this board regularly need longer just to establish
+  // the TCP/TLS connection, even though the response timeout is already 10 s.
+  return WiFi.RSSI() <= -75 ? 15000UL : 10000UL;
+}
+
+bool canStartLyricsTlsRequest() {
+  RuntimeDiagnostics::markPhase(
+      "lyrics/heap-check", BackgroundWorker::getStackHighWaterMark());
+  if (WiFi.status() != WL_CONNECTED || networkAbortRequested())
+    return false;
+
+  if (!heap_caps_check_integrity_all(true)) {
+    ErrorHandler::logError(ERR_CAT_SYSTEM,
+                           "Heap integrity check failed before lyrics request",
+                           "fetchLyricsIfNeeded");
+    return false;
+  }
+
+  const size_t largestInternal = heap_caps_get_largest_free_block(
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (largestInternal < MIN_LYRICS_TLS_INTERNAL_BLOCK) {
+    Serial.printf("Lyrics request stopped safely: largest internal block is "
+                  "%u bytes\n",
+                  (unsigned)largestInternal);
+    ErrorHandler::logError(ERR_CAT_SYSTEM,
+                           "Not enough contiguous memory for another lyrics "
+                           "connection",
+                           "fetchLyricsIfNeeded");
+    return false;
+  }
+  return true;
+}
+
+void closeLyricsRequest(HTTPClient &http, WiFiClientSecure &client) {
+  RuntimeDiagnostics::markPhase(
+      "lyrics/socket-close", BackgroundWorker::getStackHighWaterMark());
+  http.end();
+  client.stop();
+  // Let the TCP/IP task release its buffers before another TLS connection.
+  delay(50);
 }
 
 
@@ -44,14 +107,20 @@ bool readHttpResponseToPsram(HTTPClient &http, PsramString &body,
 
   uint32_t lastDataAt = millis();
   char chunk[1024];
-  while ((http.connected() || stream->available()) &&
-         body.size() < maximumBytes) {
+  while (body.size() < maximumBytes) {
     if (networkAbortRequested()) {
       body.clear();
       return false;
     }
     const int available = stream->available();
     if (available <= 0) {
+      // Unknown-length HTTP/1.0 responses end by closing the connection. On
+      // ESP32, connected() can turn false just before the final decrypted
+      // bytes become visible in available(). Give that tail a short settling
+      // window instead of returning a truncated JSON document.
+      if (!http.connected() && !body.empty() &&
+          millis() - lastDataAt >= HTTP_EOF_SETTLE_MS)
+        break;
       if (millis() - lastDataAt > idleTimeoutMs)
         break;
       delay(1);
@@ -68,6 +137,8 @@ bool readHttpResponseToPsram(HTTPClient &http, PsramString &body,
     }
     body.append(chunk, (size_t)bytesRead);
     lastDataAt = millis();
+    if (expectedLength >= 0 && body.size() >= (size_t)expectedLength)
+      break;
     delay(1); // Keep WiFi/system tasks responsive during a continuous stream.
   }
 
@@ -85,23 +156,38 @@ bool readHttpResponseToPsram(HTTPClient &http, PsramString &body,
 bool extractLyricsFromResponse(HTTPClient &http, const char *primaryField,
                                const char *fallbackField,
                                PsramString &lyrics) {
+  lastLyricsResponseError[0] = '\0';
+  RuntimeDiagnostics::markPhase(
+      "lyrics/response-read", BackgroundWorker::getStackHighWaterMark());
   PsramString response;
-  if (!readHttpResponseToPsram(http, response, MAX_LYRICS_RESPONSE_BYTES))
+  if (!readHttpResponseToPsram(http, response, MAX_LYRICS_RESPONSE_BYTES)) {
+    snprintf(lastLyricsResponseError, sizeof(lastLyricsResponseError),
+             "response read failed (%u bytes)", (unsigned)response.size());
     return false;
+  }
 
+  RuntimeDiagnostics::markPhase(
+      "lyrics/json-parse", BackgroundWorker::getStackHighWaterMark());
   const size_t jsonCapacity = response.size() + 4096;
   BasicJsonDocument<SpiRamAllocator> doc(jsonCapacity);
   const DeserializationError error =
       deserializeJson(doc, response.data(), response.size());
-  if (error)
+  if (error) {
+    snprintf(lastLyricsResponseError, sizeof(lastLyricsResponseError),
+             "JSON %s at %u bytes", error.c_str(),
+             (unsigned)response.size());
     return false;
+  }
 
   const char *value = doc[primaryField] | "";
   if ((!value || value[0] == '\0' || strcmp(value, "null") == 0) &&
       fallbackField)
     value = doc[fallbackField] | "";
-  if (!value || value[0] == '\0' || strcmp(value, "null") == 0)
+  if (!value || value[0] == '\0' || strcmp(value, "null") == 0) {
+    snprintf(lastLyricsResponseError, sizeof(lastLyricsResponseError),
+             "lyrics fields were empty");
     return false;
+  }
   lyrics.assign(value);
   return !lyrics.empty();
 }
@@ -208,6 +294,7 @@ MBRelease MediaManager::fetchReleaseByBarcode(const char *barcode) {
 
   http.begin(client, url);
   http.addHeader("User-Agent", "DigitalLibrarian/1.0");
+  http.setConnectTimeout(10000);
   http.setTimeout(10000);
 
   int httpCode = http.GET();
@@ -334,6 +421,7 @@ MBRelease MediaManager::fetchReleaseFromDiscogs(const char *barcode) {
 
   http.begin(client, url);
   http.addHeader("User-Agent", "DigitalLibrarian/1.0");
+  http.setConnectTimeout(10000);
   http.setTimeout(10000);
 
   int httpCode = http.GET();
@@ -452,6 +540,7 @@ std::vector<Track> MediaManager::fetchTracklist(const char *releaseMbid,
 
   http.begin(client, url);
   http.addHeader("User-Agent", "DigitalLibrarian/1.0");
+  http.setConnectTimeout(15000);
   http.setTimeout(15000);
 
   int httpCode = http.GET();
@@ -627,6 +716,7 @@ bool MediaManager::fetchBookByISBN(const char *isbn, Book &book) {
       "https://www.googleapis.com/books/v1/volumes?q=isbn:" + String(isbn) +
       "&maxResults=1";
   http.begin(client, url);
+  http.setConnectTimeout(10000);
   http.setTimeout(10000);
 
   int httpCode = http.GET();
@@ -991,7 +1081,134 @@ bool MediaManager::fetchMetadataForISBN(const char *isbn, ItemView &outView) {
   return true;
 }
 
-// Fetch Album Cover URL from iTunes API
+namespace {
+
+bool isValidMbid(const String &value) {
+  if (value.length() != 36)
+    return false;
+  for (size_t i = 0; i < value.length(); i++) {
+    const bool separator = i == 8 || i == 13 || i == 18 || i == 23;
+    if ((separator && value[i] != '-') ||
+        (!separator && !isHexadecimalDigit(value[i])))
+      return false;
+  }
+  return true;
+}
+
+String escapeMusicBrainzSearchValue(String value) {
+  // Quoted Lucene values still need embedded slashes and quotes escaped.
+  value.replace("\\", "\\\\");
+  value.replace("\"", "\\\"");
+  return value;
+}
+
+String fetchMusicBrainzCoverGroup(const String &artist, const String &album,
+                                  bool quickMode, bool &providerResponded,
+                                  String &connectionError) {
+  if (networkAbortRequested() || WiFi.status() != WL_CONNECTED)
+    return "";
+
+  HTTPClient http;
+  WiFiClientSecure client;
+  if (!configureTrustedTlsClient(client)) {
+    connectionError = "MusicBrainz: TLS clock unavailable";
+    return "";
+  }
+
+  const unsigned long handshakeTimeoutSeconds = quickMode ? 2UL : 20UL;
+  const uint32_t requestTimeoutMs = quickMode ? 3000UL : 20000UL;
+  client.setHandshakeTimeout(handshakeTimeoutSeconds);
+  client.setTimeout(requestTimeoutMs);
+
+  const String query =
+      "releasegroup:\"" + escapeMusicBrainzSearchValue(album) +
+      "\" AND artist:\"" + escapeMusicBrainzSearchValue(artist) + "\"";
+  const String url = "https://musicbrainz.org/ws/2/release-group/?query=" +
+                     urlEncode(query) + "&fmt=json&limit=3";
+
+  Serial.printf("  MusicBrainz cover search: '%s' - '%s'\n", artist.c_str(),
+                album.c_str());
+  if (!http.begin(client, url)) {
+    connectionError = "MusicBrainz: could not start request";
+    client.stop();
+    return "";
+  }
+  http.addHeader("User-Agent", "DigitalLibrarian/1.0");
+  http.addHeader("Accept", "application/json");
+  http.addHeader("Connection", "close");
+  http.setConnectTimeout(requestTimeoutMs);
+  http.setTimeout(requestTimeoutMs);
+
+  const int httpCode = http.GET();
+  if (networkAbortRequested()) {
+    http.end();
+    client.stop();
+    return "";
+  }
+
+  if (httpCode == HTTP_CODE_OK) {
+    providerResponded = true;
+    PsramString payload;
+    const bool bodyRead = readHttpResponseToPsram(
+        http, payload, MAX_METADATA_RESPONSE_BYTES, quickMode ? 2500 : 10000);
+    http.end();
+    client.stop();
+    if (!bodyRead) {
+      connectionError = "MusicBrainz: response was empty or too large";
+      return "";
+    }
+
+    BasicJsonDocument<SpiRamAllocator> doc(24576);
+    const DeserializationError parseError =
+        deserializeJson(doc, payload.data(), payload.size());
+    if (parseError) {
+      Serial.printf("  MusicBrainz cover response parse error: %s\n",
+                    parseError.c_str());
+      return "";
+    }
+
+    JsonArray groups = doc["release-groups"].as<JsonArray>();
+    for (JsonObject group : groups) {
+      const int score = group["score"] | 0;
+      String groupMbid = group["id"] | "";
+      groupMbid.trim();
+      // A quoted artist/title match should normally score 100. Reject weaker
+      // matches so a similarly named album does not receive the wrong artwork.
+      if (score >= 90 && isValidMbid(groupMbid)) {
+        const String coverUrl =
+            "https://coverartarchive.org/release-group/" + groupMbid +
+            "/front-250";
+        Serial.printf("  Found MusicBrainz release-group cover: %s\n",
+                      coverUrl.c_str());
+        return coverUrl;
+      }
+    }
+    Serial.println("  MusicBrainz returned no strong release-group match");
+    return "";
+  }
+
+  if (httpCode < 0) {
+    char tlsErrorText[96] = {0};
+    const int tlsError = client.lastError(tlsErrorText, sizeof(tlsErrorText));
+    connectionError =
+        "MusicBrainz: " + String(HTTPClient::errorToString(httpCode));
+    if (tlsError != 0)
+      connectionError +=
+          " / TLS " + String(tlsError) + " " + String(tlsErrorText);
+  } else {
+    connectionError = "MusicBrainz: HTTP " + String(httpCode);
+  }
+  Serial.printf("  %s\n", connectionError.c_str());
+  http.end();
+  client.stop();
+  return "";
+}
+
+} // namespace
+
+// Fetch an album cover URL. Prefer MusicBrainz/Cover Art Archive because it
+// matches the metadata provider and offers release-group artwork, then retain
+// iTunes as an independent fallback.
 String MediaManager::fetchAlbumCoverUrl(const char *artist, const char *album,
                                         bool quickMode,
                                         bool *requestFailed,
@@ -1001,6 +1218,20 @@ String MediaManager::fetchAlbumCoverUrl(const char *artist, const char *album,
     *requestFailed = false;
   if (errorDetail)
     *errorDetail = "";
+  String cleanArtist = artist ? String(artist) : String();
+  String cleanAlbum = album ? String(album) : String();
+  cleanArtist.trim();
+  cleanAlbum.trim();
+  if (cleanArtist.length() == 0 || cleanAlbum.length() == 0)
+    return coverUrl;
+
+  bool providerResponded = false;
+  String providerError;
+  coverUrl = fetchMusicBrainzCoverGroup(cleanArtist, cleanAlbum, quickMode,
+                                        providerResponded, providerError);
+  if (coverUrl.length() > 0 || networkAbortRequested())
+    return coverUrl;
+
   // Bulk sync must abandon weak records quickly. Manual search instead gets
   // one realistic handshake window for the board's high-latency WiFi, without
   // multiplying that delay through retries.
@@ -1014,10 +1245,7 @@ String MediaManager::fetchAlbumCoverUrl(const char *artist, const char *album,
     HTTPClient http;
     WiFiClientSecure client;
     if (!configureTrustedTlsClient(client)) {
-      if (requestFailed)
-        *requestFailed = true;
-      if (errorDetail)
-        *errorDetail = "TLS clock unavailable";
+      providerError = "iTunes: TLS clock unavailable";
       break;
     }
     if (networkAbortRequested())
@@ -1025,18 +1253,23 @@ String MediaManager::fetchAlbumCoverUrl(const char *artist, const char *album,
     client.setHandshakeTimeout(handshakeTimeoutSeconds);
     client.setTimeout(requestTimeoutMs);
 
-    String searchQuery = String(artist) + " " + String(album);
+    String searchQuery = cleanArtist + " " + cleanAlbum;
     String encodedQuery = urlEncode(searchQuery);
 
     String url = "https://itunes.apple.com/search?term=" + encodedQuery +
                  "&entity=album&limit=1";
 
     if (attempt == 1) {
-      Serial.printf("Fetching URL for: %s - %s\n", artist, album);
+      Serial.printf("  Trying iTunes cover search for: %s - %s\n",
+                    cleanArtist.c_str(), cleanAlbum.c_str());
     } else
       Serial.printf("  Retry #%d...\n", attempt);
 
-    http.begin(client, url);
+    if (!http.begin(client, url)) {
+      providerError = "iTunes: could not start request";
+      client.stop();
+      break;
+    }
 
     // Add headers to mimic a browser
     http.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1045,6 +1278,7 @@ String MediaManager::fetchAlbumCoverUrl(const char *artist, const char *album,
     http.addHeader("Accept", "*/*");
     http.addHeader("Connection", "close");
 
+    http.setConnectTimeout(requestTimeoutMs);
     http.setTimeout(requestTimeoutMs);
 
     int httpCode = http.GET();
@@ -1054,26 +1288,34 @@ String MediaManager::fetchAlbumCoverUrl(const char *artist, const char *album,
     }
 
     if (httpCode == 200) {
-      String payload = http.getString();
+      providerResponded = true;
+      PsramString payload;
+      const bool bodyRead = readHttpResponseToPsram(
+          http, payload, MAX_METADATA_RESPONSE_BYTES,
+          quickMode ? 2500 : 10000);
       if (networkAbortRequested()) {
         http.end();
+        client.stop();
         break;
       }
-      int artworkIndex = payload.indexOf("\"artworkUrl100\":\"");
-      if (artworkIndex > 0) {
-        int startIndex = artworkIndex + 17;
-        int endIndex = payload.indexOf("\"", startIndex);
-        coverUrl = payload.substring(startIndex, endIndex);
+      static constexpr char ARTWORK_FIELD[] = "\"artworkUrl100\":\"";
+      const size_t artworkIndex =
+          bodyRead ? payload.find(ARTWORK_FIELD) : PsramString::npos;
+      if (artworkIndex != PsramString::npos) {
+        const size_t startIndex = artworkIndex + strlen(ARTWORK_FIELD);
+        const size_t endIndex = payload.find('\"', startIndex);
+        if (endIndex != PsramString::npos) {
+          coverUrl = String(payload.c_str() + startIndex)
+                         .substring(0, endIndex - startIndex);
 
-        // Request 240x240 image
-        coverUrl.replace("100x100", "240x240");
-        Serial.printf("  ✓ Found: %s\n", coverUrl.c_str());
+          // Request 240x240 image
+          coverUrl.replace("100x100", "240x240");
+          Serial.printf("  Found iTunes cover: %s\n", coverUrl.c_str());
+        }
       }
       http.end();
       break; // Success!
     } else if (httpCode < 0) {
-      if (requestFailed)
-        *requestFailed = true;
       char tlsErrorText[96] = {0};
       const int tlsError = client.lastError(tlsErrorText,
                                             sizeof(tlsErrorText));
@@ -1081,8 +1323,7 @@ String MediaManager::fetchAlbumCoverUrl(const char *artist, const char *album,
       if (tlsError != 0) {
         detail += " / TLS " + String(tlsError) + " " + String(tlsErrorText);
       }
-      if (errorDetail)
-        *errorDetail = detail;
+      providerError = "iTunes: " + detail;
       Serial.printf("  Cover provider connection error: %d (%s)\n", httpCode,
                     detail.c_str());
       http.end();
@@ -1091,14 +1332,11 @@ String MediaManager::fetchAlbumCoverUrl(const char *artist, const char *album,
       delay(250);
       continue;
     } else {
-      if (requestFailed)
-        *requestFailed = true;
-      if (errorDetail)
-        *errorDetail = "HTTP " + String(httpCode);
+      providerError = "iTunes: HTTP " + String(httpCode);
       ErrorHandler::logError(ERR_CAT_NETWORK,
                              String("iTunes HTTP Error: ") + String(httpCode) +
-                                 " (Query: " + String(artist) + " - " +
-                                 String(album) + ")",
+                                 " (Query: " + cleanArtist + " - " +
+                                  cleanAlbum + ")",
                              "fetchAlbumCoverUrl");
       Serial.printf("  ✗ HTTP Error: %d\n", httpCode);
       http.end();
@@ -1106,12 +1344,23 @@ String MediaManager::fetchAlbumCoverUrl(const char *artist, const char *album,
     delay(quickMode ? 20 : 150);
   }
 
+  // Only describe this as a connection failure if neither provider completed a
+  // valid response. A responsive provider with no match is simply "not found".
+  if (coverUrl.length() == 0 && !providerResponded &&
+      providerError.length() > 0) {
+    if (requestFailed)
+      *requestFailed = true;
+    if (errorDetail)
+      *errorDetail = providerError;
+  }
   return coverUrl;
 }
 
 #include <algorithm>
 
 void MediaManager::sortByArtistOrAuthor() {
+  if (libraryMutex)
+    xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
   switch (currentMode) {
   case MODE_CD:
     std::sort(cdLibrary.begin(), cdLibrary.end(), [](const CD &a, const CD &b) {
@@ -1143,6 +1392,8 @@ void MediaManager::sortByArtistOrAuthor() {
   // REBUILD CACHE after sorting to avoid indexing mismatches
   rebuildNavigationCache(getCurrentItemIndex());
   saveLibrary();
+  if (libraryMutex)
+    xSemaphoreGiveRecursive(libraryMutex);
 }
 
 // ============================================================================
@@ -1154,7 +1405,7 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
                                  bool force) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("fetchLyricsIfNeeded: No WiFi");
-    return LYRICS_NOT_FOUND;
+    return LYRICS_ERROR;
   }
 
   // 1. Check current status in cache first
@@ -1201,15 +1452,23 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
   // PSRAM and are bounded independently from the TLS/internal heap.
   PsramString finalLyrics;
   bool found = false;
+  bool providerReached = false;
+  bool requestFailed = false;
 
   // --- STRATEGY 1: LYRICS.OVH ---
   {
     Serial.println("Using Strategy 1: Lyrics.ovh...");
     HTTPClient http;
     WiFiClientSecure client;
-    configureTrustedTlsClient(client);
-    client.setHandshakeTimeout(10);
-    client.setTimeout(10000);
+    RuntimeDiagnostics::markPhase(
+        "lyrics/ovh-config", BackgroundWorker::getStackHighWaterMark());
+    if (!canStartLyricsTlsRequest() || !configureTrustedTlsClient(client)) {
+      Serial.println("  -> Lyrics.ovh request could not start safely");
+      return LYRICS_ERROR;
+    }
+    const uint32_t requestTimeoutMs = lyricsRequestTimeoutMs();
+    client.setHandshakeTimeout((requestTimeoutMs + 999UL) / 1000UL);
+    client.setTimeout(requestTimeoutMs);
 
     // Schema: https://api.lyrics.ovh/v1/artist/title
     String url = "https://api.lyrics.ovh/v1/" +
@@ -1217,30 +1476,50 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
 
     Serial.printf("Query URL: %s\n", url.c_str());
 
-    http.begin(client, url);
+    if (!http.begin(client, url)) {
+      client.stop();
+      return LYRICS_ERROR;
+    }
+    http.useHTTP10(true);
+    http.setReuse(false);
     http.addHeader("User-Agent", "DigitalLibrarian/1.0");
+    http.addHeader("Connection", "close");
+    http.setConnectTimeout(requestTimeoutMs);
+    http.setTimeout(requestTimeoutMs);
+    RuntimeDiagnostics::markPhase(
+        "lyrics/ovh-get", BackgroundWorker::getStackHighWaterMark());
     int code = http.GET();
 
+    providerReached = code > 0;
     if (code == 200) {
       found = extractLyricsFromResponse(http, "lyrics", nullptr, finalLyrics);
     } else {
+      requestFailed = code <= 0;
       ErrorHandler::logError(ERR_CAT_NETWORK,
                              String("Lyrics.ovh HTTP Error: ") + String(code) +
                                  " (Track: " + trackTitle + ")",
                              "fetchLyricsIfNeeded");
       Serial.printf("  -> Lyrics.ovh HTTP Error %d\n", code);
     }
-    http.end();
+    closeLyricsRequest(http, client);
   }
 
   // --- STRATEGY 2: LRCLIB (Fallback) ---
-  if (!found) {
+  if (!found && !networkAbortRequested() && WiFi.status() == WL_CONNECTED) {
+    if (!waitForLyricsNetworkCooldown(300, 1500))
+      return LYRICS_ERROR;
     Serial.println("  -> Lyrics.ovh failed, trying LRCLib...");
     HTTPClient http;
     WiFiClientSecure client;
-    configureTrustedTlsClient(client);
-    client.setHandshakeTimeout(10);
-    client.setTimeout(10000);
+    RuntimeDiagnostics::markPhase(
+        "lyrics/lrclib-config", BackgroundWorker::getStackHighWaterMark());
+    if (!canStartLyricsTlsRequest() || !configureTrustedTlsClient(client)) {
+      Serial.println("  -> LRCLib request could not start safely");
+      return LYRICS_ERROR;
+    }
+    const uint32_t requestTimeoutMs = lyricsRequestTimeoutMs();
+    client.setHandshakeTimeout((requestTimeoutMs + 999UL) / 1000UL);
+    client.setTimeout(requestTimeoutMs);
 
     String url = "https://lrclib.net/api/get?artist_name=" +
                  urlEncode(albumArtist) + "&track_name=" +
@@ -1249,25 +1528,41 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
 
     Serial.printf("Query URL (Fallback): %s\n", url.c_str());
 
-    http.begin(client, url);
+    if (!http.begin(client, url)) {
+      client.stop();
+      return LYRICS_ERROR;
+    }
+    http.useHTTP10(true);
+    http.setReuse(false);
     http.addHeader("User-Agent", "DigitalLibrarian/1.0");
-    http.setTimeout(10000);
+    http.addHeader("Connection", "close");
+    http.setConnectTimeout(requestTimeoutMs);
+    http.setTimeout(requestTimeoutMs);
 
+    RuntimeDiagnostics::markPhase(
+        "lyrics/lrclib-get", BackgroundWorker::getStackHighWaterMark());
     int code = http.GET();
+    providerReached = providerReached || code > 0;
     if (code == 200) {
       found = extractLyricsFromResponse(http, "plainLyrics", "syncedLyrics",
                                         finalLyrics);
     } else {
+      requestFailed = requestFailed || code <= 0;
       ErrorHandler::logError(ERR_CAT_NETWORK,
                              String("LRCLib HTTP Error: ") + String(code) +
                                  " (Track: " + trackTitle + ")",
                              "fetchLyricsIfNeeded");
       Serial.printf("  -> LRCLib HTTP Error %d\n", code);
     }
-    http.end();
+    closeLyricsRequest(http, client);
   }
 
+  if (networkAbortRequested() || WiFi.status() != WL_CONNECTED)
+    return LYRICS_ERROR;
+
   if (found) {
+    RuntimeDiagnostics::markPhase(
+        "lyrics/file-save", BackgroundWorker::getStackHighWaterMark());
     String filename = "/lyrics/" + String(releaseMbid) + "/" +
                       padTrackNumber(trackNumber) + ".json";
     Serial.printf("Saving lyrics to %s, length: %d\n", filename.c_str(),
@@ -1287,11 +1582,20 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
     tl->tracks[trackIndex].lyrics.status = "cached";
     tl->tracks[trackIndex].lyrics.path = filename.c_str();
     tl->tracks[trackIndex].lyrics.offset = 0;
+    RuntimeDiagnostics::markPhase(
+        "lyrics/index-save", BackgroundWorker::getStackHighWaterMark());
     const bool tracklistSaved = Storage.saveTracklist(releaseMbid, tl);
     Serial.printf("  -> Found & Saved to %s\n", filename.c_str());
     Storage.deleteTracklist(tl);
     return tracklistSaved ? LYRICS_FETCHED_NOW : LYRICS_ERROR;
   } else {
+    // A connection/TLS failure is not evidence that lyrics do not exist. Do
+    // not persist "missing" and do not let a bulk job immediately open yet
+    // another TLS connection after both providers were unreachable.
+    if (!providerReached || requestFailed) {
+      Serial.println("  -> Lyrics providers were not reachable; stopping");
+      return LYRICS_ERROR;
+    }
     tl = Storage.loadTracklist(releaseMbid);
     if (tl && trackIndex >= 0 && trackIndex < (int)tl->tracks.size()) {
       tl->tracks[trackIndex].lyrics.status = "missing";
@@ -1302,6 +1606,223 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
     Serial.println("  -> Not found in any provider");
     return LYRICS_NOT_FOUND;
   }
+}
+
+namespace {
+
+struct LyricsProbeOutcome {
+  int httpCode = 0;
+  int tlsError = 0;
+  uint32_t elapsedMs = 0;
+  String address;
+  String detail;
+};
+
+bool runLyricsDiagnosticProbe(const char *host, const char *url,
+                              const char *primaryField,
+                              const char *fallbackField,
+                              const char *phasePrefix,
+                              LyricsProbeOutcome &outcome) {
+  outcome = LyricsProbeOutcome{};
+  if (networkAbortRequested()) {
+    outcome.detail = "cancelled";
+    return false;
+  }
+
+  IPAddress resolved;
+  RuntimeDiagnostics::markPhase(
+      phasePrefix, BackgroundWorker::getStackHighWaterMark());
+  if (WiFi.hostByName(host, resolved) != 1) {
+    outcome.detail = "DNS failed";
+    return false;
+  }
+  outcome.address = resolved.toString();
+
+  HTTPClient http;
+  WiFiClientSecure client;
+  if (!canStartLyricsTlsRequest()) {
+    outcome.detail = WiFi.status() == WL_CONNECTED
+                         ? "TLS memory guard stopped request"
+                         : "WiFi disconnected";
+    return false;
+  }
+  if (!configureTrustedTlsClient(client)) {
+    outcome.detail = "TLS clock unavailable";
+    return false;
+  }
+
+  client.setHandshakeTimeout(15);
+  client.setTimeout(15000);
+  if (!http.begin(client, url)) {
+    client.stop();
+    outcome.detail = "request setup failed";
+    return false;
+  }
+  http.useHTTP10(true);
+  http.setReuse(false);
+  http.addHeader("User-Agent", "DigitalLibrarian/1.0 diagnostics");
+  http.addHeader("Connection", "close");
+  http.setConnectTimeout(15000);
+  http.setTimeout(15000);
+
+  const uint32_t startedAt = millis();
+  outcome.httpCode = http.GET();
+  outcome.elapsedMs = millis() - startedAt;
+
+  char tlsErrorText[96] = {0};
+  if (outcome.httpCode < 0)
+    outcome.tlsError = client.lastError(tlsErrorText, sizeof(tlsErrorText));
+
+  PsramString lyrics;
+  const bool parsed =
+      outcome.httpCode == HTTP_CODE_OK &&
+      extractLyricsFromResponse(http, primaryField, fallbackField, lyrics);
+
+  if (parsed) {
+    outcome.detail = "OK";
+  } else if (outcome.httpCode == HTTP_CODE_OK) {
+    outcome.detail = lastLyricsResponseError[0]
+                         ? String(lastLyricsResponseError)
+                         : String("response parse failed");
+  } else if (outcome.httpCode < 0) {
+    outcome.detail = HTTPClient::errorToString(outcome.httpCode);
+    if (outcome.tlsError != 0) {
+      outcome.detail += " / TLS " + String(outcome.tlsError);
+      if (tlsErrorText[0])
+        outcome.detail += " " + String(tlsErrorText);
+    }
+  } else {
+    outcome.detail = "HTTP " + String(outcome.httpCode);
+  }
+
+  closeLyricsRequest(http, client);
+  return parsed;
+}
+
+String formatProbeFailure(const char *provider,
+                          const LyricsProbeOutcome &outcome) {
+  String text = String(provider) + ": " + outcome.detail;
+  if (outcome.address.length() > 0)
+    text += " @" + outcome.address;
+  if (outcome.elapsedMs > 0)
+    text += " " + String(outcome.elapsedMs) + "ms";
+  return text;
+}
+
+} // namespace
+
+bool MediaManager::stressTestLyricsTransport(int cycles,
+                                             String &resultMessage) {
+  cycles = constrain(cycles, 1, 20);
+  if (WiFi.status() != WL_CONNECTED) {
+    resultMessage = "No WiFi connection";
+    return false;
+  }
+
+  const char *lrclibProbeUrl =
+      "https://lrclib.net/api/get?artist_name=Coldplay&track_name=Yellow&album_name=Parachutes";
+  const char *lyricsOvhProbeUrl =
+      "https://api.lyrics.ovh/v1/Coldplay/Yellow";
+  uint32_t lowestLargestBlock = UINT32_MAX;
+  int recoveredRetries = 0;
+  int providerFallbacks = 0;
+
+  for (int cycle = 0; cycle < cycles; ++cycle) {
+    if (networkAbortRequested()) {
+      resultMessage = "Stress test cancelled";
+      RuntimeDiagnostics::clearOperation();
+      return false;
+    }
+
+    RuntimeDiagnostics::beginOperation(JOB_DIAGNOSTIC_LYRICS_STRESS,
+                                       cycle + 1, cycles, "LRCLIB probe");
+    BackgroundWorker::reportStatus("TLS stress: cycle " +
+                                   String(cycle + 1) + " of " +
+                                   String(cycles));
+    BackgroundWorker::reportProgress((float)cycle / (float)cycles);
+
+    LyricsProbeOutcome lrclibOutcome;
+    RuntimeDiagnostics::markPhase(
+        "stress/lrclib", BackgroundWorker::getStackHighWaterMark());
+    bool parsed = runLyricsDiagnosticProbe(
+        "lrclib.net", lrclibProbeUrl, "plainLyrics", "syncedLyrics",
+        "stress/lrclib-dns", lrclibOutcome);
+
+    if (!parsed && !networkAbortRequested() &&
+        WiFi.status() == WL_CONNECTED) {
+      BackgroundWorker::reportStatus("Cycle " + String(cycle + 1) +
+                                     ": retrying LRCLIB...");
+      if (!waitForLyricsNetworkCooldown(1000, 3000)) {
+        RuntimeDiagnostics::clearOperation();
+        resultMessage = "Stress test cancelled or WiFi disconnected";
+        return false;
+      }
+      parsed = runLyricsDiagnosticProbe(
+          "lrclib.net", lrclibProbeUrl, "plainLyrics", "syncedLyrics",
+          "stress/lrclib-retry", lrclibOutcome);
+      if (parsed)
+        recoveredRetries++;
+    }
+
+    LyricsProbeOutcome ovhOutcome;
+    if (!parsed && !networkAbortRequested() &&
+        WiFi.status() == WL_CONNECTED) {
+      BackgroundWorker::reportStatus("Cycle " + String(cycle + 1) +
+                                     ": trying Lyrics.ovh...");
+      if (!waitForLyricsNetworkCooldown(1000, 3000)) {
+        RuntimeDiagnostics::clearOperation();
+        resultMessage = "Stress test cancelled or WiFi disconnected";
+        return false;
+      }
+      parsed = runLyricsDiagnosticProbe(
+          "api.lyrics.ovh", lyricsOvhProbeUrl, "lyrics", nullptr,
+          "stress/ovh-dns", ovhOutcome);
+      if (parsed)
+        providerFallbacks++;
+    }
+
+    if (!parsed) {
+      resultMessage = "Cycle " + String(cycle + 1) + " failed. " +
+                      formatProbeFailure("LRCLIB", lrclibOutcome);
+      if (ovhOutcome.detail.length() > 0)
+        resultMessage += " | " + formatProbeFailure("OVH", ovhOutcome);
+      const int32_t rssi = WiFi.RSSI();
+      resultMessage += " | " + WiFi.SSID() + " " + String(rssi) + "dBm";
+      if (rssi <= -75)
+        resultMessage += "; weak signal - select a stronger saved network";
+      RuntimeDiagnostics::clearOperation();
+      return false;
+    }
+    if (!heap_caps_check_integrity_all(true)) {
+      resultMessage = "Heap corruption detected at cycle " +
+                      String(cycle + 1);
+      RuntimeDiagnostics::clearOperation();
+      return false;
+    }
+
+    const uint32_t largest = heap_caps_get_largest_free_block(
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    lowestLargestBlock = std::min(lowestLargestBlock, largest);
+    RuntimeDiagnostics::markPhase(
+        "stress/cycle-done", BackgroundWorker::getStackHighWaterMark());
+    RuntimeDiagnostics::clearOperation();
+    if (cycle + 1 < cycles &&
+        !waitForLyricsNetworkCooldown(1000, 3000)) {
+      resultMessage = "Stress test cancelled or WiFi disconnected";
+      return false;
+    }
+  }
+
+  BackgroundWorker::reportProgress(1.0f);
+  resultMessage = "Passed " + String(cycles) +
+                  " TLS cycles; lowest block " +
+                  String(lowestLargestBlock / 1024) + "K";
+  if (recoveredRetries > 0)
+    resultMessage += "; retries " + String(recoveredRetries);
+  if (providerFallbacks > 0)
+    resultMessage += "; OVH fallback " + String(providerFallbacks);
+  resultMessage += "; WiFi " + String(WiFi.RSSI()) + "dBm";
+  return true;
 }
 
 void fetchAllLyrics(const char *releaseMbid) {
@@ -1319,6 +1840,8 @@ void fetchAllLyrics(const char *releaseMbid) {
 }
 
 void MediaManager::sortByLedIndex() {
+  if (libraryMutex)
+    xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
   switch (currentMode) {
   case MODE_CD:
     std::sort(cdLibrary.begin(), cdLibrary.end(), [](const CD &a, const CD &b) {
@@ -1342,4 +1865,6 @@ void MediaManager::sortByLedIndex() {
   // REBUILD CACHE after sorting to avoid indexing mismatches
   rebuildNavigationCache(getCurrentItemIndex());
   saveLibrary();
+  if (libraryMutex)
+    xSemaphoreGiveRecursive(libraryMutex);
 }

@@ -26,9 +26,9 @@ struct LyricsMetadata {
 
 // --- Track Structure ---
 struct Track {
-  int trackNo;
+  int trackNo = 0;
   PsramString title;
-  unsigned long durationMs;
+  unsigned long durationMs = 0;
   PsramString recordingMbid;
   LyricsMetadata lyrics;
   bool isFavoriteTrack = false; // NEW: Track favorite status
@@ -51,8 +51,8 @@ struct MBRelease {
   String title;
   String artist;
   String genre; // Added to support Discogs genre data
-  int year;
-  bool success;
+  int year = 0;
+  bool success = false;
 };
 
 // --- Lyrics Fetch Result Enum ---
@@ -130,12 +130,12 @@ struct ItemView {
   String title;
   String artistOrAuthor;
   String genre;
-  int year;
+  int year = 0;
   std::vector<int> ledIndices;
   String uniqueID;
   String coverUrl;
   String coverFile;
-  bool favorite;
+  bool favorite = false;
   String notes;
   String codecOrIsbn; // Barcode for CDs, ISBN for Books
 
@@ -149,7 +149,7 @@ struct ItemView {
   String releaseMbid;           // Hidden metadata
   String publisher;             // Hidden metadata
   bool detailsLoaded = false;   // Track if full record is in RAM
-  bool isValid;
+  bool isValid = false;
 };
 
 // Media mode toggle
@@ -191,7 +191,10 @@ struct NavigationCache {
   int cacheCenter; // Center index (cacheSize / 2)
 };
 
-extern NavigationCache navCache;
+extern NavigationCache *navCacheStorage;
+// Preserve the existing value-style cache API while its large backing object
+// is allocated in PSRAM during startup.
+#define navCache (*navCacheStorage)
 
 // --- Settings Externs ---
 extern bool setting_enable_cds;

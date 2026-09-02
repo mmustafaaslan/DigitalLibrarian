@@ -4,6 +4,7 @@
 #include "MediaManager.h"
 #include "NavigationCache.h"
 #include "NetworkManager.h"
+#include "RuntimeDiagnostics.h"
 #include "Storage.h"
 #include "UI_Styles.h"
 #include "Utils.h"
@@ -177,12 +178,17 @@ static void refresh_debug_overlay() {
   else
     snprintf(wifiText, sizeof(wifiText), "offline");
 
-  char text[256];
+  const DiagnosticBreadcrumb previousTrace =
+      RuntimeDiagnostics::getPreviousInterruptedOperation();
+  const bool hasPreviousTrace =
+      RuntimeDiagnostics::hasPreviousInterruptedOperation();
+  char text[320];
   snprintf(text, sizeof(text),
            "DEBUG  INT free %luK  largest %luK\n"
            "Low-water %luK  PSRAM %lu/%luK\n"
-           "Render %lums / %luKpx  Job %s Q%d S%luK\n"
-           "WiFi %s  Reset %d  Up %02lu:%02lu:%02lu",
+           "Render %lums/%luKpx Job %s Q%d BG%luK UI%luK\n"
+           "WiFi %s  Reset %d  Up %02lu:%02lu:%02lu\n"
+           "Prev: %s %d/%d L%luK",
            (unsigned long)(freeInternal / 1024),
            (unsigned long)(largestInternal / 1024),
            (unsigned long)(ESP.getMinFreeHeap() / 1024),
@@ -192,10 +198,17 @@ static void refresh_debug_overlay() {
            (unsigned long)(lvgl_port_get_last_render_pixels() / 1000),
            workerBusy ? "BUSY" : "idle", BackgroundWorker::getQueueSize(),
            (unsigned long)(BackgroundWorker::getStackHighWaterMark() / 1024),
+           (unsigned long)(lvgl_port_get_stack_high_water_mark() / 1024),
            wifiText, boot_reset_reason,
            (unsigned long)(uptimeSeconds / 3600),
            (unsigned long)((uptimeSeconds / 60) % 60),
-           (unsigned long)(uptimeSeconds % 60));
+           (unsigned long)(uptimeSeconds % 60),
+           hasPreviousTrace ? previousTrace.phase : "none",
+           hasPreviousTrace ? previousTrace.itemIndex : 0,
+           hasPreviousTrace ? previousTrace.itemCount : 0,
+           (unsigned long)(hasPreviousTrace
+                               ? previousTrace.largestInternal / 1024
+                               : 0));
   lv_label_set_text(debug_overlay_label, text);
   // Keep diagnostics visible over temporary panels without intercepting touch.
   lv_obj_move_foreground(debug_overlay);
@@ -218,7 +231,7 @@ static void set_debug_overlay_enabled(bool enabled) {
 
   if (!debug_overlay) {
     debug_overlay = lv_obj_create(lv_layer_top());
-    lv_obj_set_size(debug_overlay, 296, 92);
+    lv_obj_set_size(debug_overlay, 296, 108);
     lv_obj_align(debug_overlay, LV_ALIGN_TOP_RIGHT, -8, 72);
     lv_obj_set_style_bg_color(debug_overlay, lv_color_hex(0x090D12), 0);
     lv_obj_set_style_bg_opa(debug_overlay, LV_OPA_90, 0);
@@ -1135,12 +1148,12 @@ static void render_tracklist_page(TracklistBuildState *state) {
 
 static void render_tracklist_ui(int idx, const String &releaseMbid,
                                 TrackList *trackList) {
-  if (!trackList || idx < 0 || idx >= (int)cdLibrary.size()) {
+  ItemView cd = getItemAtRAM(idx);
+  if (!trackList || currentMode != MODE_CD || !cd.isValid) {
     if (trackList)
       Storage.deleteTracklist(trackList);
     return;
   }
-  CD &cd = cdLibrary[idx];
 
   if (tracklist_panel)
     close_tracklist_ui();
@@ -1150,8 +1163,8 @@ static void render_tracklist_ui(int idx, const String &releaseMbid,
   lv_obj_add_flag(tracklist_panel, LV_OBJ_FLAG_HIDDEN);
   prepare_modal_panel(tracklist_panel, 704, 432);
 
-  String tracklistTitle = sanitizeLvglText(String(cd.title.c_str())) + " - " +
-                          sanitizeLvglText(String(cd.artist.c_str()));
+  String tracklistTitle = sanitizeLvglText(cd.title) + " - " +
+                          sanitizeLvglText(cd.artistOrAuthor);
   lv_obj_t *lblTitle =
       create_panel_header(tracklist_panel, tracklistTitle.c_str());
   lv_obj_set_pos(lblTitle, 76, 22);
@@ -1333,7 +1346,8 @@ static void render_tracklist_ui(int idx, const String &releaseMbid,
 }
 
 void show_tracklist_ui(int idx) {
-  if (currentMode != MODE_CD || idx < 0 || idx >= (int)cdLibrary.size())
+  ItemView item = getItemAtRAM(idx);
+  if (currentMode != MODE_CD || !item.isValid)
     return;
   if (tracklist_request_pending)
     return;
@@ -1341,8 +1355,8 @@ void show_tracklist_ui(int idx) {
   // Only copy fields already in RAM here. If the MBID is not loaded yet, the
   // worker uses the unique ID to load the CD detail before opening its track
   // list.
-  const String releaseMbid = cdLibrary[idx].releaseMbid.c_str();
-  const String uniqueId = cdLibrary[idx].uniqueID.c_str();
+  const String releaseMbid = item.releaseMbid;
+  const String uniqueId = item.uniqueID;
   tracklist_request_pending = BackgroundWorker::addJob(
       {JOB_TRACKLIST_LOAD, releaseMbid, idx, uniqueId, nullptr, true});
   if (tracklist_request_pending) {
@@ -1578,7 +1592,12 @@ void setupMainUI() {
   lv_obj_add_event_cb(
       btn_mode,
       [](lv_event_t *e) {
-        saveLibrary();
+        if (BackgroundWorker::isBusy() || BackgroundWorker::getQueueSize() > 0) {
+          show_info_popup("Please Wait",
+                          "Let the current background task finish before switching modes.",
+                          NULL, NULL);
+          return;
+        }
         MediaMode newMode = getOtherMode();
         preferences.begin("settings", false);
         preferences.putInt("mode", (int)newMode);
@@ -1594,7 +1613,7 @@ void setupMainUI() {
         create_panel_header(panel, LV_SYMBOL_REFRESH " SWITCHING MODE");
 
         lv_obj_t *title = lv_label_create(panel);
-        lv_label_set_text(title, "SAVING LIBRARY");
+        lv_label_set_text(title, "SWITCHING MODE");
         lv_obj_set_pos(title, 24, 84);
         lv_obj_add_style(title, &style_section_label, 0);
 
@@ -1972,6 +1991,18 @@ void setupMainUI() {
         bool isBusy = BackgroundWorker::isBusy();
         bool showProgress = BackgroundWorker::shouldShowProgress();
 
+        String favoriteFailureId;
+        bool favoriteAttemptedValue = false;
+        if (BackgroundWorker::takeFavoritePersistenceFailure(
+                favoriteFailureId, favoriteAttemptedValue)) {
+          invalidateNavigationCache();
+          update_item_display();
+          show_info_popup("Favorite Not Saved",
+                          "The SD update failed, so the favorite change was reverted.",
+                          NULL, NULL);
+          return;
+        }
+
         // Saving detail JSON and atomically rewriting the index can take long
         // enough to starve touch when executed inside the SAVE callback. The
         // worker performs that transaction; LVGL only applies the verified
@@ -2088,7 +2119,9 @@ void setupMainUI() {
           const bool cancellable =
               progressJob == JOB_BULK_SYNC ||
               progressJob == JOB_COVER_DOWNLOAD ||
-              progressJob == JOB_LYRICS_FETCH_ALL;
+              progressJob == JOB_WEB_METADATA_ADD ||
+              progressJob == JOB_LYRICS_FETCH_ALL ||
+              progressJob == JOB_DIAGNOSTIC_LYRICS_STRESS;
           progress_modal = lv_obj_create(lv_layer_top());
           lv_obj_set_size(progress_modal, UiLayout::screenW, UiLayout::screenH);
           lv_obj_set_pos(progress_modal, 0, 0);
@@ -2268,7 +2301,8 @@ void setupMainUI() {
           if (completedMessage == "Cancelled")
             completionHandled = true;
 
-          if (completedJob == JOB_COVER_DOWNLOAD) {
+          if (completedJob == JOB_COVER_DOWNLOAD ||
+              completedJob == JOB_COVER_DELETE) {
             if (btn_search)
               lv_obj_clear_state(btn_search, LV_STATE_DISABLED);
             update_item_display();
@@ -2720,6 +2754,7 @@ void btn_favorite_clicked(lv_event_t *e) {
 
   if (!toggled)
     return;
+  invalidateNavigationCache();
 
   if (isFav) {
     lv_label_set_text(label_favorite, LV_SYMBOL_MINUS);
@@ -2749,8 +2784,33 @@ void btn_favorite_clicked(lv_event_t *e) {
 
   String persistenceMode = (mode == MODE_BOOK) ? "book:" : "cd:";
   persistenceMode += isFav ? "1" : "0";
-  BackgroundWorker::addJob({JOB_PERSIST_FAVORITE, uniqueID, idx,
-                            persistenceMode, nullptr, false});
+  if (!BackgroundWorker::addJob({JOB_PERSIST_FAVORITE, uniqueID, idx,
+                                 persistenceMode, nullptr, false})) {
+    if (libraryMutex)
+      xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
+    if (mode == MODE_CD) {
+      for (CD &item : cdLibrary) {
+        if (item.uniqueID == uniqueID.c_str() && item.favorite == isFav) {
+          item.favorite = !isFav;
+          break;
+        }
+      }
+    } else {
+      for (Book &item : bookLibrary) {
+        if (item.uniqueID == uniqueID.c_str() && item.favorite == isFav) {
+          item.favorite = !isFav;
+          break;
+        }
+      }
+    }
+    if (libraryMutex)
+      xSemaphoreGiveRecursive(libraryMutex);
+    invalidateNavigationCache();
+    update_item_display();
+    show_info_popup("Favorite Not Saved",
+                    "The background queue is full. Please try again.", NULL,
+                    NULL);
+  }
 }
 
 void btn_delete_cover_clicked(lv_event_t *e) {
@@ -2769,32 +2829,13 @@ void btn_delete_cover_clicked(lv_event_t *e) {
       [](lv_event_t *e) {
         int idx = getCurrentItemIndex();
         ItemView item = getItemAt(idx);
-        String path = "/covers/" + item.coverFile;
-
-        // 1. Delete from SD
-        if (i2cMutex &&
-            xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(1000)) == pdPASS) {
-          if (sdExpander)
-            sdExpander->digitalWrite(SD_CS, LOW);
-          if (SD.exists(path)) {
-            SD.remove(path);
-          }
-          if (sdExpander)
-            sdExpander->digitalWrite(SD_CS, HIGH);
-          xSemaphoreGiveRecursive(i2cMutex);
+        if (!item.isValid ||
+            !BackgroundWorker::addJob({JOB_COVER_DELETE, item.uniqueID, idx,
+                                       "", nullptr, true})) {
+          show_info_popup("Delete Not Started",
+                          "The background queue is full. Please try again.",
+                          NULL, NULL);
         }
-
-        // 2. Update model
-        ensureItemDetailsLoaded(idx);
-        if (currentMode == MODE_CD) {
-          cdLibrary[idx].coverFile = "";
-          Storage.saveCD(cdLibrary[idx]);
-        } else {
-          bookLibrary[idx].coverFile = "";
-          Storage.saveBook(bookLibrary[idx]);
-        }
-        saveLibrary();
-        update_item_display();
       },
       NULL, NULL);
 }
@@ -2884,27 +2925,15 @@ static void render_search_batch() {
 
   for (int i = search_display_offset; i < end; i++) {
     int libraryIdx = search_matches[i];
-    String labelStr;
-    int itemYear = 0;
-    if (currentMode == MODE_CD && libraryIdx >= 0 &&
-        libraryIdx < (int)cdLibrary.size()) {
-      const CD &item = cdLibrary[libraryIdx];
-      labelStr = sanitizeLvglText(String(item.title.c_str()));
-      labelStr += "  -  ";
-      labelStr += sanitizeLvglText(String(item.artist.c_str()));
-      itemYear = item.year;
-    } else if (currentMode == MODE_BOOK && libraryIdx >= 0 &&
-               libraryIdx < (int)bookLibrary.size()) {
-      const Book &item = bookLibrary[libraryIdx];
-      labelStr = sanitizeLvglText(String(item.title.c_str()));
-      labelStr += "  -  ";
-      labelStr += sanitizeLvglText(String(item.author.c_str()));
-      itemYear = item.year;
-    } else {
+    ItemView item = getItemAtRAM(libraryIdx);
+    if (!item.isValid)
       continue;
-    }
-    if (itemYear > 0)
-      labelStr += "  |  " + String(itemYear);
+    String labelStr;
+    labelStr = sanitizeLvglText(item.title);
+    labelStr += "  -  ";
+    labelStr += sanitizeLvglText(item.artistOrAuthor);
+    if (item.year > 0)
+      labelStr += "  |  " + String(item.year);
     const char *resultIcon = currentMode == MODE_BOOK ? LV_SYMBOL_FILE
                                                       : LV_SYMBOL_AUDIO;
     lv_obj_t *btn = lv_list_add_btn(list_results, resultIcon, labelStr.c_str());
@@ -2952,6 +2981,8 @@ static void sort_search_results() {
     return *left ? 1 : -1;
   };
 
+  if (libraryMutex)
+    xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
   std::sort(search_matches.begin(), search_matches.end(),
             [compare_text_ci](int a, int b) {
     const char *leftTitle = "";
@@ -2995,7 +3026,9 @@ static void sort_search_results() {
       return leftLed < rightLed;
     const int titleOrder = compare_text_ci(leftTitle, rightTitle);
     return titleOrder == 0 ? a < b : titleOrder < 0;
-            });
+  });
+  if (libraryMutex)
+    xSemaphoreGiveRecursive(libraryMutex);
 }
 
 void filter_library(const char *query) {
@@ -3381,7 +3414,24 @@ void load_and_show_cover(String filename) {
     if (sdExpander)
       sdExpander->digitalWrite(SD_CS, LOW);
 
-    File f = SD.open("/covers/" + filename, FILE_READ);
+    const String coverPath = "/covers/" + sanitizeFilename(filename);
+    if (!SD.exists(coverPath)) {
+      const String backupPath = coverPath + ".bak";
+      const String tmpPath = coverPath + ".tmp";
+      if (SD.exists(backupPath)) {
+        SD.rename(backupPath, coverPath);
+        if (SD.exists(tmpPath))
+          SD.remove(tmpPath);
+      } else if (SD.exists(tmpPath)) {
+        File candidate = SD.open(tmpPath, FILE_READ);
+        const bool usable = candidate && candidate.size() > 0;
+        if (candidate)
+          candidate.close();
+        if (usable)
+          SD.rename(tmpPath, coverPath);
+      }
+    }
+    File f = SD.open(coverPath, FILE_READ);
     if (!f) {
       Serial.printf("Failed to open file: %s\n", filename.c_str());
       if (sdExpander)
@@ -3782,7 +3832,7 @@ void show_wifi_config_ui() {
         AppNetworkManager::cancelConnectionAttempts();
         // Startup fallback can leave the radio in AP-only mode. Manual setup
         // must always switch back to station mode before starting an attempt.
-        WiFi.mode(WIFI_STA);
+        AppNetworkManager::prepareStationRadio();
         WiFi.disconnect(false, false);
         WiFi.setAutoReconnect(true);
         WiFi.begin(pending_wifi_ssid.c_str(), pending_wifi_password.c_str());
@@ -3906,9 +3956,16 @@ void show_edit_item_ui(int index) {
 
   switch (currentMode) {
   case MODE_BOOK: {
+    if (libraryMutex)
+      xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
     if (index >= (int)bookLibrary.size())
+      currentEditBook = Book{};
+    else
+      currentEditBook = bookLibrary[index];
+    if (libraryMutex)
+      xSemaphoreGiveRecursive(libraryMutex);
+    if (currentEditBook.uniqueID.empty())
       return;
-    currentEditBook = bookLibrary[index];
     e_uniqueID = currentEditBook.uniqueID.c_str();
     e_barcode = currentEditBook.isbn.c_str();
     e_title = currentEditBook.title.c_str();
@@ -3920,9 +3977,16 @@ void show_edit_item_ui(int index) {
   } break;
   case MODE_CD:
   default: {
+    if (libraryMutex)
+      xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
     if (index >= (int)cdLibrary.size())
+      currentEditCD = CD{};
+    else
+      currentEditCD = cdLibrary[index];
+    if (libraryMutex)
+      xSemaphoreGiveRecursive(libraryMutex);
+    if (currentEditCD.uniqueID.empty())
       return;
-    currentEditCD = cdLibrary[index];
     e_uniqueID = currentEditCD.uniqueID.c_str();
     e_barcode = currentEditCD.barcode.c_str();
     e_title = currentEditCD.title.c_str();
@@ -3985,20 +4049,7 @@ void show_edit_item_ui(int index) {
             edit_item_index >= getItemCount()) // Renamed from edit_item_index
           return;
 
-        String delTitle;
-        switch (currentMode) {
-        case MODE_BOOK:
-          if (edit_item_index < (int)bookLibrary.size()) {
-            delTitle = bookLibrary[edit_item_index].title.c_str();
-          }
-          break;
-        case MODE_CD:
-        default:
-          if (edit_item_index < (int)cdLibrary.size()) {
-            delTitle = cdLibrary[edit_item_index].title.c_str();
-          }
-          break;
-        }
+        String delTitle = getItemTitle(edit_item_index);
 
         String dialogTitle = "DELETE " + getModeName();
         String dialogMessage =
@@ -4011,6 +4062,7 @@ void show_edit_item_ui(int index) {
 
               if (deleteItemAt(edit_item_index)) {
                 Serial.println("Deleted successfully!");
+                invalidateNavigationCache();
                 if (currentCDIndex >= getItemCount())
                   currentCDIndex = getItemCount() - 1;
                 if (currentCDIndex < 0)
@@ -6299,6 +6351,33 @@ void show_settings_ui() {
                 show_info_popup("Error", "Failed to wipe Book data.");
               }
             });
+      },
+      LV_EVENT_CLICKED, NULL);
+
+  // Read-only stress test for the same HTTPS/PSRAM path used by lyrics. It is
+  // deliberately separate from destructive storage tests and never modifies
+  // a CD, tracklist, or cached lyrics file.
+  lv_obj_t *btn_lyrics_stress = lv_btn_create(tab4);
+  lv_obj_set_size(btn_lyrics_stress, 224, 44);
+  lv_obj_align(btn_lyrics_stress, LV_ALIGN_TOP_LEFT, 20, 268);
+  style_action_button(btn_lyrics_stress, &style_secondary_button);
+
+  lv_obj_t *l_lyrics_stress = lv_label_create(btn_lyrics_stress);
+  lv_label_set_text(l_lyrics_stress, LV_SYMBOL_REFRESH " TEST LYRICS x5");
+  lv_obj_center(l_lyrics_stress);
+
+  lv_obj_add_event_cb(
+      btn_lyrics_stress,
+      [](lv_event_t *e) {
+        if (WiFi.status() != WL_CONNECTED) {
+          show_info_popup("WiFi Required",
+                          "Connect before running the lyrics stress test.");
+          return;
+        }
+        const bool queued = BackgroundWorker::addJob(
+            {JOB_DIAGNOSTIC_LYRICS_STRESS, "LRCLIB", 5, "", nullptr, true});
+        if (!queued)
+          show_info_popup("Busy", "Wait for the current task, then retry.");
       },
       LV_EVENT_CLICKED, NULL);
 

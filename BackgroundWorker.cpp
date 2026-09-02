@@ -11,7 +11,9 @@
 #include "BackgroundWorker.h"
 #include "ErrorHandler.h"
 #include "MediaManager.h"
+#include "NavigationCache.h"
 #include "NetworkManager.h"
+#include "RuntimeDiagnostics.h"
 #include "Storage.h"
 #include "Utils.h"
 #include "mode_abstraction.h"
@@ -36,6 +38,14 @@ bool BackgroundWorker::_lastJobSuccess = false;
 uint32_t BackgroundWorker::_coverCompletionSequence = 0;
 bool BackgroundWorker::_lastCoverSuccess = false;
 String BackgroundWorker::_lastCoverMessage = "Not run";
+String BackgroundWorker::_lastCoverItemId = "";
+uint32_t BackgroundWorker::_webAddCompletionSequence = 0;
+bool BackgroundWorker::_lastWebAddSuccess = false;
+String BackgroundWorker::_lastWebAddMessage = "Not run";
+String BackgroundWorker::_lastWebAddRequestCode = "";
+bool BackgroundWorker::_favoriteFailureReady = false;
+String BackgroundWorker::_favoriteFailureItemId = "";
+bool BackgroundWorker::_favoriteFailureAttemptedValue = false;
 ItemView BackgroundWorker::_metadataResult;
 bool BackgroundWorker::_metadataResultReady = false;
 ItemView BackgroundWorker::_itemSaveResult;
@@ -125,7 +135,8 @@ bool BackgroundWorker::addJob(const BackgroundJob &job) {
   const bool interactiveJob =
       job.type == JOB_TRACKLIST_LOAD || job.type == JOB_LYRICS_LOAD_CACHED ||
       job.type == JOB_LYRICS_FETCH_ONE || job.type == JOB_METADATA_LOOKUP ||
-      job.type == JOB_ITEM_SAVE || job.type == JOB_COVER_DOWNLOAD;
+      job.type == JOB_ITEM_SAVE || job.type == JOB_COVER_DOWNLOAD ||
+      job.type == JOB_WEB_METADATA_ADD || job.type == JOB_COVER_DELETE;
   if (interactiveJob && !_jobQueue.empty()) {
     // Touch-driven work should not wait behind maintenance tasks such as track
     // summaries, favorites, or WLED persistence.
@@ -193,6 +204,10 @@ void BackgroundWorker::reportProgress(float progress) {
   setProgress(progress);
 }
 
+void BackgroundWorker::reportStatus(const String &message) {
+  setStatus(message);
+}
+
 void BackgroundWorker::requestCancel() {
   _cancelRequested.store(true, std::memory_order_relaxed);
   setStatus("Cancelling at the next safe checkpoint...");
@@ -228,19 +243,60 @@ bool BackgroundWorker::wasLastJobSuccessful() {
 }
 
 void BackgroundWorker::getLastCoverCompletion(uint32_t &sequence,
-                                              bool &success,
-                                              String &message) {
+                                               bool &success,
+                                               String &message,
+                                               String *itemId) {
   if (!_queueMutex ||
       xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
     sequence = 0;
     success = false;
     message = "Busy";
+    if (itemId)
+      *itemId = "";
     return;
   }
   sequence = _coverCompletionSequence;
   success = _lastCoverSuccess;
   message = _lastCoverMessage;
+  if (itemId)
+    *itemId = _lastCoverItemId;
   xSemaphoreGive(_queueMutex);
+}
+
+void BackgroundWorker::getLastWebAddCompletion(uint32_t &sequence,
+                                               bool &success,
+                                               String &message,
+                                               String *requestCode) {
+  if (!_queueMutex ||
+      xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+    sequence = 0;
+    success = false;
+    message = "Busy";
+    if (requestCode)
+      *requestCode = "";
+    return;
+  }
+  sequence = _webAddCompletionSequence;
+  success = _lastWebAddSuccess;
+  message = _lastWebAddMessage;
+  if (requestCode)
+    *requestCode = _lastWebAddRequestCode;
+  xSemaphoreGive(_queueMutex);
+}
+
+bool BackgroundWorker::takeFavoritePersistenceFailure(String &itemId,
+                                                       bool &attemptedValue) {
+  if (!_queueMutex ||
+      xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    return false;
+  const bool ready = _favoriteFailureReady;
+  if (ready) {
+    itemId = _favoriteFailureItemId;
+    attemptedValue = _favoriteFailureAttemptedValue;
+    _favoriteFailureReady = false;
+  }
+  xSemaphoreGive(_queueMutex);
+  return ready;
 }
 
 bool BackgroundWorker::takeMetadataResult(ItemView &result) {
@@ -386,6 +442,7 @@ void BackgroundWorker::workerTask(void *pvParameters) {
     if (hasJob) {
       bool success = false;
       String resultMsg = "";
+      bool restartAfterCompletion = false;
 
       switch (currentJob.type) {
       case JOB_METADATA_LOOKUP: {
@@ -418,6 +475,53 @@ void BackgroundWorker::workerTask(void *pvParameters) {
           resultMsg = "Metadata found for " + staged.title;
         } else {
           resultMsg = "No metadata was found for that code";
+        }
+      } break;
+
+      case JOB_WEB_METADATA_ADD: {
+        if (WiFi.status() != WL_CONNECTED) {
+          resultMsg = "No WiFi connection. Connect and try again.";
+          break;
+        }
+        setStatus("Looking up " + currentJob.id + "...");
+        setProgress(0.10f);
+        ItemView staged{};
+        success = fetchModeMetadata(currentJob.id, staged);
+        if (!success || isCancellationRequested()) {
+          success = false;
+          resultMsg = isCancellationRequested()
+                          ? "Cancelled"
+                          : "No metadata was found for " + currentJob.id;
+          break;
+        }
+
+        // Barcode providers commonly use the barcode as the initial ID. A
+        // forced duplicate must get its own detail file rather than silently
+        // overwriting or sharing the first copy's cover.
+        if (findItemIndex(staged.uniqueID) >= 0) {
+          staged.uniqueID += "_" + String(millis()) + "_" +
+                             String(esp_random() & 0xFFFF, HEX);
+          staged.coverFile = "";
+        }
+        if (staged.uniqueID.length() == 0)
+          staged.uniqueID = String(millis()) + "_" +
+                            String(esp_random() & 0xFFFF, HEX);
+        if (staged.ledIndices.empty())
+          staged.ledIndices.push_back(getNextLedIndex());
+        staged.detailsLoaded = true;
+        staged.isValid = true;
+
+        setStatus("Saving " + staged.title + "...");
+        setProgress(0.85f);
+        const MediaMode savedMode = currentMode;
+        success = saveItemViewToStorage(staged, savedMode) &&
+                  addItemToLibrary(staged);
+        if (success) {
+          invalidateNavigationCache();
+          setProgress(1.0f);
+          resultMsg = "Added " + staged.title;
+        } else {
+          resultMsg = "Metadata was found but could not be saved";
         }
       } break;
 
@@ -462,6 +566,7 @@ void BackgroundWorker::workerTask(void *pvParameters) {
         int downloadedCount = 0;
         bool persistenceFailed = false;
         bool networkLost = false;
+        bool indexDirty = false;
 
         for (int i = 0; i < total; i++) {
           if (is_sync_stopping || isCancellationRequested()) {
@@ -546,13 +651,17 @@ void BackgroundWorker::workerTask(void *pvParameters) {
                   switch (currentMode) {
                   case MODE_CD:
                     if (i < (int)cdLibrary.size())
-                      if (!Storage.saveCD(cdLibrary[i]))
+                      if (!Storage.saveCD(cdLibrary[i], nullptr, true))
                         persistenceFailed = true;
+                      else
+                        indexDirty = true;
                     break;
                   case MODE_BOOK:
                     if (i < (int)bookLibrary.size())
-                      if (!Storage.saveBook(bookLibrary[i]))
+                      if (!Storage.saveBook(bookLibrary[i], nullptr, true))
                         persistenceFailed = true;
+                      else
+                        indexDirty = true;
                     break;
                   default:
                     break;
@@ -634,13 +743,17 @@ void BackgroundWorker::workerTask(void *pvParameters) {
                   switch (currentMode) {
                   case MODE_CD:
                     if (i < (int)cdLibrary.size())
-                      if (!Storage.saveCD(cdLibrary[i]))
+                      if (!Storage.saveCD(cdLibrary[i], nullptr, true))
                         persistenceFailed = true;
+                      else
+                        indexDirty = true;
                     break;
                   case MODE_BOOK:
                     if (i < (int)bookLibrary.size())
-                      if (!Storage.saveBook(bookLibrary[i]))
+                      if (!Storage.saveBook(bookLibrary[i], nullptr, true))
                         persistenceFailed = true;
+                      else
+                        indexDirty = true;
                     break;
                   default:
                     break;
@@ -656,6 +769,11 @@ void BackgroundWorker::workerTask(void *pvParameters) {
 
           delay(10); // Yield to other operations
         }
+
+        if (indexDirty && !Storage.rewriteIndex(currentMode))
+          persistenceFailed = true;
+        if (indexDirty)
+          invalidateNavigationCache();
 
         const bool cancelled =
             is_sync_stopping || isCancellationRequested();
@@ -675,18 +793,26 @@ void BackgroundWorker::workerTask(void *pvParameters) {
           resultMsg = "No WiFi connection. Connect and try again.";
           break;
         }
-        ItemView item = getItemAtSD(currentJob.index);
+        int itemIndex = currentJob.index;
+        ItemView item = getItemAtSD(itemIndex);
+        if (!item.isValid ||
+            (currentJob.id.length() > 0 && item.uniqueID != currentJob.id)) {
+          itemIndex = findItemIndex(currentJob.id);
+          item = getItemAtSD(itemIndex);
+        }
         if (!item.isValid) {
           resultMsg = "This item is no longer available";
           break;
         }
+        const bool explicitUrl = currentJob.extraData.length() > 0;
 
         // Re-running Cover Search for an item that already has a valid local
         // JPEG needlessly repeats several TLS handshakes and rewrites the same
         // SD file. The cover can still be replaced deliberately by tapping it,
         // deleting it, and searching again.
         bool localCoverReady = false;
-        if (item.coverFile.length() > 4 && sdExpander && i2cMutex &&
+        if (!explicitUrl && item.coverFile.length() > 4 && sdExpander &&
+            i2cMutex &&
             xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(1000)) == pdPASS) {
           sdExpander->digitalWrite(SD_CS, LOW);
           File localCover = SD.open("/covers/" + item.coverFile, FILE_READ);
@@ -710,7 +836,7 @@ void BackgroundWorker::workerTask(void *pvParameters) {
         String uid = item.uniqueID;
         if (uid.length() == 0) {
           uid = String(millis()) + "_" + String(random(9999));
-          setItemID(currentJob.index, uid);
+          setItemID(itemIndex, uid);
         }
         const String fileName =
             getUidPrefix() + sanitizeFilename(uid) + ".jpg";
@@ -720,6 +846,8 @@ void BackgroundWorker::workerTask(void *pvParameters) {
         // persisted provider URL, so try that same URL before asking the
         // provider to discover the album again.
         String url = item.coverUrl;
+        if (explicitUrl)
+          url = currentJob.extraData;
         bool downloaded = false;
         bool replacementFound = false;
         bool lookupConnectionFailed = false;
@@ -730,7 +858,7 @@ void BackgroundWorker::workerTask(void *pvParameters) {
           setStatus("Trying the saved cover for " + item.title + "...");
           setProgress(0.20f);
           downloaded = AppNetworkManager::downloadCoverImage(
-              url, savePath, false, &downloadErrorDetail);
+              url, savePath, false, &downloadErrorDetail, !explicitUrl);
         }
 
         // CD records already carry an exact MusicBrainz release ID. The Cover
@@ -754,7 +882,7 @@ void BackgroundWorker::workerTask(void *pvParameters) {
                                 : "Finding a cover for " + item.title + "...");
           setProgress(0.45f);
           String discoveredUrl = fetchCoverUrlForIndex(
-              currentJob.index, false, &lookupConnectionFailed,
+              itemIndex, false, &lookupConnectionFailed,
               &lookupErrorDetail);
           if (discoveredUrl.length() > 0) {
             replacementFound = true;
@@ -792,43 +920,94 @@ void BackgroundWorker::workerTask(void *pvParameters) {
 
         setStatus("Saving the cover...");
         setProgress(0.90f);
-        setItemCoverUrl(currentJob.index, url);
-        setItemCoverFile(currentJob.index, fileName);
-        ensureItemDetailsLoaded(currentJob.index);
-
-        bool detailSaved = false;
-        if (!libraryMutex ||
-            xSemaphoreTakeRecursive(libraryMutex, pdMS_TO_TICKS(5000)) ==
-                pdPASS) {
-          switch (currentMode) {
-          case MODE_CD:
-            if (currentJob.index >= 0 &&
-                currentJob.index < (int)cdLibrary.size()) {
-              cdLibrary[currentJob.index].coverUrl = url.c_str();
-              cdLibrary[currentJob.index].coverFile = fileName.c_str();
-              detailSaved = Storage.saveCD(cdLibrary[currentJob.index]);
-            }
-            break;
-          case MODE_BOOK:
-            if (currentJob.index >= 0 &&
-                currentJob.index < (int)bookLibrary.size()) {
-              bookLibrary[currentJob.index].coverUrl = url.c_str();
-              bookLibrary[currentJob.index].coverFile = fileName.c_str();
-              detailSaved = Storage.saveBook(bookLibrary[currentJob.index]);
-            }
-            break;
-          default:
-            break;
-          }
-          if (libraryMutex)
-            xSemaphoreGiveRecursive(libraryMutex);
+        ItemView updated = getItemAtSD(itemIndex);
+        if (!updated.isValid)
+          updated = item;
+        updated.coverUrl = url;
+        updated.coverFile = fileName;
+        updated.detailsLoaded = true;
+        success = saveItemViewToStorage(updated, currentMode);
+        if (success) {
+          setItem(itemIndex, updated);
+          invalidateNavigationCache();
         }
-
-        const bool indexSaved = saveLibrary();
-        success = detailSaved && indexSaved;
         setProgress(1.0f);
         resultMsg = success ? "Cover downloaded and saved"
                             : "Cover downloaded, but could not be fully saved";
+      } break;
+
+      case JOB_COVER_DELETE: {
+        int itemIndex = currentJob.index;
+        ItemView original = getItemAtSD(itemIndex);
+        if (!original.isValid || original.uniqueID != currentJob.id) {
+          itemIndex = findItemIndex(currentJob.id);
+          original = getItemAtSD(itemIndex);
+        }
+        if (!original.isValid) {
+          resultMsg = "This item is no longer available";
+          break;
+        }
+
+        setStatus("Updating the cover record...");
+        setProgress(0.25f);
+        ItemView updated = original;
+        updated.coverFile = "";
+        updated.coverUrl = "";
+        const MediaMode savedMode = currentMode;
+        success = saveItemViewToStorage(updated, savedMode,
+                                        original.uniqueID.c_str());
+        if (!success) {
+          resultMsg = "The cover was kept because its record could not be saved";
+          break;
+        }
+
+        setItem(itemIndex, updated);
+        invalidateNavigationCache();
+        setProgress(0.75f);
+
+        // Delete the JPEG only after the metadata transaction is durable. A
+        // failed deletion leaves an unreferenced file, not a broken record.
+        bool imageRemoved = true;
+        const String safeCoverName = sanitizeFilename(original.coverFile);
+        if (safeCoverName.length() > 0) {
+          imageRemoved = false;
+          if (i2cMutex &&
+              xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(2000)) ==
+                  pdPASS) {
+            if (sdExpander)
+              sdExpander->digitalWrite(SD_CS, LOW);
+            const String path = "/covers/" + safeCoverName;
+            imageRemoved = !SD.exists(path) || SD.remove(path);
+            if (sdExpander)
+              sdExpander->digitalWrite(SD_CS, HIGH);
+            xSemaphoreGiveRecursive(i2cMutex);
+          }
+        }
+        if (!imageRemoved)
+          ErrorHandler::logWarn(ERR_CAT_STORAGE,
+                                "Cover metadata cleared; orphan JPEG remains",
+                                "BackgroundWorker::JOB_COVER_DELETE");
+        setProgress(1.0f);
+        resultMsg = imageRemoved ? "Cover deleted"
+                                 : "Cover removed from the record";
+      } break;
+
+      case JOB_BACKUP_IMPORT: {
+        setStatus("Importing backup...");
+        setProgress(0.10f);
+        int itemCount = 0;
+        int tracklistCount = 0;
+        success = Storage.importBackup(currentJob.id.c_str(), itemCount,
+                                       tracklistCount);
+        setProgress(1.0f);
+        if (success) {
+          invalidateNavigationCache();
+          resultMsg = "Imported " + String(itemCount) + " items and " +
+                      String(tracklistCount) + " tracklists";
+          restartAfterCompletion = true;
+        } else {
+          resultMsg = "Backup import failed validation or storage verification";
+        }
       } break;
 
       case JOB_TRACKLIST_LOAD: {
@@ -917,6 +1096,7 @@ void BackgroundWorker::workerTask(void *pvParameters) {
         }
 
         trackTitle = trackList->tracks[currentJob.index].title.c_str();
+        const int trackCount = (int)trackList->tracks.size();
         const bool alreadyCached =
             trackList->tracks[currentJob.index].lyrics.status == "cached";
         if (alreadyCached)
@@ -933,8 +1113,12 @@ void BackgroundWorker::workerTask(void *pvParameters) {
           }
           setStatus("Downloading lyrics for " + trackTitle + "...");
           setProgress(0.20f);
+          RuntimeDiagnostics::beginOperation(
+              JOB_LYRICS_FETCH_ONE, currentJob.index + 1,
+              trackCount, trackTitle.c_str());
           const LyricsResult result = fetchLyricsIfNeeded(
               currentJob.id.c_str(), currentJob.index, false);
+          RuntimeDiagnostics::clearOperation();
           if (result != LYRICS_FETCHED_NOW &&
               result != LYRICS_ALREADY_CACHED) {
             resultMsg = "Lyrics were not found for this track";
@@ -988,26 +1172,49 @@ void BackgroundWorker::workerTask(void *pvParameters) {
             Storage.deleteTracklist(tl);
             tl = nullptr;
             int fetched = 0;
+            bool stoppedForSafety = false;
+            int stoppedAt = 0;
             for (int i = 0; i < trackCount; i++) {
               if (is_sync_stopping || isCancellationRequested())
                 break;
+              if (WiFi.status() != WL_CONNECTED) {
+                stoppedForSafety = true;
+                stoppedAt = i + 1;
+                break;
+              }
               setProgress(trackCount > 0 ? (float)i / trackCount : 0.0f);
               setStatus("Lyrics: track " + String(i + 1) + " of " +
                         String(trackCount));
 
               // This will check cache first, then hit APIs if missing
+              RuntimeDiagnostics::beginOperation(
+                  JOB_LYRICS_FETCH_ALL, i + 1, trackCount,
+                  targetMbid.c_str());
               LyricsResult res =
                   fetchLyricsIfNeeded(targetMbid.c_str(), i, false);
+              RuntimeDiagnostics::clearOperation();
               if (res == LYRICS_FETCHED_NOW || res == LYRICS_ALREADY_CACHED) {
                 fetched++;
+              } else if (res == LYRICS_ERROR) {
+                stoppedForSafety = true;
+                stoppedAt = i + 1;
+                break;
               }
               // Give TLS cleanup and the UI task breathing room between
               // providers/tracks; repeated handshakes otherwise fragment the
               // small internal heap very quickly.
-              delay(250);
+              delay(WiFi.RSSI() <= -75 ? 2500 : 750);
             }
-            resultMsg = "Fetched " + String(fetched) + "/" + String(trackCount);
-            success = true;
+            if (stoppedForSafety) {
+              resultMsg = "Stopped safely at track " + String(stoppedAt) +
+                          "/" + String(trackCount) +
+                          ". Check WiFi or memory, then retry.";
+              success = false;
+            } else {
+              resultMsg = "Fetched " + String(fetched) + "/" +
+                          String(trackCount);
+              success = true;
+            }
           } else {
             resultMsg = "Tracklist missing";
             success = false;
@@ -1041,13 +1248,27 @@ void BackgroundWorker::workerTask(void *pvParameters) {
               setStatus("Lyrics: " + title);
               // Just fetch first 5 tracks in full scan to avoid API ban
               for (int t = 0; t < std::min(trackCount, 5); t++) {
-                fetchLyricsIfNeeded(mbid.c_str(), t, false);
-                delay(100);
+                RuntimeDiagnostics::beginOperation(
+                    JOB_LYRICS_FETCH_ALL, t + 1,
+                    std::min(trackCount, 5), mbid.c_str());
+                const LyricsResult result =
+                    fetchLyricsIfNeeded(mbid.c_str(), t, false);
+                RuntimeDiagnostics::clearOperation();
+                if (result == LYRICS_ERROR ||
+                    WiFi.status() != WL_CONNECTED) {
+                  is_sync_stopping = true;
+                  break;
+                }
+                delay(WiFi.RSSI() <= -75 ? 2500 : 750);
               }
             }
+            if (is_sync_stopping)
+              break;
           }
-          resultMsg = "Scan complete";
-          success = true;
+          resultMsg = is_sync_stopping
+                          ? "Lyrics scan stopped safely. Check WiFi or memory."
+                          : "Scan complete";
+          success = !is_sync_stopping;
         }
       } break;
 
@@ -1058,6 +1279,35 @@ void BackgroundWorker::workerTask(void *pvParameters) {
 
         MediaMode mode = isBook ? MODE_BOOK : MODE_CD;
         success = Storage.updateFavorite(currentJob.id, mode, favorite);
+        if (!success && libraryMutex &&
+            xSemaphoreTakeRecursive(libraryMutex, pdMS_TO_TICKS(1000)) ==
+                pdPASS) {
+          if (mode == MODE_CD) {
+            for (CD &item : cdLibrary) {
+              if (item.uniqueID == currentJob.id.c_str() &&
+                  item.favorite == favorite) {
+                item.favorite = !favorite;
+                break;
+              }
+            }
+          } else {
+            for (Book &item : bookLibrary) {
+              if (item.uniqueID == currentJob.id.c_str() &&
+                  item.favorite == favorite) {
+                item.favorite = !favorite;
+                break;
+              }
+            }
+          }
+          xSemaphoreGiveRecursive(libraryMutex);
+        }
+        if (!success && _queueMutex &&
+            xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          _favoriteFailureReady = true;
+          _favoriteFailureItemId = currentJob.id;
+          _favoriteFailureAttemptedValue = favorite;
+          xSemaphoreGive(_queueMutex);
+        }
         resultMsg = success ? "Favorite saved" : "Favorite save failed";
       } break;
 
@@ -1103,6 +1353,13 @@ void BackgroundWorker::workerTask(void *pvParameters) {
         resultMsg = "Shelf lights synced";
         break;
 
+      case JOB_DIAGNOSTIC_LYRICS_STRESS:
+        setStatus("Preparing lyrics TLS stress test...");
+        success = MediaManager::stressTestLyricsTransport(
+            currentJob.index > 0 ? currentJob.index : 5, resultMsg);
+        RuntimeDiagnostics::clearOperation();
+        break;
+
       default:
         break;
       }
@@ -1111,8 +1368,10 @@ void BackgroundWorker::workerTask(void *pvParameters) {
           (currentJob.type == JOB_METADATA_LOOKUP ||
            currentJob.type == JOB_LYRICS_FETCH_ONE ||
            currentJob.type == JOB_LYRICS_FETCH_ALL ||
+           currentJob.type == JOB_WEB_METADATA_ADD ||
            currentJob.type == JOB_COVER_DOWNLOAD ||
-           currentJob.type == JOB_BULK_SYNC)) {
+           currentJob.type == JOB_BULK_SYNC ||
+           currentJob.type == JOB_DIAGNOSTIC_LYRICS_STRESS)) {
         success = false;
         resultMsg = "Cancelled";
       }
@@ -1128,6 +1387,13 @@ void BackgroundWorker::workerTask(void *pvParameters) {
           _coverCompletionSequence++;
           _lastCoverSuccess = success;
           _lastCoverMessage = resultMsg;
+          _lastCoverItemId = currentJob.id;
+        }
+        if (currentJob.type == JOB_WEB_METADATA_ADD) {
+          _webAddCompletionSequence++;
+          _lastWebAddSuccess = success;
+          _lastWebAddMessage = resultMsg;
+          _lastWebAddRequestCode = currentJob.id;
         }
         if (currentJob.type == JOB_LYRICS_LOAD_CACHED ||
             currentJob.type == JOB_LYRICS_FETCH_ONE) {
@@ -1151,6 +1417,11 @@ void BackgroundWorker::workerTask(void *pvParameters) {
       }
       _cancelRequested.store(false, std::memory_order_relaxed);
       _skipRequested.store(false, std::memory_order_relaxed);
+      if (restartAfterCompletion) {
+        setStatus(resultMsg + ". Restarting...");
+        delay(1500);
+        ESP.restart();
+      }
     } else {
       delay(100); // Wait longer when idle to reduce bus load
     }

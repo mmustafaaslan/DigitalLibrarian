@@ -23,6 +23,7 @@
 #include "MediaManager.h"     // API Clients (MusicBrainz, Google Books)
 #include "NavigationCache.h"  // Smart Caching for Smooth UI
 #include "NetworkManager.h"   // WiFi & Connection Management
+#include "RuntimeDiagnostics.h" // Reboot-surviving operation trace
 #include "Storage.h"          // SD Card Database Operations
 #include "StorageTests.h"     // Integrity Checks on Boot
 #include "UIManager.h"        // LVGL Interface Logic
@@ -34,25 +35,13 @@
 // GLOBAL OBJECTS
 // ========================================
 WebServer server(80);
-File uploadFile;
 SemaphoreHandle_t libraryMutex = NULL;
 SemaphoreHandle_t i2cMutex = NULL;
 SemaphoreHandle_t ledMutex = NULL;
 static bool backupUploadAuthorized = false;
 static bool backupUploadFailed = false;
-static bool backupUploadOwnsSd = false;
 static size_t backupUploadBytes = 0;
 static constexpr size_t MAX_BACKUP_UPLOAD_BYTES = 2 * 1024 * 1024;
-
-void releaseBackupUploadSd() {
-  if (!backupUploadOwnsSd)
-    return;
-  if (sdExpander)
-    sdExpander->digitalWrite(SD_CS, HIGH);
-  if (i2cMutex)
-    xSemaphoreGiveRecursive(i2cMutex);
-  backupUploadOwnsSd = false;
-}
 
 // ========================================
 // HELPER FUNCTIONS
@@ -413,8 +402,12 @@ void setupWebHandlers() {
   // 2. Status API
   server.on("/api/status", HTTP_GET, []() {
     StaticJsonDocument<256> doc;
+    if (libraryMutex)
+      xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
     doc["cdCount"] = cdLibrary.size();
     doc["bookCount"] = bookLibrary.size();
+    if (libraryMutex)
+      xSemaphoreGiveRecursive(libraryMutex);
     doc["currentMode"] = (int)currentMode;
     doc["heap"] = ESP.getFreeHeap();
     doc["uptime"] = millis() / 1000;
@@ -495,7 +488,7 @@ void setupWebHandlers() {
   server.on("/api/job", HTTP_GET, []() {
     if (!requireWebAuth())
       return;
-    DynamicJsonDocument doc(512);
+    DynamicJsonDocument doc(1536);
     doc["busy"] = BackgroundWorker::isBusy();
     doc["queue"] = BackgroundWorker::getQueueSize();
     doc["currentJob"] = (int)BackgroundWorker::getCurrentJobType();
@@ -506,14 +499,70 @@ void setupWebHandlers() {
     uint32_t coverSequence = 0;
     bool coverSuccess = false;
     String coverMessage;
+    String coverItemId;
     BackgroundWorker::getLastCoverCompletion(coverSequence, coverSuccess,
-                                             coverMessage);
+                                             coverMessage, &coverItemId);
     doc["coverSequence"] = coverSequence;
     doc["coverSuccess"] = coverSuccess;
     doc["coverStatus"] = coverMessage;
+    doc["coverItemId"] = coverItemId;
+    uint32_t webAddSequence = 0;
+    bool webAddSuccess = false;
+    String webAddMessage;
+    String webAddCode;
+    BackgroundWorker::getLastWebAddCompletion(webAddSequence, webAddSuccess,
+                                               webAddMessage, &webAddCode);
+    doc["webAddSequence"] = webAddSequence;
+    doc["webAddSuccess"] = webAddSuccess;
+    doc["webAddStatus"] = webAddMessage;
+    doc["webAddCode"] = webAddCode;
+    const DiagnosticBreadcrumb currentTrace =
+        RuntimeDiagnostics::getCurrentOperation();
+    doc["traceActive"] = currentTrace.active != 0;
+    doc["tracePhase"] = currentTrace.phase;
+    doc["traceItem"] = currentTrace.item;
+    doc["traceIndex"] = currentTrace.itemIndex;
+    doc["traceCount"] = currentTrace.itemCount;
+    doc["traceLargestInternal"] = currentTrace.largestInternal;
+    doc["traceWorkerStackWords"] = currentTrace.workerStackWords;
+    doc["previousInterrupted"] =
+        RuntimeDiagnostics::hasPreviousInterruptedOperation();
+    if (RuntimeDiagnostics::hasPreviousInterruptedOperation()) {
+      const DiagnosticBreadcrumb previousTrace =
+          RuntimeDiagnostics::getPreviousInterruptedOperation();
+      doc["previousPhase"] = previousTrace.phase;
+      doc["previousItem"] = previousTrace.item;
+      doc["previousIndex"] = previousTrace.itemIndex;
+      doc["previousCount"] = previousTrace.itemCount;
+      doc["previousLargestInternal"] = previousTrace.largestInternal;
+      doc["previousWorkerStackWords"] = previousTrace.workerStackWords;
+      doc["previousResetReason"] =
+          RuntimeDiagnostics::getPreviousResetReason();
+    }
     String out;
     serializeJson(doc, out);
     server.send(200, "application/json", out);
+  });
+
+  // Non-destructive reproduction of the lyrics TLS/PSRAM path. It performs a
+  // bounded number of read-only LRCLIB requests and can be cancelled from the
+  // normal progress dialog. No library, lyrics, or SD records are changed.
+  server.on("/api/debug/stress/lyrics", HTTP_POST, []() {
+    if (!requireWebAuth())
+      return;
+    if (WiFi.status() != WL_CONNECTED) {
+      server.send(503, "text/plain", "No WiFi connection");
+      return;
+    }
+    const int cycles = constrain(
+        server.hasArg("cycles") ? server.arg("cycles").toInt() : 5, 1, 20);
+    const bool queued = BackgroundWorker::addJob(
+        {JOB_DIAGNOSTIC_LYRICS_STRESS, "LRCLIB", cycles, "", nullptr, true});
+    if (!queued) {
+      server.send(503, "text/plain", "Background queue is busy");
+      return;
+    }
+    server.send(202, "application/json", "{\"status\":\"queued\"}");
   });
 
   // 3. Remote Control API
@@ -1031,76 +1080,31 @@ void setupWebHandlers() {
     html += "    </div>"; // This closing div is for the container, it should
                           // remain.
     html += getWebFooter();
-    html += "</body></html>";
 
     // Client-side Logic (Main App Only)
     html += "<script>";
-    html += "    function processQueue(lines, idx, res, btn) {";
-    html += "       if(idx >= lines.length) {";
-    html += "           btn.innerText = 'Lookup'; btn.disabled = false;";
-    html += "           document.getElementById('barcode').value = '';";
-    html += "           return;";
-    html += "       }";
-    html += "       var code = lines[idx];";
-    html +=
-        "       btn.innerText = 'Processing ' + (idx + 1) + '/' + lines.length "
-        "+ '...';";
-    html += "       var itemDiv = document.createElement('div');";
-    html += "       itemDiv.style.borderBottom = '1px solid #333'; "
-            "itemDiv.style.marginBottom = '10px'; itemDiv.style.paddingBottom "
-            "= '10px';";
-    html += "       itemDiv.innerHTML = '<div>Scanning: <b>' + code + "
-            "'</b>...</div>';";
-    html += "       res.prepend(itemDiv);";
-    html += "       var xhr = new XMLHttpRequest();";
-    html += "       xhr.open('POST', '/api/lookup', true);";
-    html += "       xhr.setRequestHeader('Content-Type','application/x-www-form-urlencoded');";
-    html += "       xhr.onload = function() {";
-    html += "          if(xhr.status === 409) {";
-    html += "             var d = JSON.parse(xhr.responseText);";
-    html += "             if(confirm(`Duplicate found for "
-            "${code}:\\n${d.title}\\nby "
-            "${d.artist}\\n\\nAdd copy anyway?`)) {";
-    html += "                var x2 = new XMLHttpRequest();";
-    html += "                x2.open('POST', '/api/lookup', true);";
-    html += "                x2.setRequestHeader('Content-Type','application/x-www-form-urlencoded');";
-    html += "                x2.onload = function(){ disp(itemDiv, x2, code); "
-            "setTimeout(function(){ processQueue(lines, idx+1, res, btn); }, "
-            "2000); };";
-    html += "                x2.onerror = function(){ "
-            "itemDiv.innerHTML='Error'; setTimeout(function(){ "
-            "processQueue(lines, idx+1, res, btn); }, 2000); "
-            "};";
-    html += "                x2.send('barcode='+encodeURIComponent(code)+'&force=true');";
-    html += "                return;";
-    html += "             } else {";
-    html +=
-        "                itemDiv.innerHTML = '<div>Code: <b>' + code + "
-        "'</b> - <span style=\"color:#888\">Skipped duplicate</span></div>';";
-    html += "                setTimeout(function(){ processQueue(lines, idx+1, "
-            "res, btn); }, 2000);";
-    html += "             }";
-    html += "          } else {";
-    html += "             disp(itemDiv, xhr, code);";
-    html += "             setTimeout(function(){ processQueue(lines, idx+1, "
-            "res, btn); }, 2000);";
-    html += "          }";
-    html += "       };";
-    html += "       xhr.onerror = function() { itemDiv.innerHTML='<div "
-            "style=\"color:red\">Network Error</div>'; setTimeout(function(){ "
-            "processQueue(lines, "
-            "idx+1, res, btn); }, 2000); };";
-    html += "       xhr.send('barcode='+encodeURIComponent(code));";
-    html += "    }";
-    html += "    function disp(el, x, code) {";
-    html += "       if(x.status === 200) {";
-    html += "          var d = JSON.parse(x.responseText);";
-    html += "          el.innerHTML = '<div>Code: <b>' + code + '</b> - <span "
-            "style=\"color:#00ff88\">✅ Added</span> <b>' + d.title + "
-            "'</b></div>';";
-    html += "       } else { el.innerHTML = '<div style=\"color:#f44\">Code: "
-            "<b>' + code + '</b> - ' + x.responseText + '</div>'; }";
-    html += "    }";
+    html += "const pause=ms=>new Promise(r=>setTimeout(r,ms));";
+    html += "function showLine(el,text,ok){el.textContent=text;el.style.color=ok?'#00ff88':'#f44';}";
+    html += "async function waitForWebAdd(after,code){";
+    html += " for(let n=0;n<240;n++){await pause(500);const r=await fetch('/api/job');";
+    html += "  if(!r.ok)throw new Error(await r.text());const j=await r.json();";
+    html += "  if(j.webAddSequence>after&&j.webAddCode===code)return j;}throw new Error('Lookup timed out');}";
+    html += "async function queueLookup(code,force){";
+    html += " const body='barcode='+encodeURIComponent(code)+(force?'&force=true':'');";
+    html += " const r=await fetch('/api/lookup',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});";
+    html += " if(r.status===409){const d=await r.json();return {duplicate:d};}";
+    html += " if(r.status!==202)throw new Error(await r.text());const q=await r.json();return {job:await waitForWebAdd(q.waitAfter,code)};}";
+    html += "async function processQueue(lines,idx,res,btn){";
+    html += " if(idx>=lines.length){btn.innerText='Lookup';btn.disabled=false;document.getElementById('barcode').value='';return;}";
+    html += " const code=lines[idx];btn.innerText='Processing '+(idx+1)+'/'+lines.length+'...';";
+    html += " const itemDiv=document.createElement('div');itemDiv.style.cssText='border-bottom:1px solid #333;margin-bottom:10px;padding-bottom:10px';";
+    html += " itemDiv.textContent='Scanning: '+code+'...';res.prepend(itemDiv);";
+    html += " try{let result=await queueLookup(code,false);";
+    html += "  if(result.duplicate){const d=result.duplicate;const force=confirm('Duplicate found for '+code+':\\n'+d.title+'\\nby '+d.artist+'\\n\\nAdd copy anyway?');";
+    html += "   if(!force){showLine(itemDiv,'Code: '+code+' - Skipped duplicate',true);return processQueue(lines,idx+1,res,btn);}result=await queueLookup(code,true);}";
+    html += "  const j=result.job;showLine(itemDiv,'Code: '+code+' - '+j.webAddStatus,j.webAddSuccess);";
+    html += " }catch(e){showLine(itemDiv,'Code: '+code+' - '+e.message,false);}";
+    html += " await pause(500);processQueue(lines,idx+1,res,btn);}";
     html += "    document.getElementById('scanForm').onsubmit = function(e) {";
     html += "        e.preventDefault();";
     html +=
@@ -1194,7 +1198,9 @@ void setupWebHandlers() {
     html += "</div>";
 
     html += "<script>";
-    html += "document.getElementById('linkForm').onsubmit = function(e) {";
+    html += "const coverPause=ms=>new Promise(r=>setTimeout(r,ms));";
+    html += "async function waitForCover(after,itemId){for(let n=0;n<240;n++){await coverPause(500);const r=await fetch('/api/job');if(!r.ok)throw new Error(await r.text());const j=await r.json();if(j.coverSequence>after&&j.coverItemId===itemId)return j;}throw new Error('Cover download timed out');}";
+    html += "document.getElementById('linkForm').onsubmit = async function(e) {";
     html += "  e.preventDefault();";
     html += "  var url = document.getElementById('url').value.trim();";
     html += "  var tid = document.getElementById('target_id').value.trim();";
@@ -1203,27 +1209,15 @@ void setupWebHandlers() {
     html += "  if(url.length < 5 || tid.length < 1) return;";
     html += "  btn.innerText = 'Downloading...'; btn.disabled = true; "
             "res.style.display = 'none';";
-    html += "  var xhr = new XMLHttpRequest();";
-    html += "  xhr.open('POST', '/api/setcover', true);";
-    html += "  xhr.setRequestHeader('Content-Type','application/x-www-form-urlencoded');";
-    html += "  xhr.onload = function() {";
-    html += "    btn.innerText = 'Update Cover'; btn.disabled = false; "
-            "res.style.display = 'block';";
-    html += "    if (xhr.status === 401) { localStorage.removeItem('web_pin'); "
-            "location.reload(); return; }";
-    html += "    if (xhr.status === 200) {";
-    html += "      res.className = 'result success';";
-    html += "      var data = JSON.parse(xhr.responseText);";
-    html += "      res.innerHTML = `<h2>Cover "
-            "Updated</h2><h3>${data.title}</h3><p>${data.artist}</p><p "
-            "style='margin-top:8px'>${data.year} • ${data.genre}</p>`;";
-    html += "      document.getElementById('url').value = '';";
-    html += "    } else {";
-    html += "      res.className = 'result error'; res.innerText = "
-            "xhr.responseText;";
-    html += "    }";
-    html += "  };";
-    html += "  xhr.send('url='+encodeURIComponent(url)+'&id='+encodeURIComponent(tid));";
+    html += "  try{";
+    html += "    const response=await fetch('/api/setcover',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(url)+'&id='+encodeURIComponent(tid)});";
+    html += "    if(response.status===401){localStorage.removeItem('web_pin');location.reload();return;}";
+    html += "    if(response.status!==202)throw new Error(await response.text());";
+    html += "    const queued=await response.json();const job=await waitForCover(queued.waitAfter,tid);";
+    html += "    res.style.display='block';res.className=job.coverSuccess?'result success':'result error';";
+    html += "    res.textContent=(job.coverSuccess?'Cover updated: ':'Cover failed: ')+queued.title+' - '+job.coverStatus;";
+    html += "    if(job.coverSuccess)document.getElementById('url').value='';";
+    html += "  }catch(err){res.style.display='block';res.className='result error';res.textContent=err.message;}finally{btn.innerText='Update Cover';btn.disabled=false;}";
     html += "};";
     html += "</script>";
 
@@ -1295,33 +1289,27 @@ void setupWebHandlers() {
       item.coverFile = prefix + item.uniqueID + ".jpg";
     }
 
-    // Try download
-    if (AppNetworkManager::downloadCoverImage(url, item.coverFile)) {
-      // Success
-      item.coverUrl = url;
-
-      // Update Target Item
-      setItem(targetIndex, item);
-      saveLibrary();
-
-      // Only refresh screen if we updated the CURRENTLY visible item
-      if (targetIndex == getCurrentItemIndex()) {
-        lvgl_port_lock(-1);
-        load_and_show_cover(item.coverFile);
-        lvgl_port_unlock();
-      }
-
-      StaticJsonDocument<256> doc;
-      doc["title"] = item.title;
-      doc["artist"] = item.artistOrAuthor;
-      doc["year"] = item.year;
-      doc["genre"] = item.genre;
-      String json;
-      serializeJson(doc, json);
-      server.send(200, "application/json", json);
-    } else {
-      server.send(500, "text/plain", "Download Failed");
+    uint32_t waitAfter = 0;
+    bool ignoredSuccess = false;
+    String ignoredMessage;
+    BackgroundWorker::getLastCoverCompletion(waitAfter, ignoredSuccess,
+                                              ignoredMessage);
+    if (!BackgroundWorker::addJob({JOB_COVER_DOWNLOAD, item.uniqueID,
+                                   targetIndex, url, nullptr, true})) {
+      server.send(503, "text/plain", "Background queue is full; try again");
+      return;
     }
+
+    StaticJsonDocument<384> doc;
+    doc["status"] = "queued";
+    doc["waitAfter"] = waitAfter;
+    doc["title"] = item.title;
+    doc["artist"] = item.artistOrAuthor;
+    doc["year"] = item.year;
+    doc["genre"] = item.genre;
+    String json;
+    serializeJson(doc, json);
+    server.send(202, "application/json", json);
   });
 
   // 5. Metadata Lookup API (Updated with Duplicate Check)
@@ -1350,43 +1338,27 @@ void setupWebHandlers() {
       }
     }
 
-    // 2. Lookup & Add
-    ItemView out;
-    if (fetchModeMetadata(code, out)) {
-      // Assign Unique ID
-      // Assign Unique ID if not already set by fetcher
-      if (out.uniqueID.length() == 0) {
-        out.uniqueID = String(millis()) + "_" + String(random(9999));
-      }
-
-      // Assign LED (If not already set by metadata fetcher)
-      if (out.ledIndices.empty()) {
-        out.ledIndices.push_back(getNextLedIndex());
-      }
-
-      // Add
-      if (!addItemToLibrary(out) || !saveLibrary()) {
-        return server.send(500, "text/plain",
-                           "Metadata was found but could not be saved");
-      }
-
-      // Select & Show
-      setCurrentItemIndex(getItemCount() - 1);
-      lvgl_port_lock(-1);
-      update_item_display();
-      lvgl_port_unlock();
-
-      StaticJsonDocument<256> doc;
-      doc["title"] = out.title;
-      doc["artist"] = out.artistOrAuthor;
-      doc["year"] = out.year;
-      doc["genre"] = out.genre;
-      String json;
-      serializeJson(doc, json);
-      server.send(200, "application/json", json);
-    } else {
-      server.send(404, "text/plain", "Not Found");
+    if (code.length() < 4) {
+      server.send(400, "text/plain", "Code is too short");
+      return;
     }
+
+    uint32_t waitAfter = 0;
+    bool ignoredSuccess = false;
+    String ignoredMessage;
+    BackgroundWorker::getLastWebAddCompletion(waitAfter, ignoredSuccess,
+                                               ignoredMessage);
+    if (!BackgroundWorker::addJob({JOB_WEB_METADATA_ADD, code, -1,
+                                   force ? "force" : "", nullptr, true})) {
+      server.send(503, "text/plain", "Background queue is full; try again");
+      return;
+    }
+    StaticJsonDocument<192> doc;
+    doc["status"] = "queued";
+    doc["waitAfter"] = waitAfter;
+    String json;
+    serializeJson(doc, json);
+    server.send(202, "application/json", json);
   });
 
   // 6. Remote Browser (Full Featured)
@@ -1596,15 +1568,14 @@ void setupWebHandlers() {
 
     // 5. Send Rest of SCRIPT (Render logic)
     chunk = "const list = document.getElementById('list');";
+    chunk += "const esc=s=>String(s??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));";
     chunk += "function render(items) {";
     chunk += "  list.innerHTML = '';";
     chunk += "  items.forEach(cd => {";
     chunk += "    const div = document.createElement('div');";
     chunk += "    div.className = 'cd';";
-    chunk +=
-        "    const safeT = cd.title.replace(/\"/g, '&quot;');"; // Extra safety
     chunk += "    div.innerHTML = `<div "
-             "class='cd-info'><h3>${cd.title}</h3><p>${cd.artist}</p></div>";
+             "class='cd-info'><h3>${esc(cd.title)}</h3><p>${esc(cd.artist)}</p></div>";
     chunk += "                     <div class='btn-group'>";
     chunk += "                       <button class='btn-edit' "
              "onclick='event.stopPropagation(); edit(${cd.id})'>EDIT</button>";
@@ -1851,8 +1822,19 @@ void setupWebHandlers() {
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "application/ndjson", ""); // Newline Delimited JSON
 
+    // Snapshot the lightweight RAM records so a worker update cannot invalidate
+    // an iterator while the HTTP response is being streamed.
+    CDVector cdSnapshot;
+    BookVector bookSnapshot;
+    if (libraryMutex)
+      xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
+    cdSnapshot = cdLibrary;
+    bookSnapshot = bookLibrary;
+    if (libraryMutex)
+      xSemaphoreGiveRecursive(libraryMutex);
+
     // Export CDs
-    for (const auto &item : cdLibrary) {
+    for (const auto &item : cdSnapshot) {
       CD fullCD;
       if (Storage.loadCDDetail(item.uniqueID.c_str(), fullCD)) {
         DynamicJsonDocument doc(2048);
@@ -1863,6 +1845,7 @@ void setupWebHandlers() {
         data["genre"] = fullCD.genre.c_str();
         data["year"] = fullCD.year;
         data["uniqueID"] = fullCD.uniqueID.c_str();
+        data["coverUrl"] = fullCD.coverUrl.c_str();
         data["coverFile"] = fullCD.coverFile.c_str();
         data["favorite"] = fullCD.favorite;
         data["notes"] = fullCD.notes.c_str();
@@ -1870,6 +1853,9 @@ void setupWebHandlers() {
         data["trackCount"] = fullCD.trackCount;
         data["totalDurationMs"] = fullCD.totalDurationMs;
         data["releaseMbid"] = fullCD.releaseMbid.c_str();
+        JsonArray cdLeds = data.createNestedArray("ledIndices");
+        for (int led : fullCD.ledIndices)
+          cdLeds.add(led);
 
         // Tracks are stored separately and not included in basic backup
 
@@ -1916,7 +1902,7 @@ void setupWebHandlers() {
     }
 
     // Export Books
-    for (const auto &item : bookLibrary) {
+    for (const auto &item : bookSnapshot) {
       Book fullBook;
       if (Storage.loadBookDetail(item.uniqueID.c_str(), fullBook)) {
         DynamicJsonDocument doc(2048);
@@ -1927,12 +1913,17 @@ void setupWebHandlers() {
         data["genre"] = fullBook.genre.c_str();
         data["year"] = fullBook.year;
         data["uniqueID"] = fullBook.uniqueID.c_str();
+        data["coverUrl"] = fullBook.coverUrl.c_str();
         data["coverFile"] = fullBook.coverFile.c_str();
         data["favorite"] = fullBook.favorite;
         data["notes"] = fullBook.notes.c_str();
         data["isbn"] = fullBook.isbn.c_str();
         data["pageCount"] = fullBook.pageCount;
+        data["currentPage"] = fullBook.currentPage;
         data["publisher"] = fullBook.publisher.c_str();
+        JsonArray bookLeds = data.createNestedArray("ledIndices");
+        for (int led : fullBook.ledIndices)
+          bookLeds.add(led);
 
         String line;
         serializeJson(doc, line);
@@ -1964,137 +1955,16 @@ void setupWebHandlers() {
                                                 : "Unauthorized");
         }
 
-        // 1. Process the saved file
-        if (!libraryMutex ||
-            xSemaphoreTakeRecursive(libraryMutex, pdMS_TO_TICKS(5000)) != pdPASS)
-          return server.send(503, "text/plain", "Library is busy");
-        if (!i2cMutex ||
-            xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(5000)) != pdPASS) {
-          xSemaphoreGiveRecursive(libraryMutex);
-          return server.send(503, "text/plain", "SD card is busy");
+        if (!BackgroundWorker::addJob({JOB_BACKUP_IMPORT, "/restore.jsonl", -1,
+                                       "", nullptr, true})) {
+          return server.send(503, "text/plain",
+                             "Background queue is full; try again");
         }
-        if (sdExpander)
-          sdExpander->digitalWrite(SD_CS, LOW);
-        File file = SD.open("/restore.jsonl", FILE_READ);
-        if (!file) {
-          if (sdExpander)
-            sdExpander->digitalWrite(SD_CS, HIGH);
-          xSemaphoreGiveRecursive(i2cMutex);
-          xSemaphoreGiveRecursive(libraryMutex);
-          return server.send(500, "text/plain", "Restore file missing");
-        }
-
-        int importCount = 0;
-        int tracklistCount = 0;
-
-        while (file.available()) {
-          String line = file.readStringUntil('\n');
-          line.trim();
-          if (line.length() == 0)
-            continue;
-          if (line.length() > 65536) {
-            backupUploadFailed = true;
-            continue;
-          }
-
-          BasicJsonDocument<SpiRamAllocator> doc(65536);
-          DeserializationError error = deserializeJson(doc, line);
-          if (!error) {
-            String type = doc["type"].as<String>();
-            JsonObject data = doc["data"];
-
-            if (type == "cd") {
-              CD cd;
-              cd.title = (const char *)(data["title"] | "");
-              cd.artist = (const char *)(data["artist"] | "");
-              cd.genre = (const char *)(data["genre"] | "");
-              cd.year = data["year"] | 0;
-              cd.uniqueID = (const char *)(data["uniqueID"] | "");
-              cd.coverFile = (const char *)(data["coverFile"] | "");
-              cd.favorite = data["favorite"] | false;
-              cd.notes = (const char *)(data["notes"] | "");
-              cd.barcode = (const char *)(data["barcode"] | "");
-              cd.trackCount = data["trackCount"] | 0;
-              cd.totalDurationMs = data["totalDurationMs"] | 0;
-              cd.releaseMbid = (const char *)(data["releaseMbid"] | "");
-
-              if (cd.uniqueID.length() > 0 && cd.title.length() > 0 &&
-                  Storage.saveCD(cd)) {
-                importCount++;
-              }
-            } else if (type == "tracklist") {
-              String mbid = doc["mbid"] | "";
-              if (mbid.length() > 0) {
-                TrackList tl;
-                tl.releaseMbid = mbid.c_str();
-                tl.cdTitle = (const char *)(data["cdTitle"] | "");
-                tl.cdArtist = (const char *)(data["cdArtist"] | "");
-                tl.fetchedAt = (const char *)(data["fetchedAt"] | "");
-                JsonArray tracks = data["tracks"];
-                for (JsonObject tObj : tracks) {
-                  Track t;
-                  t.trackNo = tObj["trackNo"] | 0;
-                  t.title = (const char *)(tObj["title"] | "");
-                  t.durationMs = tObj["durationMs"] | 0;
-                  t.recordingMbid = (const char *)(tObj["recordingMbid"] | "");
-                  t.isFavoriteTrack = tObj["isFav"] | false;
-
-                  JsonObject lyr = tObj["lyrics"];
-                  t.lyrics.status = (const char *)(lyr["status"] | "unchecked");
-                  t.lyrics.path = (const char *)(lyr["path"] | "");
-                  t.lyrics.fetchedAt = (const char *)(lyr["fetchedAt"] | "");
-                  t.lyrics.lang = (const char *)(lyr["lang"] | "");
-
-                  tl.tracks.push_back(t);
-                }
-                if (Storage.saveTracklist(mbid.c_str(), &tl))
-                  tracklistCount++;
-              }
-            } else if (type == "book") {
-              Book book;
-              book.title = data["title"] | "";
-              book.author = data["author"] | "";
-              book.genre = data["genre"] | "";
-              book.year = data["year"] | 0;
-              book.uniqueID = data["uniqueID"] | "";
-              book.coverFile = data["coverFile"] | "";
-              book.favorite = data["favorite"] | false;
-              book.notes = data["notes"] | "";
-              book.isbn = data["isbn"] | "";
-              book.pageCount = data["pageCount"] | 0;
-              book.publisher = data["publisher"] | "";
-              if (book.uniqueID.length() > 0 && book.title.length() > 0 &&
-                  Storage.saveBook(book)) {
-                importCount++;
-              }
-            }
-          }
-        }
-        file.close();
-        SD.remove("/restore.jsonl");
-        if (sdExpander)
-          sdExpander->digitalWrite(SD_CS, HIGH);
-        xSemaphoreGiveRecursive(i2cMutex);
-        xSemaphoreGiveRecursive(libraryMutex);
-
-        if (backupUploadFailed)
-          return server.send(500, "text/plain",
-                             "Import completed with validation or storage errors");
-
-        server.send(200, "text/html",
-                    "<html><head><meta http-equiv='refresh' "
-                    "content='10;url=/backup'></head>"
-                    "<body "
-                    "style='background:#000;color:#00ff88;font-family:sans-"
-                    "serif;text-align:center;'>"
-                    "<h1>Import Success!</h1><p>Imported " +
-                        String(importCount) + " items and " +
-                        String(tracklistCount) +
-                        " tracklists.</p>"
-                        "<p>Device is restarting to apply "
-                        "changes...</p></body></html>");
-        delay(2000);
-        ESP.restart();
+        server.send(202, "text/html",
+                    "<html><head><meta http-equiv='refresh' content='12;url=/backup'></head>"
+                    "<body style='background:#000;color:#00ff88;font-family:sans-serif;text-align:center;'>"
+                    "<h1>Import started</h1><p>The interface remains responsive while the backup is verified.</p>"
+                    "<p>The device will restart automatically after a successful import.</p></body></html>");
       },
       []() {
         // 2. Upload Handler
@@ -2106,47 +1976,62 @@ void setupWebHandlers() {
           if (!backupUploadAuthorized)
             return;
           if (!i2cMutex || xSemaphoreTakeRecursive(i2cMutex,
-                                                   pdMS_TO_TICKS(5000)) != pdPASS) {
+                                                   pdMS_TO_TICKS(1000)) != pdPASS) {
             backupUploadFailed = true;
             return;
           }
-          backupUploadOwnsSd = true;
           if (sdExpander)
             sdExpander->digitalWrite(SD_CS, LOW);
           if (SD.exists("/restore.jsonl"))
             SD.remove("/restore.jsonl");
-          uploadFile = SD.open("/restore.jsonl", FILE_WRITE);
-          if (!uploadFile)
+          File restore = SD.open("/restore.jsonl", FILE_WRITE);
+          if (!restore)
             backupUploadFailed = true;
+          else
+            restore.close();
+          if (sdExpander)
+            sdExpander->digitalWrite(SD_CS, HIGH);
+          xSemaphoreGiveRecursive(i2cMutex);
         } else if (upload.status == UPLOAD_FILE_WRITE) {
           if (!backupUploadAuthorized || backupUploadFailed)
             return;
           backupUploadBytes += upload.currentSize;
           if (backupUploadBytes > MAX_BACKUP_UPLOAD_BYTES) {
             backupUploadFailed = true;
-            if (uploadFile)
-              uploadFile.close();
-            if (SD.exists("/restore.jsonl"))
-              SD.remove("/restore.jsonl");
             return;
           }
-          if (!uploadFile ||
-              uploadFile.write(upload.buf, upload.currentSize) !=
-                  upload.currentSize)
+          if (!i2cMutex || xSemaphoreTakeRecursive(i2cMutex,
+                                                   pdMS_TO_TICKS(1000)) != pdPASS) {
             backupUploadFailed = true;
-        } else if (upload.status == UPLOAD_FILE_END) {
-          if (uploadFile) {
-            uploadFile.flush();
-            uploadFile.close();
+            return;
           }
-          releaseBackupUploadSd();
+          if (sdExpander)
+            sdExpander->digitalWrite(SD_CS, LOW);
+          File restore = SD.open("/restore.jsonl", FILE_APPEND);
+          if (!restore || restore.write(upload.buf, upload.currentSize) !=
+                              upload.currentSize)
+            backupUploadFailed = true;
+          if (restore) {
+            restore.flush();
+            restore.close();
+          }
+          if (sdExpander)
+            sdExpander->digitalWrite(SD_CS, HIGH);
+          xSemaphoreGiveRecursive(i2cMutex);
+        } else if (upload.status == UPLOAD_FILE_END) {
+          // Each upload chunk is already flushed under a short SD lock.
         } else if (upload.status == UPLOAD_FILE_ABORTED) {
           backupUploadFailed = true;
-          if (uploadFile)
-            uploadFile.close();
-          if (SD.exists("/restore.jsonl"))
-            SD.remove("/restore.jsonl");
-          releaseBackupUploadSd();
+          if (i2cMutex && xSemaphoreTakeRecursive(i2cMutex,
+                                                  pdMS_TO_TICKS(1000)) == pdPASS) {
+            if (sdExpander)
+              sdExpander->digitalWrite(SD_CS, LOW);
+            if (SD.exists("/restore.jsonl"))
+              SD.remove("/restore.jsonl");
+            if (sdExpander)
+              sdExpander->digitalWrite(SD_CS, HIGH);
+            xSemaphoreGiveRecursive(i2cMutex);
+          }
         }
       });
 
@@ -2302,6 +2187,7 @@ void setupWebHandlers() {
             "categories=['NETWORK','STORAGE','API','PARSING','MEMORY','"
             "HARDWARE','SYSTEM'];";
     html += "let autoRefreshInterval=null;";
+    html += "const esc=s=>String(s??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));";
 
     html += "async function loadErrors(){";
     html += "  const res=await fetch('/api/errors');";
@@ -2330,8 +2216,8 @@ void setupWebHandlers() {
     html += "      const badge=level.toLowerCase();";
     html +=
         "      return `<tr><td>${time}</td><td><span class='badge "
-        "${badge}'>${level}</span></td><td>${cat}</td><td>${e.message}</td><td "
-        "style='color:#888;font-size:11px'>${e.context||'-'}</td></tr>`;";
+        "${badge}'>${level}</span></td><td>${cat}</td><td>${esc(e.message)}</td><td "
+        "style='color:#888;font-size:11px'>${esc(e.context||'-')}</td></tr>`;";
     html += "    }).reverse().join('');";
     html += "  }";
     html += "  document.getElementById('lastUpdate').textContent=new "
@@ -2406,6 +2292,7 @@ void setup() {
   Serial.println("[UPLOAD SMOKE TEST] Digital Librarian build 2026-08-31");
   boot_reset_reason = (int)esp_reset_reason();
   Serial.printf("[BOOT] ESP reset reason: %d\n", boot_reset_reason);
+  RuntimeDiagnostics::begin(boot_reset_reason);
   logMemoryUsage("BOOT START");
 
   logMemoryUsage("BOOT START");

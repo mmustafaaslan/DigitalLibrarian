@@ -85,6 +85,43 @@ bool replaceFileWithRollback(const String &tmpPath, const String &path,
   return true;
 }
 
+// A reset can occur between renaming the old file to .bak and promoting the
+// completed .tmp file. Prefer the known-good backup when the canonical file is
+// absent. A .delete.bak is also safe to restore: if deletion had committed, its
+// index row would no longer cause this detail file to be loaded.
+bool recoverInterruptedReplace(const String &path) {
+  if (SD.exists(path))
+    return true;
+
+  const String backupPath = path + ".bak";
+  const String deleteBackupPath = path + ".delete.bak";
+  const String tmpPath = path + ".tmp";
+  String recoveryPath;
+  if (SD.exists(backupPath))
+    recoveryPath = backupPath;
+  else if (SD.exists(deleteBackupPath))
+    recoveryPath = deleteBackupPath;
+  else if (SD.exists(tmpPath)) {
+    File candidate = SD.open(tmpPath, FILE_READ);
+    const bool usable = candidate && candidate.size() > 0;
+    if (candidate)
+      candidate.close();
+    if (usable)
+      recoveryPath = tmpPath;
+  }
+
+  if (recoveryPath.isEmpty() || !SD.rename(recoveryPath, path))
+    return false;
+
+  if (recoveryPath != tmpPath && SD.exists(tmpPath))
+    SD.remove(tmpPath);
+  ErrorHandler::logWarn(ERR_CAT_STORAGE,
+                        String("Recovered interrupted file transaction: ") +
+                            path,
+                        "Storage::recovery");
+  return true;
+}
+
 void rollbackReplacedFile(const String &path, bool hadOriginal) {
   const String backupPath = path + ".bak";
   if (SD.exists(path))
@@ -353,6 +390,7 @@ bool LibrarianStorage::updateFavorite(String uniqueID, MediaMode mode,
   if (!sd)
     return false;
 
+  recoverInterruptedReplace(path);
   File source = SD.open(path, FILE_READ);
   if (!source)
     return false;
@@ -419,6 +457,7 @@ bool LibrarianStorage::loadIndex(MediaMode mode) {
   ScopedSdAccess sd(2000);
   if (!sd)
     return false;
+  recoverInterruptedReplace(path);
   File file = SD.open(path, FILE_READ);
 
   if (!file)
@@ -517,6 +556,7 @@ bool LibrarianStorage::loadCDDetail(String uniqueID, CD &outCD) {
   ScopedSdAccess sd(2000);
   if (!sd)
     return false;
+  recoverInterruptedReplace(path);
   File file = SD.open(path, FILE_READ);
   if (!file)
     return false;
@@ -693,6 +733,7 @@ bool LibrarianStorage::loadBookDetail(String uniqueID, Book &outBook) {
   ScopedSdAccess sd(2000);
   if (!sd)
     return false;
+  recoverInterruptedReplace(path);
   File file = SD.open(path, FILE_READ);
   if (!file)
     return false;
@@ -871,6 +912,7 @@ TrackList *LibrarianStorage::loadTracklist(const char *releaseMbid) {
     if (!sd)
       return nullptr;
 
+    recoverInterruptedReplace(filename);
     File file = SD.open(filename, FILE_READ);
     if (!file)
       return nullptr;
@@ -1059,8 +1101,10 @@ bool LibrarianStorage::loadLyrics(const char *lyricsPath,
       return false;
 
     String resolvedPath = path;
+    recoverInterruptedReplace(resolvedPath);
     if (!SD.exists(resolvedPath) && path.startsWith("/lyrics/")) {
       String rootPath = "/" + String(lyricsPath);
+      recoverInterruptedReplace(rootPath);
       if (SD.exists(rootPath))
         resolvedPath = rootPath;
     }
@@ -1160,4 +1204,184 @@ bool LibrarianStorage::saveLyrics(const char *lyricsPath,
     return false;
   }
   return true;
+}
+
+bool LibrarianStorage::importBackup(const char *path, int &itemCount,
+                                    int &tracklistCount) {
+  itemCount = 0;
+  tracklistCount = 0;
+  if (!path || path[0] == '\0')
+    return false;
+
+  // Copy the upload into PSRAM, then release the shared SD/touch bus before
+  // parsing. The web upload is capped at 2 MiB, so this allocation is bounded.
+  char *contents = nullptr;
+  size_t contentSize = 0;
+  {
+    ScopedSdAccess sd(5000);
+    if (!sd)
+      return false;
+    File file = SD.open(path, FILE_READ);
+    if (!file)
+      return false;
+    contentSize = file.size();
+    if (contentSize == 0 || contentSize > 2 * 1024 * 1024) {
+      file.close();
+      return false;
+    }
+    contents = static_cast<char *>(
+        heap_caps_malloc(contentSize + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!contents) {
+      file.close();
+      return false;
+    }
+    const size_t bytesRead = file.readBytes(contents, contentSize);
+    file.close();
+    if (bytesRead != contentSize) {
+      heap_caps_free(contents);
+      return false;
+    }
+    contents[contentSize] = '\0';
+  }
+
+  bool allValid = true;
+  bool importedCD = false;
+  bool importedBook = false;
+  size_t offset = 0;
+  while (offset < contentSize) {
+    size_t end = offset;
+    while (end < contentSize && contents[end] != '\n' && contents[end] != '\r')
+      end++;
+    const size_t lineLength = end - offset;
+    while (end < contentSize &&
+           (contents[end] == '\n' || contents[end] == '\r'))
+      end++;
+
+    if (lineLength == 0) {
+      offset = end;
+      continue;
+    }
+    if (lineLength > 65536) {
+      allValid = false;
+      offset = end;
+      continue;
+    }
+
+    BasicJsonDocument<SpiRamAllocator> doc(65536);
+    const DeserializationError error =
+        deserializeJson(doc, contents + offset, lineLength);
+    offset = end;
+    if (error) {
+      allValid = false;
+      continue;
+    }
+
+    const char *type = doc["type"] | "";
+    JsonObject data = doc["data"];
+    bool saved = false;
+    if (strcmp(type, "cd") == 0) {
+      CD cd;
+      cd.title = (const char *)(data["title"] | "");
+      cd.artist = (const char *)(data["artist"] | "");
+      cd.genre = (const char *)(data["genre"] | "");
+      cd.year = data["year"] | 0;
+      cd.uniqueID = (const char *)(data["uniqueID"] | "");
+      cd.coverUrl = (const char *)(data["coverUrl"] | "");
+      cd.coverFile = (const char *)(data["coverFile"] | "");
+      cd.favorite = data["favorite"] | false;
+      cd.notes = (const char *)(data["notes"] | "");
+      cd.barcode = (const char *)(data["barcode"] | "");
+      cd.trackCount = data["trackCount"] | 0;
+      cd.totalDurationMs = data["totalDurationMs"] | 0;
+      cd.releaseMbid = (const char *)(data["releaseMbid"] | "");
+      for (int led : data["ledIndices"].as<JsonArray>())
+        cd.ledIndices.push_back(led);
+      if (!cd.uniqueID.empty() && !cd.title.empty()) {
+        saved = saveCD(cd, nullptr, true);
+        importedCD = importedCD || saved;
+      }
+    } else if (strcmp(type, "book") == 0) {
+      Book book;
+      book.title = (const char *)(data["title"] | "");
+      book.author = (const char *)(data["author"] | "");
+      book.genre = (const char *)(data["genre"] | "");
+      book.year = data["year"] | 0;
+      book.uniqueID = (const char *)(data["uniqueID"] | "");
+      book.coverUrl = (const char *)(data["coverUrl"] | "");
+      book.coverFile = (const char *)(data["coverFile"] | "");
+      book.favorite = data["favorite"] | false;
+      book.notes = (const char *)(data["notes"] | "");
+      book.isbn = (const char *)(data["isbn"] | "");
+      book.pageCount = data["pageCount"] | 0;
+      book.currentPage = data["currentPage"] | 0;
+      book.publisher = (const char *)(data["publisher"] | "");
+      for (int led : data["ledIndices"].as<JsonArray>())
+        book.ledIndices.push_back(led);
+      if (!book.uniqueID.empty() && !book.title.empty()) {
+        saved = saveBook(book, nullptr, true);
+        importedBook = importedBook || saved;
+      }
+    } else if (strcmp(type, "tracklist") == 0) {
+      const char *mbid = doc["mbid"] | "";
+      if (mbid[0] != '\0') {
+        TrackList trackList;
+        trackList.releaseMbid = mbid;
+        trackList.cdTitle = (const char *)(data["cdTitle"] | "");
+        trackList.cdArtist = (const char *)(data["cdArtist"] | "");
+        trackList.fetchedAt = (const char *)(data["fetchedAt"] | "");
+        for (JsonObject trackData : data["tracks"].as<JsonArray>()) {
+          Track track;
+          track.trackNo = trackData["trackNo"] | 0;
+          track.title = (const char *)(trackData["title"] | "");
+          track.durationMs = trackData["durationMs"] | 0;
+          track.recordingMbid =
+              (const char *)(trackData["recordingMbid"] | "");
+          track.isFavoriteTrack = !trackData["isFav"].isNull()
+                                      ? (trackData["isFav"] | false)
+                                      : (trackData["isFavoriteTrack"] | false);
+          JsonObject lyrics = trackData["lyrics"];
+          track.lyrics.status = (const char *)(lyrics["status"] | "unchecked");
+          track.lyrics.path = (const char *)(lyrics["path"] | "");
+          track.lyrics.fetchedAt = (const char *)(lyrics["fetchedAt"] | "");
+          track.lyrics.lastTriedAt =
+              (const char *)(lyrics["lastTriedAt"] | "");
+          track.lyrics.lang = (const char *)(lyrics["lang"] | "");
+          track.lyrics.error = (const char *)(lyrics["error"] | "");
+          trackList.tracks.push_back(track);
+        }
+        saved = saveTracklist(mbid, &trackList);
+        if (saved)
+          tracklistCount++;
+      }
+      if (!saved)
+        allValid = false;
+      yield();
+      continue;
+    } else {
+      allValid = false;
+      yield();
+      continue;
+    }
+
+    if (saved)
+      itemCount++;
+    else
+      allValid = false;
+    yield();
+  }
+  heap_caps_free(contents);
+
+  // Each imported detail transaction updates its in-memory index. Commit each
+  // affected index once, rather than once per record.
+  if (importedCD && !rewriteIndex(MODE_CD))
+    allValid = false;
+  if (importedBook && !rewriteIndex(MODE_BOOK))
+    allValid = false;
+
+  {
+    ScopedSdAccess sd(2000);
+    if (sd && SD.exists(path) && !SD.remove(path))
+      allValid = false;
+  }
+  return allValid && (itemCount > 0 || tracklistCount > 0);
 }
