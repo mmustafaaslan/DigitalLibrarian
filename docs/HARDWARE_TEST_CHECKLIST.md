@@ -38,7 +38,7 @@ problems.
 
 ## Web test
 
-1. Open `http://digitallibrarian.local/browse` in a private browser window.
+1. Open `http://mylibrary.local/browse` (or the configured mDNS name shown on the device) in a private browser window.
    Confirm the library is not visible before login.
 2. Log in once, then visit Browse, Scanner, Covers, Backup, Manual, and Errors.
    Confirm the PIN is not added to the browser URL.

@@ -498,7 +498,7 @@ String escapeJSON(String s) {
       out += "\\t";
     else if (c == '`')
       out += "\\`";
-    else if (c >= 0 && (unsigned char)c <= 0x1f) {
+    else if ((unsigned char)c <= 0x1f) {
       // Skip control chars
     } else {
       out += c;

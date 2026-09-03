@@ -4,6 +4,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <esp_heap_caps.h>
+#include <TJpg_Decoder.h>
 #include <queue>
 #include <utility>
 
@@ -29,6 +30,7 @@ bool BackgroundWorker::_busy = false;
 bool BackgroundWorker::_showProgress = false;
 JobType BackgroundWorker::_currentJobType = JOB_NONE;
 String BackgroundWorker::_statusMsg = "Idle";
+uint32_t BackgroundWorker::_statusRevision = 1;
 float BackgroundWorker::_progress = 0.0f;
 std::atomic<bool> BackgroundWorker::_cancelRequested{false};
 std::atomic<bool> BackgroundWorker::_skipRequested{false};
@@ -46,6 +48,22 @@ String BackgroundWorker::_lastWebAddRequestCode = "";
 bool BackgroundWorker::_favoriteFailureReady = false;
 String BackgroundWorker::_favoriteFailureItemId = "";
 bool BackgroundWorker::_favoriteFailureAttemptedValue = false;
+bool BackgroundWorker::_trackFavoriteFailureReady = false;
+String BackgroundWorker::_trackFavoriteFailureMbid = "";
+int BackgroundWorker::_trackFavoriteFailureIndex = -1;
+bool BackgroundWorker::_trackFavoriteFailureAttemptedValue = false;
+bool BackgroundWorker::_coverRenderCompletionReady = false;
+bool BackgroundWorker::_coverRenderCompletionSuccess = false;
+String BackgroundWorker::_coverRenderCompletionMessage = "";
+String BackgroundWorker::_coverRenderFilename = "";
+uint16_t *BackgroundWorker::_coverRenderPixels = nullptr;
+bool BackgroundWorker::_maintenanceCompletionReady = false;
+JobType BackgroundWorker::_maintenanceCompletionType = JOB_NONE;
+bool BackgroundWorker::_maintenanceCompletionSuccess = false;
+String BackgroundWorker::_maintenanceCompletionMessage = "";
+int BackgroundWorker::_maintenanceCompletionIndex = -1;
+MediaMode BackgroundWorker::_maintenanceCompletionMode = MODE_CD;
+String BackgroundWorker::_maintenanceCompletionData = "";
 ItemView BackgroundWorker::_metadataResult;
 bool BackgroundWorker::_metadataResultReady = false;
 ItemView BackgroundWorker::_itemSaveResult;
@@ -72,6 +90,195 @@ String BackgroundWorker::_itemDetailCompletionMessage = "";
 int BackgroundWorker::_itemDetailResultIndex = -1;
 MediaMode BackgroundWorker::_itemDetailResultMode = MODE_CD;
 String BackgroundWorker::_itemDetailResultId = "";
+
+namespace {
+constexpr size_t COVER_PIXEL_COUNT = 240 * 240;
+constexpr size_t MAX_RENDER_COVER_BYTES = 2 * 1024 * 1024;
+uint16_t *coverDecodeTarget = nullptr;
+uint16_t coverDecodeWidth = 0;
+uint16_t coverDecodeHeight = 0;
+
+void scaleCoverToViewport(const uint16_t *source, uint16_t sourceWidth,
+                          uint16_t sourceHeight, uint16_t *destination) {
+  if (!source || !destination || sourceWidth == 0 || sourceHeight == 0)
+    return;
+
+  // Scale to contain: square artwork fills the viewport, while uncommon
+  // rectangular artwork keeps its aspect ratio and is letterboxed.
+  uint16_t targetWidth = 240;
+  uint16_t targetHeight = 240;
+  if (sourceWidth > sourceHeight) {
+    targetHeight = std::max<uint16_t>(
+        1, static_cast<uint32_t>(sourceHeight) * 240 / sourceWidth);
+  } else if (sourceHeight > sourceWidth) {
+    targetWidth = std::max<uint16_t>(
+        1, static_cast<uint32_t>(sourceWidth) * 240 / sourceHeight);
+  }
+
+  const uint16_t offsetX = (240 - targetWidth) / 2;
+  const uint16_t offsetY = (240 - targetHeight) / 2;
+  for (uint16_t y = 0; y < targetHeight; ++y) {
+    const uint16_t sourceY =
+        std::min<uint16_t>(sourceHeight - 1,
+                           static_cast<uint32_t>(y) * sourceHeight /
+                               targetHeight);
+    uint16_t *outputRow = destination + (offsetY + y) * 240 + offsetX;
+    const uint16_t *sourceRow = source + sourceY * 240;
+    for (uint16_t x = 0; x < targetWidth; ++x) {
+      const uint16_t sourceX =
+          std::min<uint16_t>(sourceWidth - 1,
+                             static_cast<uint32_t>(x) * sourceWidth /
+                                 targetWidth);
+      outputRow[x] = sourceRow[sourceX];
+    }
+    if ((y & 0x0f) == 0)
+      delay(1);
+  }
+}
+
+bool renderCoverFromStorage(const String &filename, uint16_t *&pixels,
+                            String &message) {
+  pixels = static_cast<uint16_t *>(heap_caps_malloc(
+      COVER_PIXEL_COUNT * sizeof(uint16_t),
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!pixels) {
+    message = "Not enough PSRAM to render the cover";
+    return false;
+  }
+  std::fill_n(pixels, COVER_PIXEL_COUNT, static_cast<uint16_t>(0x3186));
+
+  const String path = "/covers/" + sanitizeFilename(filename);
+  uint8_t *jpeg = nullptr;
+  size_t jpegSize = 0;
+  const bool busLocked =
+      !i2cMutex ||
+      xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(2000)) == pdPASS;
+  if (!busLocked) {
+    heap_caps_free(pixels);
+    pixels = nullptr;
+    message = "The SD card is busy";
+    return false;
+  }
+
+  if (sdExpander)
+    sdExpander->digitalWrite(SD_CS, LOW);
+  if (!SD.exists(path)) {
+    const String backupPath = path + ".bak";
+    const String temporaryPath = path + ".tmp";
+    if (SD.exists(backupPath)) {
+      SD.rename(backupPath, path);
+      if (SD.exists(temporaryPath))
+        SD.remove(temporaryPath);
+    } else if (SD.exists(temporaryPath)) {
+      File candidate = SD.open(temporaryPath, FILE_READ);
+      const bool usable = candidate && candidate.size() > 0;
+      if (candidate)
+        candidate.close();
+      if (usable)
+        SD.rename(temporaryPath, path);
+    }
+  }
+  File file = SD.open(path, FILE_READ);
+  if (file) {
+    jpegSize = file.size();
+    if (jpegSize > 0 && jpegSize <= MAX_RENDER_COVER_BYTES)
+      jpeg = static_cast<uint8_t *>(heap_caps_malloc(
+          jpegSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (jpeg) {
+      size_t offset = 0;
+      while (offset < jpegSize) {
+        const size_t amount = std::min<size_t>(4096, jpegSize - offset);
+        const int count = file.read(jpeg + offset, amount);
+        if (count <= 0)
+          break;
+        offset += static_cast<size_t>(count);
+        delay(1);
+      }
+      if (offset != jpegSize) {
+        heap_caps_free(jpeg);
+        jpeg = nullptr;
+      }
+    }
+    file.close();
+  }
+  if (sdExpander)
+    sdExpander->digitalWrite(SD_CS, HIGH);
+  if (i2cMutex)
+    xSemaphoreGiveRecursive(i2cMutex);
+
+  if (!jpeg) {
+    heap_caps_free(pixels);
+    pixels = nullptr;
+    message = jpegSize > MAX_RENDER_COVER_BYTES
+                  ? "Cover is larger than 2 MB"
+                  : "Cover file could not be read";
+    return false;
+  }
+
+  uint16_t width = 0;
+  uint16_t height = 0;
+  TJpgDec.setSwapBytes(false);
+  TJpgDec.getJpgSize(&width, &height, jpeg, jpegSize);
+  if (width == 0 || height == 0 || width > 1920 || height > 1920) {
+    heap_caps_free(jpeg);
+    heap_caps_free(pixels);
+    pixels = nullptr;
+    message = "Cover dimensions are invalid or too large";
+    return false;
+  }
+  uint8_t scale = 1;
+  while (scale < 8 &&
+         (width / scale > 240 || height / scale > 240))
+    scale *= 2;
+  uint16_t *decodedPixels = static_cast<uint16_t *>(heap_caps_calloc(
+      COVER_PIXEL_COUNT, sizeof(uint16_t),
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!decodedPixels) {
+    heap_caps_free(jpeg);
+    heap_caps_free(pixels);
+    pixels = nullptr;
+    message = "Not enough PSRAM to decode the cover";
+    return false;
+  }
+
+  TJpgDec.setJpgScale(scale);
+  TJpgDec.setCallback(tjpg_output);
+  coverDecodeTarget = decodedPixels;
+  coverDecodeWidth = 0;
+  coverDecodeHeight = 0;
+  const JRESULT result = TJpgDec.drawJpg(0, 0, jpeg, jpegSize);
+  coverDecodeTarget = nullptr;
+  heap_caps_free(jpeg);
+
+  if (result != JDR_OK || coverDecodeWidth == 0 || coverDecodeHeight == 0) {
+    heap_caps_free(decodedPixels);
+    heap_caps_free(pixels);
+    pixels = nullptr;
+    message = "Cover JPEG could not be decoded";
+    return false;
+  }
+  scaleCoverToViewport(decodedPixels, coverDecodeWidth, coverDecodeHeight,
+                       pixels);
+  heap_caps_free(decodedPixels);
+  message = "Cover ready";
+  return true;
+}
+} // namespace
+
+bool tjpg_output(int16_t x, int16_t y, uint16_t w, uint16_t h,
+                 uint16_t *bitmap) {
+  if (!coverDecodeTarget || !bitmap || x >= 240 || y >= 240)
+    return false;
+  const int16_t outWidth = std::min<int16_t>(w, 240 - x);
+  const int16_t outHeight = std::min<int16_t>(h, 240 - y);
+  for (int16_t row = 0; row < outHeight; ++row) {
+    memcpy(&coverDecodeTarget[(y + row) * 240 + x], &bitmap[row * w],
+           outWidth * sizeof(uint16_t));
+  }
+  coverDecodeWidth = std::max<uint16_t>(coverDecodeWidth, x + outWidth);
+  coverDecodeHeight = std::max<uint16_t>(coverDecodeHeight, y + outHeight);
+  return true;
+}
 
 void BackgroundWorker::begin() {
   if (_taskHandle)
@@ -147,7 +354,9 @@ bool BackgroundWorker::addJob(const BackgroundJob &job) {
       job.type == JOB_LYRICS_FETCH_ONE || job.type == JOB_METADATA_LOOKUP ||
       job.type == JOB_ITEM_SAVE || job.type == JOB_COVER_DOWNLOAD ||
       job.type == JOB_WEB_METADATA_ADD || job.type == JOB_COVER_DELETE ||
-      job.type == JOB_ITEM_DETAIL_LOAD;
+      job.type == JOB_ITEM_DETAIL_LOAD || job.type == JOB_COVER_RENDER ||
+      job.type == JOB_LIBRARY_RELOAD || job.type == JOB_ITEM_DELETE ||
+      job.type == JOB_LIBRARY_WIPE;
   if (interactiveJob && !_jobQueue.empty()) {
     // Touch-driven work should not wait behind maintenance tasks such as track
     // summaries, favorites, or WLED persistence.
@@ -200,6 +409,13 @@ String BackgroundWorker::getStatusMessage() {
   if (!_queueMutex || xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
     return "Working...";
   const String value = _statusMsg;
+  xSemaphoreGive(_queueMutex);
+  return value;
+}
+uint32_t BackgroundWorker::getStatusRevision() {
+  if (!_queueMutex || xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    return 0;
+  const uint32_t value = _statusRevision;
   xSemaphoreGive(_queueMutex);
   return value;
 }
@@ -305,6 +521,70 @@ bool BackgroundWorker::takeFavoritePersistenceFailure(String &itemId,
     itemId = _favoriteFailureItemId;
     attemptedValue = _favoriteFailureAttemptedValue;
     _favoriteFailureReady = false;
+  }
+  xSemaphoreGive(_queueMutex);
+  return ready;
+}
+
+bool BackgroundWorker::takeTrackFavoritePersistenceFailure(
+    String &releaseMbid, int &trackIndex, bool &attemptedValue) {
+  if (!_queueMutex ||
+      xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    return false;
+  const bool ready = _trackFavoriteFailureReady;
+  if (ready) {
+    releaseMbid = _trackFavoriteFailureMbid;
+    trackIndex = _trackFavoriteFailureIndex;
+    attemptedValue = _trackFavoriteFailureAttemptedValue;
+    _trackFavoriteFailureReady = false;
+    _trackFavoriteFailureMbid = "";
+    _trackFavoriteFailureIndex = -1;
+  }
+  xSemaphoreGive(_queueMutex);
+  return ready;
+}
+
+bool BackgroundWorker::takeCoverRenderCompletion(bool &success,
+                                                  String &message,
+                                                  String &filename,
+                                                  uint16_t *&pixelBuffer) {
+  if (!_queueMutex ||
+      xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    return false;
+  const bool ready = _coverRenderCompletionReady;
+  if (ready) {
+    success = _coverRenderCompletionSuccess;
+    message = _coverRenderCompletionMessage;
+    filename = _coverRenderFilename;
+    pixelBuffer = _coverRenderPixels;
+    _coverRenderPixels = nullptr;
+    _coverRenderCompletionReady = false;
+    _coverRenderCompletionMessage = "";
+    _coverRenderFilename = "";
+  }
+  xSemaphoreGive(_queueMutex);
+  return ready;
+}
+
+bool BackgroundWorker::takeMaintenanceCompletion(
+    JobType &type, bool &success, String &message, int &itemIndex,
+    MediaMode &mode, String &requestData) {
+  if (!_queueMutex ||
+      xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    return false;
+  const bool ready = _maintenanceCompletionReady;
+  if (ready) {
+    type = _maintenanceCompletionType;
+    success = _maintenanceCompletionSuccess;
+    message = _maintenanceCompletionMessage;
+    itemIndex = _maintenanceCompletionIndex;
+    mode = _maintenanceCompletionMode;
+    requestData = _maintenanceCompletionData;
+    _maintenanceCompletionReady = false;
+    _maintenanceCompletionType = JOB_NONE;
+    _maintenanceCompletionMessage = "";
+    _maintenanceCompletionIndex = -1;
+    _maintenanceCompletionData = "";
   }
   xSemaphoreGive(_queueMutex);
   return ready;
@@ -429,7 +709,10 @@ bool BackgroundWorker::takeItemDetailCompletion(bool &success,
 
 void BackgroundWorker::setStatus(const String &message) {
   if (_queueMutex && xSemaphoreTake(_queueMutex, portMAX_DELAY) == pdTRUE) {
-    _statusMsg = message;
+    if (_statusMsg != message) {
+      _statusMsg = message;
+      _statusRevision++;
+    }
     xSemaphoreGive(_queueMutex);
   }
 }
@@ -529,6 +812,100 @@ void BackgroundWorker::workerTask(void *pvParameters) {
         setProgress(success ? 1.0f : 0.0f);
         resultMsg = success ? "Item details loaded"
                             : "Item details could not be loaded from SD";
+      } break;
+
+      case JOB_COVER_RENDER: {
+        setStatus("Preparing cover...");
+        uint16_t *pixels = nullptr;
+        success = renderCoverFromStorage(currentJob.id, pixels, resultMsg);
+        if (_queueMutex &&
+            xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          if (_coverRenderPixels)
+            heap_caps_free(_coverRenderPixels);
+          _coverRenderPixels = pixels;
+          _coverRenderFilename = currentJob.id;
+          pixels = nullptr;
+          xSemaphoreGive(_queueMutex);
+        }
+        if (pixels)
+          heap_caps_free(pixels);
+      } break;
+
+      case JOB_LIBRARY_RELOAD: {
+        setStatus("Reloading the library index...");
+        setProgress(0.15f);
+        success = Storage.loadIndex(MODE_CD);
+        setProgress(0.50f);
+        success = Storage.loadIndex(MODE_BOOK) && success;
+        if (success) {
+          syncLibraryFromStorage();
+          invalidateNavigationCache();
+          setProgress(1.0f);
+          resultMsg = "Library reloaded from the SD card";
+        } else {
+          resultMsg = "The library index could not be read safely";
+        }
+      } break;
+
+      case JOB_ITEM_DELETE: {
+        const MediaMode requestedMode =
+            currentJob.extraData == "book" ? MODE_BOOK : MODE_CD;
+        setStatus(requestedMode == MODE_BOOK ? "Deleting book from SD..."
+                                             : "Deleting CD from SD...");
+        setProgress(0.20f);
+        success = Storage.deleteItem(currentJob.id, requestedMode);
+        if (success && libraryMutex &&
+            xSemaphoreTakeRecursive(libraryMutex, pdMS_TO_TICKS(1000)) ==
+                pdPASS) {
+          if (requestedMode == MODE_BOOK) {
+            auto found = std::find_if(
+                bookLibrary.begin(), bookLibrary.end(),
+                [&](const Book &item) {
+                  return item.uniqueID == currentJob.id.c_str();
+                });
+            if (found != bookLibrary.end())
+              bookLibrary.erase(found);
+          } else {
+            auto found = std::find_if(
+                cdLibrary.begin(), cdLibrary.end(),
+                [&](const CD &item) {
+                  return item.uniqueID == currentJob.id.c_str();
+                });
+            if (found != cdLibrary.end())
+              cdLibrary.erase(found);
+          }
+          xSemaphoreGiveRecursive(libraryMutex);
+          invalidateNavigationCache();
+        } else if (success) {
+          success = false;
+        }
+        setProgress(success ? 1.0f : 0.0f);
+        resultMsg = success ? "Item deleted"
+                            : "The item could not be removed from storage";
+      } break;
+
+      case JOB_LIBRARY_WIPE: {
+        const MediaMode requestedMode =
+            currentJob.extraData == "book" ? MODE_BOOK : MODE_CD;
+        setStatus(requestedMode == MODE_BOOK ? "Wiping book data from SD..."
+                                             : "Wiping CD data from SD...");
+        setProgress(0.10f);
+        success = Storage.wipeLibrary(requestedMode);
+        if (success && libraryMutex &&
+            xSemaphoreTakeRecursive(libraryMutex, pdMS_TO_TICKS(1000)) ==
+                pdPASS) {
+          if (requestedMode == MODE_BOOK)
+            bookLibrary.clear();
+          else
+            cdLibrary.clear();
+          xSemaphoreGiveRecursive(libraryMutex);
+          invalidateNavigationCache();
+        } else if (success) {
+          success = false;
+        }
+        setProgress(success ? 1.0f : 0.0f);
+        resultMsg = success ? "Library data wiped"
+                            : "Library data could not be wiped";
       } break;
 
       case JOB_METADATA_LOOKUP: {
@@ -648,6 +1025,7 @@ void BackgroundWorker::workerTask(void *pvParameters) {
           break;
         }
         is_sync_stopping = false;
+        const MediaMode syncMode = currentMode;
         int total = getItemCount();
         int downloadedCount = 0;
         bool persistenceFailed = false;
@@ -671,27 +1049,58 @@ void BackgroundWorker::workerTask(void *pvParameters) {
 
           setProgress(total > 0 ? (float)i / total : 0.0f);
 
-          // 1. Initial Data Fetch (Short Lock)
-          ItemView item;
-          if (libraryMutex) {
-            if (xSemaphoreTakeRecursive(libraryMutex, pdMS_TO_TICKS(5000)) ==
-                pdPASS) {
-              ensureItemDetailsLoaded(i);
-              item = getItemAtSD(i);
-
-              // Ensure ID exists while locked
-              if (item.isValid && item.uniqueID.length() == 0) {
-                String newID =
-                    (item.codecOrIsbn.length() > 0)
-                        ? item.codecOrIsbn
-                        : (String(millis()) + "_" + String(random(9999)));
-                setItemID(i, newID);
-                item.uniqueID = newID;
+          // 1. Read detail JSON without holding libraryMutex, then merge the
+          // completed object under a short lock. Slow SD reads must not block
+          // the UI's RAM-only navigation accessors.
+          ItemView item = getItemAtRAM(i);
+          if (!item.isValid)
+            continue;
+          if (!item.detailsLoaded) {
+            bool detailLoaded = false;
+            if (syncMode == MODE_BOOK) {
+              Book loaded;
+              detailLoaded =
+                  Storage.loadBookDetail(item.uniqueID.c_str(), loaded);
+              if (detailLoaded && libraryMutex &&
+                  xSemaphoreTakeRecursive(libraryMutex,
+                                          pdMS_TO_TICKS(1000)) == pdPASS) {
+                if (i < (int)bookLibrary.size() &&
+                    bookLibrary[i].uniqueID == item.uniqueID.c_str())
+                  bookLibrary[i] = std::move(loaded);
+                else
+                  detailLoaded = false;
+                xSemaphoreGiveRecursive(libraryMutex);
+              } else if (detailLoaded) {
+                detailLoaded = false;
               }
-              xSemaphoreGiveRecursive(libraryMutex);
             } else {
-              continue;
+              CD loaded;
+              detailLoaded = Storage.loadCDDetail(item.uniqueID.c_str(), loaded);
+              if (detailLoaded && libraryMutex &&
+                  xSemaphoreTakeRecursive(libraryMutex,
+                                          pdMS_TO_TICKS(1000)) == pdPASS) {
+                if (i < (int)cdLibrary.size() &&
+                    cdLibrary[i].uniqueID == item.uniqueID.c_str())
+                  cdLibrary[i] = std::move(loaded);
+                else
+                  detailLoaded = false;
+                xSemaphoreGiveRecursive(libraryMutex);
+              } else if (detailLoaded) {
+                detailLoaded = false;
+              }
             }
+            if (!detailLoaded)
+              continue;
+          }
+          item = getItemAtSD(i); // Detail is now RAM-resident; no SD access.
+
+          if (item.isValid && item.uniqueID.length() == 0) {
+            String newID =
+                item.codecOrIsbn.length() > 0
+                    ? item.codecOrIsbn
+                    : (String(millis()) + "_" + String(random(9999)));
+            setItemID(i, newID);
+            item.uniqueID = newID;
           }
 
           if (!item.isValid)
@@ -736,18 +1145,20 @@ void BackgroundWorker::workerTask(void *pvParameters) {
                                             pdMS_TO_TICKS(1000)) == pdPASS) {
                   switch (currentMode) {
                   case MODE_CD:
-                    if (i < (int)cdLibrary.size())
+                    if (i < (int)cdLibrary.size()) {
                       if (!Storage.saveCD(cdLibrary[i], nullptr, true))
                         persistenceFailed = true;
                       else
                         indexDirty = true;
+                    }
                     break;
                   case MODE_BOOK:
-                    if (i < (int)bookLibrary.size())
+                    if (i < (int)bookLibrary.size()) {
                       if (!Storage.saveBook(bookLibrary[i], nullptr, true))
                         persistenceFailed = true;
                       else
                         indexDirty = true;
+                    }
                     break;
                   default:
                     break;
@@ -828,18 +1239,20 @@ void BackgroundWorker::workerTask(void *pvParameters) {
                                             pdMS_TO_TICKS(5000)) == pdPASS) {
                   switch (currentMode) {
                   case MODE_CD:
-                    if (i < (int)cdLibrary.size())
+                    if (i < (int)cdLibrary.size()) {
                       if (!Storage.saveCD(cdLibrary[i], nullptr, true))
                         persistenceFailed = true;
                       else
                         indexDirty = true;
+                    }
                     break;
                   case MODE_BOOK:
-                    if (i < (int)bookLibrary.size())
+                    if (i < (int)bookLibrary.size()) {
                       if (!Storage.saveBook(bookLibrary[i], nullptr, true))
                         persistenceFailed = true;
                       else
                         indexDirty = true;
+                    }
                     break;
                   default:
                     break;
@@ -1420,15 +1833,24 @@ void BackgroundWorker::workerTask(void *pvParameters) {
 
       case JOB_PERSIST_TRACK_FAVORITE: {
         setStatus("Saving track favorite...");
+        const bool attemptedValue = currentJob.extraData == "1";
         TrackList *trackList = Storage.loadTracklist(currentJob.id.c_str());
         if (trackList && currentJob.index >= 0 &&
             currentJob.index < (int)trackList->tracks.size()) {
           trackList->tracks[currentJob.index].isFavoriteTrack =
-              currentJob.extraData == "1";
+              attemptedValue;
           success = Storage.saveTracklist(currentJob.id.c_str(), trackList);
         }
         if (trackList)
           Storage.deleteTracklist(trackList);
+        if (!success && _queueMutex &&
+            xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          _trackFavoriteFailureReady = true;
+          _trackFavoriteFailureMbid = currentJob.id;
+          _trackFavoriteFailureIndex = currentJob.index;
+          _trackFavoriteFailureAttemptedValue = attemptedValue;
+          xSemaphoreGive(_queueMutex);
+        }
         resultMsg = success ? "Track favorite saved"
                             : "Track favorite save failed";
       } break;
@@ -1501,6 +1923,23 @@ void BackgroundWorker::workerTask(void *pvParameters) {
           _lastWebAddSuccess = success;
           _lastWebAddMessage = resultMsg;
           _lastWebAddRequestCode = currentJob.id;
+        }
+        if (currentJob.type == JOB_COVER_RENDER) {
+          _coverRenderCompletionReady = true;
+          _coverRenderCompletionSuccess = success;
+          _coverRenderCompletionMessage = resultMsg;
+        }
+        if (currentJob.type == JOB_LIBRARY_RELOAD ||
+            currentJob.type == JOB_ITEM_DELETE ||
+            currentJob.type == JOB_LIBRARY_WIPE) {
+          _maintenanceCompletionReady = true;
+          _maintenanceCompletionType = currentJob.type;
+          _maintenanceCompletionSuccess = success;
+          _maintenanceCompletionMessage = resultMsg;
+          _maintenanceCompletionIndex = currentJob.index;
+          _maintenanceCompletionMode =
+              currentJob.extraData == "book" ? MODE_BOOK : MODE_CD;
+          _maintenanceCompletionData = currentJob.extraData;
         }
         if (currentJob.type == JOB_LYRICS_LOAD_CACHED ||
             currentJob.type == JOB_LYRICS_FETCH_ONE) {

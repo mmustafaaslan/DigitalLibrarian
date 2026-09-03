@@ -13,6 +13,9 @@
 LibrarianStorage Storage;
 
 namespace {
+constexpr size_t ITEM_JSON_CAPACITY = 64 * 1024;
+constexpr size_t MAX_INDEX_LINE_BYTES = 64 * 1024;
+
 class ScopedLibraryAccess {
 public:
   explicit ScopedLibraryAccess(uint32_t timeoutMs = 5000) : locked(false) {
@@ -270,22 +273,35 @@ bool writeIndexTemp(const IndexVector &items, const String &tmpPath) {
 
   bool writeOk = true;
   for (const auto &item : items) {
-    StaticJsonDocument<1024> doc;
-    doc["id"] = item.uniqueID.c_str();
-    doc["t"] = item.title.c_str();
-    doc["a"] = item.artist.c_str();
-    doc["c"] = item.coverFile.c_str();
-    doc["y"] = item.year;
-    doc["g"] = item.genre.c_str();
-    doc["f"] = item.favorite;
-    doc["mi"] = item.metaInt;
-    doc["ms"] = item.metaString.c_str();
-
-    JsonArray leds = doc.createNestedArray("l");
-    for (int val : item.ledIndices)
-      leds.add(val);
-
-    writeOk = serializeJson(doc, writer) > 0 && writer.println() > 0 && writeOk;
+    // Stream index rows directly instead of placing the whole record in a
+    // fixed JsonDocument. A record with a long title or many shelf LEDs must
+    // never be silently truncated while the write still reports success.
+    writeOk = writer.print(F("{\"id\":")) > 0 && writeOk;
+    writeOk = writeEscapedJsonString(writer, item.uniqueID.c_str()) && writeOk;
+    writeOk = writer.print(F(",\"t\":")) > 0 && writeOk;
+    writeOk = writeEscapedJsonString(writer, item.title.c_str()) && writeOk;
+    writeOk = writer.print(F(",\"a\":")) > 0 && writeOk;
+    writeOk = writeEscapedJsonString(writer, item.artist.c_str()) && writeOk;
+    writeOk = writer.print(F(",\"c\":")) > 0 && writeOk;
+    writeOk = writeEscapedJsonString(writer, item.coverFile.c_str()) && writeOk;
+    writeOk = writer.print(F(",\"y\":")) > 0 && writeOk;
+    writeOk = writer.print(item.year) > 0 && writeOk;
+    writeOk = writer.print(F(",\"g\":")) > 0 && writeOk;
+    writeOk = writeEscapedJsonString(writer, item.genre.c_str()) && writeOk;
+    writeOk = writer.print(F(",\"f\":")) > 0 && writeOk;
+    writeOk = writer.print(item.favorite ? F("true") : F("false")) > 0 &&
+              writeOk;
+    writeOk = writer.print(F(",\"mi\":")) > 0 && writeOk;
+    writeOk = writer.print(item.metaInt) > 0 && writeOk;
+    writeOk = writer.print(F(",\"ms\":")) > 0 && writeOk;
+    writeOk = writeEscapedJsonString(writer, item.metaString.c_str()) && writeOk;
+    writeOk = writer.print(F(",\"l\":[")) > 0 && writeOk;
+    for (size_t i = 0; i < item.ledIndices.size(); ++i) {
+      if (i > 0)
+        writeOk = writer.write((uint8_t)',') == 1 && writeOk;
+      writeOk = writer.print(item.ledIndices[i]) > 0 && writeOk;
+    }
+    writeOk = writer.print(F("]}\n")) > 0 && writeOk;
   }
 
   writeOk = writer.finish() && writeOk;
@@ -388,7 +404,7 @@ bool LibrarianStorage::saveCD(const CD &cd, const char *oldUniqueID,
     return false;
   }
 
-  DynamicJsonDocument doc(4096); // 4KB is plenty for one item
+  BasicJsonDocument<SpiRamAllocator> doc(ITEM_JSON_CAPACITY);
   doc["title"] = cd.title.c_str();
   doc["artist"] = cd.artist.c_str();
   doc["genre"] = cd.genre.c_str();
@@ -410,6 +426,14 @@ bool LibrarianStorage::saveCD(const CD &cd, const char *oldUniqueID,
   JsonArray leds = doc.createNestedArray("ledIndices");
   for (int led : cd.ledIndices) {
     leds.add(led);
+  }
+
+  if (doc.overflowed()) {
+    file.close();
+    SD.remove(tmpPath);
+    ErrorHandler::logError(ERR_CAT_STORAGE, "CD detail is too large to save",
+                           "Storage::saveCD");
+    return false;
   }
 
   YieldingBufferedFileWriter writer(file);
@@ -515,7 +539,7 @@ bool LibrarianStorage::updateFavorite(String uniqueID, MediaMode mode,
   if (!source)
     return false;
 
-  DynamicJsonDocument doc(4096);
+  BasicJsonDocument<SpiRamAllocator> doc(ITEM_JSON_CAPACITY);
   DeserializationError error = deserializeJson(doc, source);
   source.close();
   if (error)
@@ -582,8 +606,12 @@ bool LibrarianStorage::loadIndex(MediaMode mode) {
   recoverInterruptedReplace(path);
   File file = SD.open(path, FILE_READ);
 
-  if (!file)
-    return false; // No index yet
+  if (!file) {
+    // A missing index is a valid empty library (first boot or after a wipe).
+    // Do not leave stale in-memory rows behind after a successful SD mount.
+    vec.clear();
+    return true;
+  }
 
   // Read Line-By-Line (JSONL)
   while (file.available()) {
@@ -592,7 +620,17 @@ bool LibrarianStorage::loadIndex(MediaMode mode) {
     if (line.length() == 0)
       continue;
 
-    StaticJsonDocument<1024> doc; // Increased size for robust loading
+    if (line.length() > MAX_INDEX_LINE_BYTES) {
+      file.close();
+      ErrorHandler::logError(ERR_CAT_STORAGE, "Index row exceeds 64 KB",
+                             "Storage::loadIndex");
+      return false;
+    }
+
+    const size_t capacity =
+        std::min(MAX_INDEX_LINE_BYTES,
+                 std::max<size_t>(4096, line.length() * 4 + 2048));
+    BasicJsonDocument<SpiRamAllocator> doc(capacity);
     DeserializationError error = deserializeJson(doc, line);
 
     if (!error) {
@@ -614,8 +652,10 @@ bool LibrarianStorage::loadIndex(MediaMode mode) {
       loaded.push_back(item);
     } else {
       ErrorHandler::logError(ERR_CAT_STORAGE,
-                             String("Skipping invalid index row: ") + error.c_str(),
+                             String("Invalid index row: ") + error.c_str(),
                              "Storage::loadIndex");
+      file.close();
+      return false;
     }
     delay(1);
   }
@@ -684,7 +724,7 @@ bool LibrarianStorage::loadCDDetail(String uniqueID, CD &outCD) {
   if (!file)
     return false;
 
-  DynamicJsonDocument doc(4096);
+  BasicJsonDocument<SpiRamAllocator> doc(ITEM_JSON_CAPACITY);
   DeserializationError parseError = deserializeJson(doc, file);
   file.close();
   if (parseError || !doc["title"].is<const char *>()) {
@@ -749,7 +789,7 @@ bool LibrarianStorage::saveBook(const Book &book, const char *oldUniqueID,
   if (!file)
     return false;
 
-  DynamicJsonDocument doc(4096);
+  BasicJsonDocument<SpiRamAllocator> doc(ITEM_JSON_CAPACITY);
   doc["title"] = book.title.c_str();
   doc["artist"] =
       book.author.c_str(); // Store Author in "artist" field for consistency
@@ -769,6 +809,14 @@ bool LibrarianStorage::saveBook(const Book &book, const char *oldUniqueID,
   JsonArray leds = doc.createNestedArray("ledIndices");
   for (int led : book.ledIndices) {
     leds.add(led);
+  }
+
+  if (doc.overflowed()) {
+    file.close();
+    SD.remove(tmpPath);
+    ErrorHandler::logError(ERR_CAT_STORAGE, "Book detail is too large to save",
+                           "Storage::saveBook");
+    return false;
   }
 
   YieldingBufferedFileWriter writer(file);
@@ -865,7 +913,7 @@ bool LibrarianStorage::loadBookDetail(String uniqueID, Book &outBook) {
   if (!file)
     return false;
 
-  DynamicJsonDocument doc(4096);
+  BasicJsonDocument<SpiRamAllocator> doc(ITEM_JSON_CAPACITY);
   DeserializationError parseError = deserializeJson(doc, file);
   file.close();
   if (parseError || !doc["title"].is<const char *>()) {
@@ -1135,6 +1183,7 @@ bool LibrarianStorage::saveTracklist(const char *releaseMbid,
   File file = SD.open(tmpPath, FILE_WRITE);
   if (!file)
     return false;
+
   YieldingBufferedFileWriter writer(file);
 
   // Stream JSON directly to file without allocating temporary Arduino Strings.
@@ -1546,9 +1595,11 @@ bool LibrarianStorage::importBackup(const char *path, int &itemCount,
       const char *identity = strcmp(type, "tracklist") == 0
                                  ? (const char *)(doc["mbid"] | "")
                                  : (const char *)(doc["data"]["uniqueID"] | "");
+      String canonicalIdentity = sanitizeFilename(String(identity));
+      canonicalIdentity.toLowerCase(); // FAT paths are case-insensitive.
       PsramString recordKey(type);
       recordKey += ':';
-      recordKey += identity;
+      recordKey += canonicalIdentity.c_str();
       if (std::find(recordKeys.begin(), recordKeys.end(), recordKey) !=
           recordKeys.end()) {
         heap_caps_free(contents);
@@ -1634,7 +1685,8 @@ bool LibrarianStorage::importBackup(const char *path, int &itemCount,
       cd.trackCount = data["trackCount"] | 0;
       cd.totalDurationMs = data["totalDurationMs"] | 0;
       cd.releaseMbid = (const char *)(data["releaseMbid"] | "");
-      for (int led : data["ledIndices"].as<JsonArray>())
+      JsonArrayConst ledIndices = data["ledIndices"].as<JsonArrayConst>();
+      for (int led : ledIndices)
         cd.ledIndices.push_back(led);
       if (!cd.uniqueID.empty() && !cd.title.empty()) {
         const String detailPath = getFilePath(cd.uniqueID.c_str(), MODE_CD);
@@ -1661,7 +1713,8 @@ bool LibrarianStorage::importBackup(const char *path, int &itemCount,
       book.pageCount = data["pageCount"] | 0;
       book.currentPage = data["currentPage"] | 0;
       book.publisher = (const char *)(data["publisher"] | "");
-      for (int led : data["ledIndices"].as<JsonArray>())
+      JsonArrayConst ledIndices = data["ledIndices"].as<JsonArrayConst>();
+      for (int led : ledIndices)
         book.ledIndices.push_back(led);
       if (!book.uniqueID.empty() && !book.title.empty()) {
         const String detailPath = getFilePath(book.uniqueID.c_str(), MODE_BOOK);

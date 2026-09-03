@@ -281,27 +281,39 @@ void sendWebLoginPage(const String &destination, const String &feature) {
   html += getCommonCSS();
   html +=
       "body{min-height:100vh;display:flex;align-items:center;justify-content:"
-      "center}.card{width:100%;max-width:340px;text-align:center}.error{color:"
-      "var(--err);min-height:24px;margin-top:12px}</style></head><body><div "
-      "class='card'><h1>Secure Login</h1><p style='color:var(--sub)'>Enter the " +
+      "center}.login-card{width:100%;max-width:390px}.lock-mark{width:54px;"
+      "height:54px;display:grid;place-items:center;margin-bottom:18px;border:1px "
+      "solid var(--line);border-radius:16px;background:var(--card-strong);color:"
+      "var(--accent);font-size:24px}.login-card h1{font-size:34px}.login-card "
+      ".subtitle{margin-bottom:22px}.login-card button{margin-top:14px}.error{"
+      "color:#ffaaa6;min-height:24px;margin-top:12px;font-size:13px}.privacy-"
+      "note{margin-top:18px;color:var(--sub);font-size:11px;text-align:center}"
+      "</style></head><body><main class='card login-card'><div class='lock-"
+      "mark'>&#128274;</div><div class='eyebrow'>Protected tool</div><h1>Unlock "
+      "web access</h1><p class='subtitle'>Enter the web PIN to open the " +
       safeFeature +
-      " web PIN.</p><form id='loginForm'><input id='pin' name='pin' "
-      "type='password' inputmode='numeric' autocomplete='current-password' "
-      "placeholder='Web PIN' autofocus required><button type='submit'>Unlock"
-      "</button></form><div id='error' class='error'></div></div><script>"
+      ".</p><form id='loginForm'><label for='pin'>Web PIN</label><input id='pin' name='pin' "
+      "type='password' inputmode='text' autocomplete='current-password' "
+      "autocapitalize='none' spellcheck='false' "
+      "placeholder='Enter PIN' autofocus required><button type='submit'>Unlock "
+      "this tool</button></form><div id='error' class='error' role='alert'></div>"
+      "<p class='privacy-note'>Your PIN stays on this local device.</p></main><script>"
       "document.getElementById('loginForm').onsubmit=async function(e){e."
       "preventDefault();const b=this.querySelector('button'),p=document."
-      "getElementById('pin').value;b.disabled=true;const r=await fetch('/api/"
+      "getElementById('pin').value,err=document.getElementById('error');b.disabled=true;"
+      "b.innerHTML='<span class=\"spinner\"></span>Checking PIN';err.textContent='';try{const r=await fetch('/api/"
       "auth',{method:'POST',headers:{'Content-Type':'application/x-www-form-"
       "urlencoded'},body:'pin='+encodeURIComponent(p)});if(r.ok){location."
       "replace('" +
       safeDestination +
       "');return;}const retry=r.headers.get('Retry-After');document."
       "getElementById('error').textContent=r.status===429?'Too many attempts. "
-      "Try again in '+(retry||'a few')+' seconds.':'Incorrect PIN';b.disabled="
-      "false;};</script></body></html>";
+      "Try again in '+(retry||'a few')+' seconds.':'Incorrect PIN';}catch(e){"
+      "err.textContent='Could not reach the device. Check WiFi and try again.';}"
+      "finally{b.disabled=false;b.textContent='Unlock this tool';}};</script>"
+      "</body></html>";
   server.sendHeader("Cache-Control", "no-store");
-  server.send(401, "text/html", html);
+  server.send(401, "text/html; charset=utf-8", html);
 }
 
 bool parseLedIndices(const String &input, std::vector<int> &result) {
@@ -437,28 +449,16 @@ bool isSafeRemoteCoverUrl(const String &url) {
 }
 
 String getWebFooter() {
-  String f = "<div style='margin-top: 40px; border-top: 1px solid #333; "
-             "padding-top: 20px;'>";
-  f += "<h3 style='text-align:center; color:#fff; font-size: 14px; "
-       "margin-bottom: 15px; text-transform: uppercase; letter-spacing: "
-       "1px;'>Navigation</h3>";
-  f += "<div style='display: grid; grid-template-columns: repeat(7, 1fr); "
-       "gap: 10px;'>";
-  f += "<button onclick=\"location.href='/'\" style='font-size: "
-       "13px; padding: 10px;'>&#127968; Dashboard</button>";
-  f += "<button onclick=\"location.href='/scan'\" style='font-size: "
-       "13px; padding: 10px;'>&#128247; Scanner</button>";
-  f += "<button onclick=\"location.href='/browse'\" style='font-size: "
-       "13px; padding: 10px;'>&#128241; Browse</button>";
-  f += "<button onclick=\"location.href='/link'\" style='font-size: "
-       "13px; padding: 10px;'>&#128444; Covers</button>";
-  f += "<button onclick=\"location.href='/backup'\" style='font-size: "
-       "13px; padding: 10px;'>&#128190; Backup</button>";
-  f += "<button onclick=\"location.href='/manual'\" style='font-size: "
-       "13px; padding: 10px;'>&#128214; Manuals</button>";
-  f += "<button onclick=\"location.href='/errors'\" style='font-size: "
-       "13px; padding: 10px;'>&#128681; Errors</button>";
-  f += "</div></div>";
+  String f = "<nav class='site-nav' aria-label='Web interface navigation'>";
+  f += "<h3>Navigation</h3><div class='nav-grid'>";
+  f += "<a class='nav-link' href='/'>&#127968; Home</a>";
+  f += "<a class='nav-link' href='/scan'>&#128247; Add</a>";
+  f += "<a class='nav-link' href='/browse'>&#128241; Browse</a>";
+  f += "<a class='nav-link' href='/link'>&#128444; Covers</a>";
+  f += "<a class='nav-link' href='/backup'>&#128190; Backup</a>";
+  f += "<a class='nav-link' href='/manual'>&#128214; Manual</a>";
+  f += "<a class='nav-link' href='/errors'>&#128681; Health</a>";
+  f += "</div></nav>";
   return f;
 }
 
@@ -471,7 +471,7 @@ void sendHTMLPage(const char *title, String body, String script = "") {
   if (script.length() > 0)
     html += "<script>" + script + "</script>";
   html += "</body></html>";
-  server.send(200, "text/html", html);
+  server.send(200, "text/html; charset=utf-8", html);
 }
 
 // ========================================
@@ -485,7 +485,7 @@ void setupWebHandlers() {
   server.on("/", HTTP_GET, []() {
     String html = String(INDEX_HTML_TEMPLATE);
     html.replace("%CSS%", getCommonCSS());
-    server.send(200, "text/html", html);
+    server.send(200, "text/html; charset=utf-8", html);
   });
 
   server.on("/api/auth", HTTP_POST, []() {
@@ -924,50 +924,48 @@ void setupWebHandlers() {
     html += "<meta name='viewport' "
             "content='width=device-width,initial-scale=1,maximum-scale=1,user-"
             "scalable=no'>";
+    html += "<meta charset='UTF-8'>";
     html += "<title>LED Selector - " + escapeHTML(cd.title) + "</title>";
     html += "<style>";
+    html += getCommonCSS();
     html += "*{margin:0;padding:0;box-sizing:border-box}";
     html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe "
-            "UI',Roboto,Arial,sans-serif;background:#0a0a0a;color:#fff;padding-"
-            "bottom:80px}";
-    html += ".header{position:sticky;top:0;background:linear-gradient(135deg,#"
-            "1a1a1a,#0f0f0f);padding:15px;border-bottom:2px solid "
-            "#00ff88;box-shadow:0 4px 12px rgba(0,255,136,0.2);z-index:100}";
+            "UI',Roboto,Arial,sans-serif;padding-bottom:100px}";
+    html += ".header{position:sticky;top:10px;background:linear-gradient(145deg,"
+            "rgba(23,52,79,.98),rgba(10,27,44,.98));padding:18px;border:1px "
+            "solid var(--line-soft);border-radius:18px;box-shadow:var(--shadow);"
+            "z-index:100}";
     html += ".cd-info{margin-bottom:12px}.cd-title{font-size:20px;font-weight:"
-            "700;color:#00ff88;margin-bottom:4px}.cd-artist{font-size:14px;"
-            "color:#aaa;opacity:0.9}";
+            "800;color:var(--text);margin-bottom:4px}.cd-artist{font-size:14px;"
+            "color:var(--sub)}";
     html += ".actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}";
     html += ".btn{padding:10px "
             "16px;border:none;border-radius:8px;font-weight:600;font-size:13px;"
             "cursor:pointer;transition:all "
             "0.2s;flex:1;min-width:80px;text-align:center}";
-    html += ".btn-primary{background:#00ff88;color:#000}.btn-primary:active{"
-            "background:#00dd77;transform:scale(0.98)}";
-    html += ".btn-secondary{background:#333;color:#fff}.btn-secondary:active{"
-            "background:#444;transform:scale(0.98)}";
-    html += ".btn-danger{background:#ff4444;color:#fff}.btn-danger:active{"
-            "background:#dd3333;transform:scale(0.98)}";
-    html += ".search-box{width:100%;padding:12px;background:#1a1a1a;border:2px "
-            "solid "
-            "#333;border-radius:8px;color:#fff;font-size:15px;margin-top:10px}";
-    html += ".search-box:focus{outline:none;border-color:#00ff88}";
+    html += ".btn{width:auto}.btn-primary{background:var(--accent);color:#18200b}"
+            ".btn-secondary{background:var(--card-strong);color:var(--text);"
+            "border:1px solid var(--line)}";
+    html += ".search-box{width:100%;margin-top:10px}";
     html += ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax("
-            "50px,1fr));gap:6px;padding:15px;max-width:100%}";
-    html += ".led{aspect-ratio:1;border-radius:8px;border:2px solid "
-            "#333;background:#1a1a1a;display:flex;align-items:center;justify-"
+            "52px,1fr));gap:8px;padding:18px 2px;max-width:100%}";
+    html += ".led{aspect-ratio:1;border-radius:11px;border:1px solid "
+            "var(--line);background:rgba(16,36,58,.82);display:flex;align-items:center;justify-"
             "content:center;font-size:11px;font-weight:700;cursor:pointer;"
             "transition:all "
             "0.15s;user-select:none;-webkit-tap-highlight-color:transparent}";
-    html += ".led.selected{background:#00ff88;color:#000;border-color:#00ff88;"
-            "box-shadow:0 0 12px rgba(0,255,136,0.6)}";
+    html += ".led.selected{background:var(--accent);color:#18200b;border-color:"
+            "var(--accent);box-shadow:0 0 16px rgba(246,207,74,.4)}";
     html += ".led:active{transform:scale(0.92)}";
-    html += ".led:hover{border-color:#00ff88;transform:scale(1.05)}";
-    html += ".footer{position:fixed;bottom:0;left:0;right:0;background:linear-"
-            "gradient(135deg,#1a1a1a,#0f0f0f);padding:15px;border-top:2px "
-            "solid #00ff88;box-shadow:0 -4px 12px "
-            "rgba(0,255,136,0.2);display:flex;gap:10px}";
-    html += ".count{text-align:center;padding:10px;background:#1a1a1a;border-"
-            "radius:8px;font-size:14px;color:#00ff88;font-weight:600;flex:1}";
+    html += ".led:hover{border-color:var(--cyan);transform:scale(1.04)}";
+    html += ".footer{position:fixed;bottom:12px;left:50%;transform:translateX(-"
+            "50%);width:min(calc(100% - 24px),756px);background:linear-gradient("
+            "145deg,rgba(23,52,79,.98),rgba(10,27,44,.98));padding:12px;border:"
+            "1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);"
+            "display:flex;gap:10px;z-index:110}";
+    html += ".count{text-align:center;padding:8px;background:rgba(4,13,24,.55);"
+            "border-radius:11px;font-size:14px;color:var(--accent);font-weight:"
+            "700;flex:1}";
     html += "@media(max-width:600px){.grid{grid-template-columns:repeat(auto-"
             "fill,minmax(45px,1fr));gap:5px}.led{font-size:10px}}";
     html += "</style></head><body>";
@@ -1008,7 +1006,7 @@ void setupWebHandlers() {
     html += "const led=document.createElement('div');";
     html += "led.className='led'+(selected.has(i)?' selected':'');";
     html += "led.textContent=i;";
-    html += "led.onclick=()=>toggle(i);";
+    html += "led.onclick=()=>toggle(i,led);";
     html += "return led;";
     html += "}";
 
@@ -1018,9 +1016,9 @@ void setupWebHandlers() {
     html += "updateCount();";
     html += "}";
 
-    html += "function toggle(i){";
+    html += "function toggle(i,led){";
     html += "if(selected.has(i))selected.delete(i);else selected.add(i);";
-    html += "event.target.classList.toggle('selected');";
+    html += "led.classList.toggle('selected',selected.has(i));";
     html += "updateCount();";
     html += "preview();";
     html += "}";
@@ -1072,18 +1070,21 @@ void setupWebHandlers() {
     html += "fetch('/api/"
             "control',{method:'POST',headers:{'Content-Type':'application/"
             "x-www-form-urlencoded'},body:'action=ledpreview&leds='+leds})";
-    html += ".then(r=>r.text()).then(msg=>console.log('Preview:',msg))";
+    html += ".then(async r=>{const msg=await r.text();if(!r.ok)throw new "
+            "Error(msg||'Preview failed');console.log('Preview:',msg);})";
     html += ".catch(e=>console.error('Preview error:',e));";
     html += "},100);";
     html += "}";
 
-    html += "function save(){";
+    html += "async function save(){";
     html += "const leds=Array.from(selected).sort((a,b)=>a-b).join(',');";
-    html += "fetch('/api/"
+    html += "const btn=document.querySelector('.footer button');btn.disabled=true;"
+            "btn.textContent='SAVING...';try{";
+    html += "const r=await fetch('/api/"
             "control',{method:'POST',headers:{'Content-Type':'application/"
             "x-www-form-urlencoded'},body:'action=ledupdate&id='+cdId+'&leds='+"
-            "leds})";
-    html += ".then(r=>r.text()).then(()=>{";
+            "encodeURIComponent(leds)});const response=await r.text();if(!r.ok)"
+            "throw new Error(response||'Save failed');";
     html += "console.log('Sending broadcast:', leds);";
     html += "const msg={type:'led-update',leds:leds};";
     html += "if(window.opener){window.opener.postMessage(msg,'*');}";
@@ -1091,13 +1092,14 @@ void setupWebHandlers() {
             "BroadcastChannel('led_channel');bc.postMessage(msg);bc.close();}"
             "catch(e){console.log('BC Err',e);}";
     html += "alert('LEDs saved!');window.close();";
-    html += "}).catch(e=>alert('Error: '+e));";
+    html += "}catch(e){alert('Error: '+e.message);btn.disabled=false;"
+            "btn.textContent='SAVE & CLOSE';}";
     html += "}";
 
     html += "render();";
     html += "</script></body></html>";
 
-    server.send(200, "text/html", html);
+    server.send(200, "text/html; charset=utf-8", html);
   });
 
   // 4. Scanner Tool (Full Featured)
@@ -1122,53 +1124,33 @@ void setupWebHandlers() {
     html += "    <meta charset=\"UTF-8\">";
     html += "    <title>Scanner</title>";
     html += "    <style>";
-    html += "        :root { --bg: #000000; --card: #111111; --accent: "
-            "#00ff88; --text: #ffffff; --sub: #666666; --err: #ff4444; }";
-    html += "        * { margin: 0; padding: 0; box-sizing: border-box; "
-            "-webkit-font-smoothing: antialiased; }";
-    html +=
-        "        body { background: var(--bg); color: var(--text); "
-        "font-family: -apple-system, BlinkMacSystemFont, 'Inter', Roboto, "
-        "sans-serif; display: flex; flex-direction: column; align-items: "
-        "center; justify-content: center; min-height: 100vh; padding: 20px; }";
-    html += "        .container { width: 100%; max-width: 400px; }";
-    html += "        h1 { font-size: 24px; font-weight: 600; margin-bottom: "
-            "8px; text-align: center; }";
-    html += "        p.subtitle { color: var(--sub); font-size: 14px; "
-            "text-align: center; margin-bottom: 40px; }";
-    html += "        .input-group { position: relative; margin-bottom: 20px; }";
-    html += "        input, textarea { width: 100%; background: var(--card); "
-            "border: 1px "
-            "solid #333; color: white; padding: 16px; font-size: 16px; "
-            "border-radius: 12px; outline: none; display: block; font-family: "
-            "inherit; }";
-    html += "        input { text-align: center; }";
-    html += "        textarea { text-align: left; resize: vertical; "
-            "min-height: 120px; font-family: monospace; }";
-    html +=
-        "        input:focus, textarea:focus { border-color: var(--accent); }";
-    html += "        button { width: 100%; background: var(--accent); color: "
-            "#000; border: none; padding: 16px; font-size: 16px; font-weight: "
-            "700; border-radius: 12px; cursor: pointer; }";
-    html += "        button:disabled { opacity: 0.5; background: var(--sub); }";
-    html += "        .result { margin-bottom: 20px; padding: 20px; "
-            "border-radius: 12px; background: var(--card); text-align: center; "
-            "display: none; border: 1px solid #333; }";
-    html += "        .links { margin-top: 40px; text-align: center; }";
-    html += "        a { color: var(--sub); text-decoration: none; font-size: "
-            "13px; }";
+    html += getCommonCSS();
+    html += ".container{width:100%;max-width:620px;margin:0 auto}.scan-card{"
+            "position:relative}.input-group{margin-bottom:14px}textarea{min-"
+            "height:160px;resize:vertical;font-family:ui-monospace,SFMono-"
+            "Regular,Consolas,monospace;line-height:1.5}.helper{margin-top:"
+            "12px;color:var(--sub);font-size:12px}.result{display:none;margin-"
+            "bottom:16px;padding:8px 16px;border:1px solid var(--line-soft);"
+            "border-radius:16px;background:rgba(7,17,29,.58)}.result>div:last-"
+            "child{border-bottom:0!important;margin-bottom:0!important}.step-"
+            "badge{display:inline-flex;align-items:center;gap:7px;color:var(--"
+            "cyan);font-size:12px;font-weight:800;letter-spacing:.08em;text-"
+            "transform:uppercase;margin-bottom:8px}";
     html += "    </style>";
     html += "</head>";
     html += "<body>";
     html += "    <div class=\"container\">";
-    html += "        <h1>Add " + getModeName() + "</h1>";
+    html += "<header class='hero'><div class='eyebrow'>Fast entry</div><h1>Add " +
+            getModeName() +
+            "</h1><p class='subtitle'>Scan a code or paste several codes to "
+            "build your collection.</p></header>";
     String codeLabel = getCodeLabel();
     if (codeLabel.endsWith(":"))
       codeLabel = codeLabel.substring(0, codeLabel.length() - 1); // remove ':'
-    html += "        <p class=\"subtitle\">Enter " + codeLabel + " number</p>";
-    html += "        <div id=\"result\"></div>";
+    html += "        <div id=\"result\" class=\"result\" aria-live=\"polite\"></div>";
 
-    html += "        <form id=\"scanForm\">";
+    html += "        <form id=\"scanForm\" class=\"card scan-card\">";
+    html += "<div class='step-badge'>01 &nbsp; Enter codes</div>";
     html += "            <div class=\"input-group\">";
     String placeholder = "Scan or paste " + codeLabel + "s (one per line)";
     html += "                <textarea id=\"barcode\" "
@@ -1178,7 +1160,9 @@ void setupWebHandlers() {
             "autocomplete=\"off\" rows=\"5\">" +
             escapeHTML(codeArg) + "</textarea>";
     html += "            </div>";
-    html += "            <button type=\"submit\">Lookup</button>";
+    html += "            <button type=\"submit\" id=\"lookupButton\">Look up and add</button>";
+    html += "<p class='helper'>One code per line. You can paste a batch and "
+            "leave this page open while each item is processed.</p>";
     html += "        </form>";
 
     html += "    </div>"; // This closing div is for the container, it should
@@ -1188,7 +1172,7 @@ void setupWebHandlers() {
     // Client-side Logic (Main App Only)
     html += "<script>";
     html += "const pause=ms=>new Promise(r=>setTimeout(r,ms));";
-    html += "function showLine(el,text,ok){el.textContent=text;el.style.color=ok?'#00ff88':'#f44';}";
+    html += "function showLine(el,text,ok){el.textContent=text;el.style.color=ok?'var(--ok)':'#ffaaa6';}";
     html += "async function waitForWebAdd(after,code){";
     html += " for(let n=0;n<240;n++){await pause(500);const r=await fetch('/api/job');";
     html += "  if(!r.ok)throw new Error(await r.text());const j=await r.json();";
@@ -1199,7 +1183,7 @@ void setupWebHandlers() {
     html += " if(r.status===409){const d=await r.json();return {duplicate:d};}";
     html += " if(r.status!==202)throw new Error(await r.text());const q=await r.json();return {job:await waitForWebAdd(q.waitAfter,code)};}";
     html += "async function processQueue(lines,idx,res,btn){";
-    html += " if(idx>=lines.length){btn.innerText='Lookup';btn.disabled=false;document.getElementById('barcode').value='';return;}";
+    html += " if(idx>=lines.length){btn.innerText='Look up and add';btn.disabled=false;document.getElementById('barcode').value='';return;}";
     html += " const code=lines[idx];btn.innerText='Processing '+(idx+1)+'/'+lines.length+'...';";
     html += " const itemDiv=document.createElement('div');itemDiv.style.cssText='border-bottom:1px solid #333;margin-bottom:10px;padding-bottom:10px';";
     html += " itemDiv.textContent='Scanning: '+code+'...';res.prepend(itemDiv);";
@@ -1218,7 +1202,7 @@ void setupWebHandlers() {
             "txt.split(/[\\n,]+/).map(s=>s.trim()).filter(s=>s.length>0);";
     html += "        if(lines.length===0) return;";
     html += "        var res = document.getElementById('result');";
-    html += "        var btn = document.querySelector('button');";
+    html += "        var btn = document.getElementById('lookupButton');";
     html += "        btn.disabled = true; res.style.display='block'; "
             "res.innerHTML='';";
     html += "        processQueue(lines, 0, res, btn);";
@@ -1240,7 +1224,7 @@ void setupWebHandlers() {
     html += "</script>";
 
     html += "</body></html>";
-    server.send(200, "text/html", html);
+    server.send(200, "text/html; charset=utf-8", html);
   });
 
   // Manual Cover Link Page
@@ -1256,47 +1240,34 @@ void setupWebHandlers() {
             "initial-scale=1, maximum-scale=1'>";
     html += "<meta charset='UTF-8'><title>" + getModeName() + " Art</title>";
     html += "<style>";
-    html += ":root { --bg: #000000; --card: #111111; --accent: #00ff88; "
-            "--text: #ffffff; --sub: #666666; --err: #ff4444; }";
-    html += "* { margin: 0; padding: 0; box-sizing: border-box; "
-            "-webkit-font-smoothing: antialiased; }";
-    html += "body { background: var(--bg); color: var(--text); font-family: "
-            "sans-serif; display: flex; flex-direction: column; align-items: "
-            "center; justify-content: center; min-height: 100vh; padding: "
-            "20px; }";
-    html += ".container { width: 100%; max-width: 400px; }";
-    html += "h1 { font-size: 24px; font-weight: 600; margin-bottom: 8px; "
-            "text-align: center; color: var(--accent); }";
-    html += ".subtitle { color: var(--sub); font-size: 14px; text-align: "
-            "center; margin-bottom: 40px; }";
-    html += "input { width: 100%; background: var(--card); border: 1px solid "
-            "#333; color: white; padding: 16px; font-size: 16px; "
-            "border-radius: 12px; outline: none; margin-bottom: 20px; }";
-    html += "input:focus { border-color: var(--accent); }";
-    html += "button { width: 100%; background: var(--accent); color: #000; "
-            "border: none; padding: 16px; font-size: 16px; font-weight: 700; "
-            "border-radius: 12px; cursor: pointer; }";
-    html += "button:disabled { opacity: 0.5; }";
-    html += ".result { margin-top: 30px; padding: 20px; border-radius: 12px; "
-            "background: var(--card); text-align: center; border: 1px solid "
-            "#222; }";
-    html += ".success { border-color: var(--accent); color: var(--accent); }";
-    html += ".error { border-color: var(--err); color: var(--err); }";
-    html += ".links { margin-top: 40px; text-align: center; }";
-    html += "a { color: var(--sub); text-decoration: none; }";
+    html += getCommonCSS();
+    html += ".container{width:100%;max-width:620px;margin:0 auto}.cover-form ."
+            "field:last-of-type{margin-bottom:20px}.hint{margin-top:12px;color:"
+            "var(--sub);font-size:12px}.result{margin:0 0 16px;padding:14px "
+            "16px;border-radius:14px;background:rgba(7,17,29,.65);border:1px "
+            "solid var(--line-soft)}.result.success{border-color:rgba(85,214,"
+            "158,.55);color:var(--ok)}.result.error{border-color:rgba(255,101,"
+            "95,.6);color:#ffaaa6}";
     html += "</style></head><body>";
 
     html += "<div class='container'>";
-    html += "<h1>Update " + getModeName() + " Art</h1>";
-    html += "<p class='subtitle'>Enter Unique ID and image URL</p>";
-    html += "<div id='result' style='display:none'></div>";
-    html += "<form id='linkForm'>";
-    html += "<input type='text' id='target_id' placeholder='Unique ID' "
-            "required autocomplete='off' style='text-align:center'>";
-    html += "<input type='text' id='url' "
-            "placeholder='https://example.com/image.jpg' required "
-            "autocomplete='off'>";
-    html += "<button type='submit'>Update " + getModeName() + " Art</button>";
+    html += "<header class='hero'><div class='eyebrow'>Artwork manager</div><h1>"
+            "Update " + getModeName() +
+            " cover</h1><p class='subtitle'>Attach a public HTTPS image to a "
+            "record. The device downloads and stores it safely.</p></header>";
+    html += "<div id='result' class='result' style='display:none' role='status' "
+            "aria-live='polite'></div>";
+    html += "<form id='linkForm' class='card cover-form'>";
+    html += "<div class='field'><label for='target_id'>Record unique ID</label>"
+            "<input type='text' id='target_id' placeholder='Example: "
+            "093624639329' required autocomplete='off'></div>";
+    html += "<div class='field'><label for='url'>Cover image URL</label><input "
+            "type='url' inputmode='url' id='url' placeholder='https://example."
+            "com/cover.jpg' required autocomplete='off'></div>";
+    html += "<button type='submit' id='coverButton'>Update " + getModeName() +
+            " cover</button>";
+    html += "<p class='hint'>Tip: copy the unique ID from the Browse page's "
+            "Edit panel. Only public HTTPS image addresses are accepted.</p>";
     html += "</form>";
 
     html += "</div>";
@@ -1309,9 +1280,10 @@ void setupWebHandlers() {
     html += "  var url = document.getElementById('url').value.trim();";
     html += "  var tid = document.getElementById('target_id').value.trim();";
     html += "  var res = document.getElementById('result');";
-    html += "  var btn = document.querySelector('button');";
+    html += "  var btn = document.getElementById('coverButton');";
     html += "  if(url.length < 5 || tid.length < 1) return;";
-    html += "  btn.innerText = 'Downloading...'; btn.disabled = true; "
+    html += "  btn.innerHTML = '<span class=\"spinner\"></span>Downloading "
+            "cover'; btn.disabled = true; "
             "res.style.display = 'none';";
     html += "  try{";
     html += "    const response=await fetch('/api/setcover',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(url)+'&id='+encodeURIComponent(tid)});";
@@ -1328,7 +1300,7 @@ void setupWebHandlers() {
     html += getWebFooter();
     html += "</body></html>";
 
-    server.send(200, "text/html", html);
+    server.send(200, "text/html; charset=utf-8", html);
   });
 
   // API to update cover from URL
@@ -1479,69 +1451,93 @@ void setupWebHandlers() {
     String chunk = "<!DOCTYPE html><html><head>";
     chunk +=
         "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+    chunk += "<meta charset='UTF-8'>";
     chunk += "<title>Remote " + getModeName() + " Control</title>";
     chunk += "<style>";
+    chunk += getCommonCSS();
     chunk += "* { box-sizing: border-box; }";
-    chunk += "body { background: #000; color: #fff; font-family: sans-serif; "
-             "padding: 20px; padding-bottom: 80px; max-width: 600px; margin: 0 "
-             "auto; }";
+    chunk += "body{padding-bottom:60px;max-width:860px}.browser-head{padding-"
+             "bottom:16px}.filter-card{position:sticky;top:8px;z-index:50;"
+             "padding:14px;margin-bottom:14px;backdrop-filter:blur(12px)}"
+             ".filter-row{display:flex;gap:9px;flex-wrap:wrap}.filter-row "
+             "select{flex:1;min-width:135px;margin:0}.filter-row label{margin:"
+             "0}.list-summary{display:flex;justify-content:space-between;align-"
+             "items:center;margin:12px 2px;color:var(--sub);font-size:12px}";
     chunk +=
-        ".cd { background: #111; border: 1px solid #333; padding: 15px; "
-        "margin-bottom: 10px; border-radius: 8px; display: flex; align-items: "
+        ".cd { background:linear-gradient(145deg,rgba(23,52,79,.9),rgba(12,"
+        "31,50,.92));border:1px solid var(--line-soft);padding:14px 15px;"
+        "margin-bottom:9px;border-radius:14px;display:flex;align-items:"
         "center; justify-content: space-between; gap: 10px; }";
     chunk += ".cd-info { flex: 1; min-width: 0; padding-right: 10px; overflow: "
              "hidden; }";
-    chunk += ".cd:active { background: #222; }";
+    chunk += ".cd:active{border-color:var(--cyan)}";
     chunk +=
-        ".cd h3 { margin: 0; font-size: 16px; color: #00ff88; white-space: "
+        ".cd h3 { margin: 0; font-size: 16px; color:var(--text); white-space: "
         "nowrap; overflow: hidden; text-overflow: ellipsis; }";
     chunk +=
-        ".cd p { margin: 4px 0 0; color: #888; font-size: 14px; white-space: "
+        ".cd p { margin: 4px 0 0; color:var(--sub); font-size: 13px; white-space: "
         "nowrap; overflow: hidden; text-overflow: ellipsis; }";
 
     // Buttons
     chunk += ".btn-group { display: flex; align-items: center; gap: 8px; "
              "flex-shrink: 0; }";
-    chunk += ".btn-go { padding: 10px 18px; background: #00ff88; color: #000; "
-             "border: none; border-radius: 6px; font-weight: bold; cursor: "
+    chunk += ".btn-go,.btn-edit{width:auto;min-height:40px;padding:9px 14px}"
+             ".btn-go {background:var(--accent);color:#18200b;"
+             "border:none;border-radius:10px;font-weight:bold;cursor:"
              "pointer; text-transform: uppercase; font-size: 14px; }";
     chunk +=
-        ".btn-edit { padding: 10px 18px; background: #ff8800; color: #fff; "
-        "border: none; border-radius: 6px; font-weight: bold; cursor: "
+        ".btn-edit{background:var(--card-strong);color:var(--text);border:1px "
+        "solid var(--line);border-radius:10px;font-weight:bold;cursor:"
         "pointer; text-transform: uppercase; font-size: 14px; }";
-    chunk += ".btn-edit:hover { background: #ff9922; }";
+    chunk += ".btn-edit:hover{border-color:var(--cyan)}";
 
-    chunk += "input { width: 100%; padding: 12px; margin-bottom: 20px; "
-             "background: #222; border: 1px solid #444; color: white; "
-             "border-radius: 8px; font-size: 16px; outline: none; }";
-    chunk += "input:focus { border-color: #00ff88; }";
+    chunk += "#search{margin-bottom:10px}.filter-favorite{display:flex;align-"
+             "items:center;gap:8px;min-height:48px;padding:10px 13px;border:1px "
+             "solid var(--line);border-radius:13px;background:rgba(4,13,24,.74);"
+             "color:var(--text);white-space:nowrap}.filter-favorite input{width:"
+             "auto;min-height:0;margin:0;accent-color:var(--accent)}";
 
     // Modal CSS
     chunk +=
-        ".modal { display:none; position:fixed; top:0; left:0; width:100%; "
-        "height:100%; background:rgba(0,0,0,0.9); z-index:1000; padding:20px; "
+        ".modal{display:none;position:fixed;inset:0;width:100%;height:100%;"
+        "background:rgba(1,7,13,.88);z-index:1000;padding:20px;"
         "box-sizing:border-box; overflow-y:auto; }";
-    chunk += ".modal-content { background:#111; padding:20px; border:1px solid "
-             "#333; border-radius:10px; max-width:500px; margin:20px auto; }";
-    chunk += "label { display:block; margin-bottom:5px; color:#888; "
-             "font-size:12px; }";
+    chunk += ".modal-content{background:linear-gradient(145deg,var(--card-"
+             "strong),var(--card));padding:20px;border:1px solid var(--line);"
+             "border-radius:18px;max-width:540px;margin:20px auto;box-shadow:"
+             "var(--shadow)}.modal-content h2{margin-bottom:18px}.modal-content>"
+             "input:not([type=hidden]){margin-bottom:14px}.modal-actions{display:"
+             "grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:20px}.led-"
+             "field{display:flex;gap:8px;align-items:stretch;margin-bottom:14px}"
+             ".led-field input{flex:1;min-width:0}.led-field button{width:auto;"
+             "white-space:nowrap}.favorite-field{display:flex;align-items:center;"
+             "gap:10px;color:var(--text);margin-top:4px}.favorite-field input{"
+             "width:auto;min-height:0;margin:0;accent-color:var(--accent)}.empty-state{"
+             "padding:42px 20px;text-align:center;color:var(--sub);border:1px "
+             "dashed var(--line);border-radius:16px}@media(max-width:560px){"
+             ".filter-card{top:0}.btn-group{gap:5px}.btn-go,.btn-edit{padding:"
+             "8px 10px;font-size:12px}.cd{padding:12px}.list-summary{align-items:"
+             "flex-start;flex-direction:column}.modal{padding:8px}.modal-content{"
+             "margin:8px auto;padding:17px}.modal-actions{grid-template-columns:"
+             "1fr}.led-field{flex-direction:column}.led-field button{width:100%}}";
 
     chunk += "</style></head><body>";
     server.sendContent(chunk);
 
     // 2. Send BODY Content (Headers & Filters)
-    chunk = "<h1>Library Remote</h1>";
+    chunk = "<header class='hero browser-head'><div class='eyebrow'>Remote "
+            "control</div><h1>Your library</h1><p class='subtitle'>Find a "
+            "record, light its shelf position, or update its details.</p></"
+            "header><section class='card filter-card'>";
     chunk += "<input type='text' id='search' placeholder='Search...' "
-             "onkeyup='filter()'>";
+             "oninput='filter()' aria-label='Search the library'>";
 
     // Filter Controls Container
-    chunk += "<div style='display:flex; gap:10px; margin-bottom:20px; "
-             "flex-wrap:wrap;'>";
+    chunk += "<div class='filter-row'>";
 
     // Genre Filter
-    chunk += "<select id='filterGenre' onchange='filter()' "
-             "style='padding:10px; background:#222; color:white; border:1px "
-             "solid #444; border-radius:6px; height:44px;'>";
+    chunk += "<select id='filterGenre' onchange='filter();syncDeviceFilter()' "
+             "aria-label='Filter by genre'>";
     chunk += "<option value=''>All Genres</option>";
     server.sendContent(chunk);
 
@@ -1564,9 +1560,8 @@ void setupWebHandlers() {
     server.sendContent("</select>");
 
     // Decade & Favorites Filters
-    chunk = "<select id='filterDecade' onchange='filter()' "
-            "style='padding:10px; background:#222; color:white; border:1px "
-            "solid #444; border-radius:6px; height:44px;'>";
+    chunk = "<select id='filterDecade' onchange='filter();syncDeviceFilter()' "
+            "aria-label='Filter by decade'>";
     chunk += "<option value=''>All Decades</option>";
     chunk += "<option value='60'>60s</option><option "
              "value='70'>70s</option><option value='80'>80s</option>";
@@ -1575,15 +1570,16 @@ void setupWebHandlers() {
              "value='10'>2010s</option><option value='20'>2020s</option>";
     chunk += "</select>";
 
-    chunk += "<label style='display:flex; align-items:center; gap:8px; "
-             "padding:10px; background:#222; border:1px solid #444; "
-             "border-radius:6px; height:44px;'>";
-    chunk += "<input type='checkbox' id='filterFav' onchange='filter()' "
-             "style='width:auto; margin:0;'>";
+    chunk += "<label class='filter-favorite'>";
+    chunk += "<input type='checkbox' id='filterFav' "
+             "onchange='filter();syncDeviceFilter()'>";
     chunk += "<span>&#9733; Favorites Only</span></label>";
-    chunk += "</div>";
+    chunk += "</div></section>";
 
-    chunk += "<div id='list'></div>";
+    chunk += "<div class='list-summary'><span id='result-count'></span><span>"
+             "Tap GO to locate an item</span></div><div id='list'></div>";
+    chunk += "<div id='browser-feedback' class='feedback' role='status' "
+             "aria-live='polite'></div>";
 
     // EDIT MODAL
     chunk += "<div id='edit-modal' class='modal'><div "
@@ -1598,14 +1594,10 @@ void setupWebHandlers() {
     chunk += "<label>LED Index <span "
              "style='font-size:11px;opacity:0.6'>(comma-separated, e.g., "
              "10,11,12)</span></label>";
-    chunk += "<div style='display:flex;gap:8px;align-items:stretch'>";
-    chunk += "<input id='edit-ledIndex' type='text' style='flex:1;padding:10px "
-             "12px;font-size:14px'>";
-    chunk +=
-        "<button onclick='openLEDSelector()' type='button' style='padding:10px "
-        "16px;background:#00ff88;color:#000;border:none;border-radius:6px;font-"
-        "weight:bold;cursor:pointer;white-space:nowrap'>🎯 SELECT "
-        "LEDs</button>";
+    chunk += "<div class='led-field'>";
+    chunk += "<input id='edit-ledIndex' type='text'>";
+    chunk += "<button onclick='openLEDSelector()' type='button' class='btn-"
+             "secondary'>&#9678; SELECT LEDs</button>";
     chunk += "</div>";
     String barcodeLabel = getCodeLabel();
     if (barcodeLabel.endsWith(":"))
@@ -1613,18 +1605,14 @@ void setupWebHandlers() {
           barcodeLabel.substring(0, barcodeLabel.length() - 1); // remove ':'
     chunk += "<label>" + barcodeLabel + "</label><input id='edit-barcode'>";
     chunk += "<label>Notes</label><input id='edit-notes'>";
-    chunk += "<label style='display:flex;align-items:center;gap:10px'><input "
-             "type='checkbox' id='edit-fav' style='width:auto;margin:0'> "
+    chunk += "<label class='favorite-field'><input "
+             "type='checkbox' id='edit-fav'> "
              "Favorite</label>";
-    chunk += "<div style='display:flex; gap:10px; margin-top:20px;'>";
-    chunk += "<button onclick='saveEdit()' style='flex:1; padding:12px; "
-             "background:#00ff88; color:#000; border:none; border-radius:6px; "
-             "font-weight:bold; cursor:pointer;'>SAVE CHANGES</button>";
+    chunk += "<div class='modal-actions'>";
+    chunk += "<button id='save-edit' onclick='saveEdit()'>SAVE CHANGES</button>";
     chunk += "<button "
              "onclick=\"document.getElementById('edit-modal').style.display='"
-             "none'\" style='flex:1; padding:12px; background:#444; "
-             "color:#fff; border:none; border-radius:6px; font-weight:bold; "
-             "cursor:pointer;'>CANCEL</button>";
+             "none'\" class='btn-secondary'>CANCEL</button>";
     chunk += "</div>";
     chunk += "</div></div>";
 
@@ -1632,8 +1620,13 @@ void setupWebHandlers() {
 
     // 3. Send SCRIPT - Start
     chunk = "<script>";
-    chunk += "window.onerror = function(msg, url, line, col, error) { "
-             "alert('JS Error: ' + msg); return false; };";
+    chunk += "const browserFeedback=document.getElementById('browser-feedback');"
+             "function showBrowserFeedback(message,type=''){browserFeedback."
+             "textContent=message;browserFeedback.className='feedback show '+"
+             "type;setTimeout(()=>{browserFeedback.className='feedback';},"
+             "4500);}window.onerror=function(msg){console.error(msg);"
+             "showBrowserFeedback('The page hit an unexpected error. Refresh "
+             "and try again.','error');return false;};";
     chunk += "const library = [";
     server.sendContent(chunk);
 
@@ -1675,6 +1668,11 @@ void setupWebHandlers() {
     chunk += "const esc=s=>String(s??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));";
     chunk += "function render(items) {";
     chunk += "  list.innerHTML = '';";
+    chunk += "  document.getElementById('result-count').textContent=items.length+"
+             "' of '+library.length+' records';";
+    chunk += "  if(items.length===0){list.innerHTML=\"<div class='empty-state'>"
+             "No matching records. Try a broader search or clear a filter.</div>\";"
+             "return;}";
     chunk += "  items.forEach(cd => {";
     chunk += "    const div = document.createElement('div');";
     chunk += "    div.className = 'cd';";
@@ -1750,9 +1748,7 @@ void setupWebHandlers() {
     chunk += "previewEditTimer=setTimeout(()=>{";
     chunk += "const leds=document.getElementById('edit-ledIndex').value;";
     chunk += "if(!leds)return;";
-    chunk += "fetch('/api/"
-             "control',{method:'POST',headers:{'Content-Type':'application/"
-             "x-www-form-urlencoded'},body:'action=ledpreview&leds='+leds})";
+    chunk += "doAction('ledpreview','&leds='+encodeURIComponent(leds))";
     chunk += ".catch(e=>console.error('Preview error:',e));";
     chunk += "},200);";
     chunk += "}";
@@ -1765,7 +1761,7 @@ void setupWebHandlers() {
     chunk += "});";
     chunk += "";
 
-    chunk += "function saveEdit() {";
+    chunk += "async function saveEdit() {";
     chunk += "  var id=document.getElementById('edit-id').value; var "
              "t=document.getElementById('edit-title').value; ";
     chunk += "  var a=document.getElementById('edit-artist').value; var "
@@ -1777,18 +1773,25 @@ void setupWebHandlers() {
     chunk += "  var bc=document.getElementById('edit-barcode').value; ";
     chunk += "  var n=document.getElementById('edit-notes').value; ";
 
+    chunk += "  const btn=document.getElementById('save-edit');btn.disabled=true;"
+             "btn.textContent='SAVING...';try{";
     chunk +=
-        "  doAction('edit', "
-        "'&id='+id+'&title='+encodeURIComponent(t)+'&artist='+"
-        "encodeURIComponent(a)+'&genre='+encodeURIComponent(g)+'&year='+y+"
-        "'&fav='+f+'&uniqueID='+encodeURIComponent(uid)+'&ledIndex='+li+'&"
-        "barcode='+encodeURIComponent(bc)+'&notes='+encodeURIComponent(n)); ";
+        "  await doAction('edit', "
+        "'&id='+encodeURIComponent(id)+'&title='+encodeURIComponent(t)+"
+        "'&artist='+encodeURIComponent(a)+'&genre='+encodeURIComponent(g)+"
+        "'&year='+encodeURIComponent(y)+'&fav='+f+'&uniqueID='+"
+        "encodeURIComponent(uid)+'&ledIndex='+encodeURIComponent(li)+"
+        "'&barcode='+encodeURIComponent(bc)+'&notes='+encodeURIComponent(n)); ";
 
-    chunk += "  var cd = library.find(c=>c.id==id); if(cd){ cd.title=t; "
-             "cd.artist=a; cd.genre=g; cd.year=y; cd.favorite=f; "
-             "cd.uniqueID=uid; cd.ledIndex=li; cd.barcode=bc; cd.notes=n; "
-             "render(library); } ";
-    chunk += "  document.getElementById('edit-modal').style.display='none'; }";
+    chunk += "  const cd=library.find(c=>c.id==id);if(cd){cd.title=t;"
+             "cd.artist=a;cd.genre=g;cd.year=Number(y)||0;cd.favorite=f;"
+             "cd.uniqueID=uid;cd.ledIndices=li.split(',').map(v=>parseInt(v."
+             "trim())).filter(Number.isFinite);cd.ledIndex=cd.ledIndices[0]??"
+             "-1;cd.barcode=bc;cd.notes=n;filter();}";
+    chunk += "  document.getElementById('edit-modal').style.display='none';"
+             "showBrowserFeedback('Changes saved.','success');}catch(e){"
+             "showBrowserFeedback('Save failed: '+e.message,'error');}finally{btn.disabled="
+             "false;btn.textContent='SAVE CHANGES';}}";
 
     chunk += "function filter() {";
     chunk +=
@@ -1815,26 +1818,38 @@ void setupWebHandlers() {
     chunk += "    return true;";
     chunk += "  });";
     chunk += "  render(filtered);";
-    chunk += "  const hasFilters = genreFilter || decadeFilter || favFilter;";
+    chunk += "}";
 
-    // SECURE ACTION CALL
-    chunk += "  if (hasFilters) {";
+    // Only filter controls affect the physical LEDs. Text search remains a
+    // browser-local operation and must not issue a device command per key.
+    chunk += "function syncDeviceFilter(){";
+    chunk += "  const genre=document.getElementById('filterGenre').value;";
+    chunk += "  const decade=document.getElementById('filterDecade').value;";
+    chunk += "  const favorite=document.getElementById('filterFav').checked;";
+    chunk += "  if(genre||decade||favorite){";
     chunk += "    const genre = document.getElementById('filterGenre').value;";
     chunk +=
         "    doAction('applyfilter', '&genre=' + encodeURIComponent(genre) + "
-        "'&decade=' + decadeFilter + '&favorites=' + favFilter);";
+        "'&decade=' + encodeURIComponent(decade) + '&favorites=' + favorite)"
+        ".catch(e=>showBrowserFeedback('Filter failed: '+e.message,'error'));";
     chunk += "  } else {";
-    chunk += "    doAction('clearfilter');";
+    chunk += "    doAction('clearfilter').catch(e=>showBrowserFeedback('Filter "
+             "failed: '+e.message,'error'));";
     chunk += "  }";
     chunk += "}";
 
-    chunk += "function select(id) { doAction('select', '&id='+id); }";
+    chunk += "function select(id){doAction('select','&id='+encodeURIComponent("
+             "id)).then(()=>showBrowserFeedback('Item selected on the device.',"
+             "'success')).catch(e=>showBrowserFeedback('Selection failed: '+"
+             "e.message,'error'));}";
 
     // SECURE doAction
-    chunk += "function doAction(act, params='') {";
-    chunk += "  fetch('/api/control',{method:'POST',headers:{'Content-Type':"
+    chunk += "async function doAction(act,params=''){";
+    chunk += "  const r=await fetch('/api/control',{method:'POST',headers:{'Content-Type':"
              "'application/x-www-form-urlencoded'},body:'action='+encodeURIComponent(act)+"
-             "params).then(r=>console.log(r.status));";
+             "params});const message=await r.text();if(r.status===401){location."
+             "reload();throw new Error('Session expired');}if(!r.ok)throw new "
+             "Error(message||('Request failed: '+r.status));return message;";
     chunk += "}";
 
     chunk += "</script>";
@@ -1855,63 +1870,60 @@ void setupWebHandlers() {
     String html =
         "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Backup & "
         "Restore</title><meta name='viewport' content='width=device-width, "
-        "initial-scale=1'></head>";
-    html += "<body style='font-family:sans-serif; background:#000; color:#fff; "
-            "padding:20px; max-width:600px; margin:0 auto;'>";
-    html += "<h1 style='color:#00ff88'>Backup & Restore</h1>";
+        "initial-scale=1'><style>";
+    html += getCommonCSS();
+    html += ".backup-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}"
+            ".backup-card{display:flex;flex-direction:column}.backup-card p{"
+            "color:var(--sub);margin:8px 0 18px}.backup-card .action{margin-top:"
+            "auto}.backup-card a{text-decoration:none}.file-picker{padding:8px;"
+            "margin:8px 0 14px}.file-picker::file-selector-button{background:"
+            "var(--card-strong);color:var(--text);border:1px solid var(--line);"
+            "border-radius:9px;padding:9px 12px;margin-right:10px;cursor:pointer}"
+            ".notice{padding:12px 13px;margin:4px 0 14px;border-radius:12px;"
+            "border:1px solid rgba(255,173,66,.42);background:rgba(255,173,66,"
+            ".08);color:#ffd28b;font-size:13px}code{color:var(--accent);font-"
+            "family:ui-monospace,Consolas,monospace}@media(max-width:650px){"
+            ".backup-grid{grid-template-columns:1fr}}</style></head><body>";
+    html += "<header class='hero'><div class='eyebrow'>Data safety</div><h1>"
+            "Backup &amp; restore</h1><p class='subtitle'>Keep a portable copy "
+            "of your collection or restore one you saved earlier.</p></header>";
     String libFile = getLibraryFileName();
-    html +=
-        "<p>Manage your library database (<code>" + libFile + "</code>).</p>";
+    html += "<div class='notice'>Active database: <code>" + libFile +
+            "</code>. Keep the device powered while a backup is processed.</div>";
 
     // Export (JSONL)
-    html += "<div style='background:#111; padding:20px; border:1px solid #333; "
-            "border-radius:10px; margin-bottom:20px;'>";
-    html += "<h2>⬇️ Export Library</h2><p style='color:#ccc'>Download all data "
-            "as a single .jsonl file (Line-delimited JSON).</p>";
-    html += "<a href='/api/export_backup' download='library_backup.jsonl'><button style='padding:12px "
-            "25px; background:#00ff88; color:#000; border:none; "
-            "border-radius:5px; font-weight:bold; cursor:pointer;'>EXPORT "
-            "FULL BACKUP</button></a>";
-    html += "</div>";
+    html += "<div class='backup-grid'><section class='card backup-card'>";
+    html += "<div class='section-kicker'>Download</div><h2>Export library</h2>"
+            "<p>Save your records as one line-delimited JSON file that you can "
+            "store on another device.</p>";
+    html += "<a class='action' href='/api/export_backup' download='library_"
+            "backup.jsonl'><button type='button'>Download full backup</button>"
+            "</a></section>";
 
     // Import (JSONL)
-    html += "<div style='background:#111; padding:20px; border:1px solid #333; "
-            "border-radius:10px;'>";
-    html += "<h2>⬆️ Import Backup</h2><p style='color:#ffaa00'>⚠️ Warning: "
-            "Adds/Overwrites items from the backup file.</p>";
-    html += "<form method='POST' action='/api/import_backup' enctype='multipart/form-data'>";
-    html +=
-        "<input type='file' name='data' accept='.jsonl' onchange='var "
-        "b=document.getElementById(\"btnR\"); b.disabled=!this.files.length; "
-        "b.style.opacity=this.files.length?1:0.5; "
-        "b.style.cursor=this.files.length?\"pointer\":\"not-allowed\";' "
-        "style='margin-bottom:15px; width:100%; padding:10px; background:#222; "
-        "border:1px solid #444; border-radius:5px;'><br>";
-    html +=
-        "<input type='submit' id='btnR' value='RESTORE FROM BACKUP' disabled "
-        "style='padding:12px 25px; background:#ff4444; color:#fff; "
-        "border:none; border-radius:5px; font-weight:bold; "
-        "cursor:not-allowed; opacity:0.5;'>";
-    html += "</form></div>";
+    html += "<section class='card backup-card'><div class='section-kicker'>"
+            "Upload</div><h2>Restore backup</h2><p>Select a <code>.jsonl</code> "
+            "backup. Matching records may be overwritten and new records will "
+            "be added.</p>";
+    html += "<form id='restoreForm' method='POST' action='/api/import_backup' "
+            "enctype='multipart/form-data'><label for='restoreFile'>Backup "
+            "file</label><input class='file-picker' id='restoreFile' type='file' "
+            "name='data' accept='.jsonl,application/x-ndjson'>";
+    html += "<button class='btn-danger' type='submit' id='btnR' disabled>"
+            "Restore from backup</button></form></section></div>";
 
-    html += "<div style='margin-top: 40px; border-top: 1px solid #333; "
-            "padding-top: 20px;'>";
-    html += "<h3 style='text-align:center; color:#fff; font-size: 14px; "
-            "margin-bottom: 15px; text-transform: uppercase; letter-spacing: "
-            "1px;'>Navigation</h3>";
-    html += "<div style='display: grid; grid-template-columns: repeat(5, 1fr); "
-            "gap: 10px;'>";
-    html += "<button onclick=\"location.href='/browse'\" style='font-size: "
-            "13px; padding: 10px;'>&#128241; Remote</button>";
-    html += "<button onclick=\"location.href='/scan'\" style='font-size: 13px; "
-            "padding: 10px;'>&#128247; Scanner</button>";
-    html += "<button onclick=\"location.href='/link'\" style='font-size: 13px; "
-            "padding: 10px;'>&#128444; Covers</button>";
-    html += "<button onclick=\"location.href='/backup'\" style='font-size: "
-            "13px; padding: 10px;'>&#128190; Backup</button>";
-    html += "<button onclick=\"location.href='/manual'\" style='font-size: "
-            "13px; padding: 10px;'>&#128214; Manuals</button>";
-    html += "</div></div>";
+    html += "<div id='restore-feedback' class='feedback' role='status' aria-"
+            "live='polite'></div><script>const file=document.getElementById("
+            "'restoreFile'),form=document.getElementById('restoreForm'),btn="
+            "document.getElementById('btnR'),feedback=document.getElementById("
+            "'restore-feedback');file.addEventListener('change',()=>{btn.disabled="
+            "!file.files.length;feedback.className='feedback';});form.addEventListener("
+            "'submit',()=>{btn.disabled=true;btn.innerHTML='<span class=\"spinner\">"
+            "</span>Uploading backup';feedback.textContent='Uploading and "
+            "validating your backup. Keep this page open.';feedback.className="
+            "'feedback show';});</script>";
+
+    html += getWebFooter();
     html += "</body></html>";
     server.send(200, "text/html; charset=utf-8", html);
   });
@@ -2066,11 +2078,21 @@ void setupWebHandlers() {
           return server.send(503, "text/plain",
                              "Background queue is full; try again");
         }
-        server.send(202, "text/html",
-                    "<html><head><meta http-equiv='refresh' content='12;url=/backup'></head>"
-                    "<body style='background:#000;color:#00ff88;font-family:sans-serif;text-align:center;'>"
-                    "<h1>Import started</h1><p>The interface remains responsive while the backup is verified.</p>"
-                    "<p>The device will restart automatically after a successful import.</p></body></html>");
+        String importPage = "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+                            "<meta name='viewport' content='width=device-width,"
+                            "initial-scale=1'><meta http-equiv='refresh' content='"
+                            "12;url=/backup'><title>Import started</title><style>";
+        importPage += getCommonCSS();
+        importPage += "body{display:grid;place-items:center;text-align:center}."
+                      "import-card{width:100%;max-width:460px}.import-card .spinner"
+                      "{width:28px;height:28px;border-width:3px;margin:0 0 16px}"
+                      "</style></head><body><main class='card import-card'><span "
+                      "class='spinner'></span><div class='eyebrow'>Backup restore"
+                      "</div><h1>Import started</h1><p class='subtitle'>The device"
+                      " is validating the file in the background. It will restart"
+                      " automatically after a successful import.</p></main></body>"
+                      "</html>";
+        server.send(202, "text/html; charset=utf-8", importPage);
       },
       []() {
         // 2. Upload Handler
@@ -2152,52 +2174,64 @@ void setupWebHandlers() {
     String chunk =
         "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Digital "
         "Librarian Manual</title><meta name='viewport' "
-        "content='width=device-width, initial-scale=1'>";
+        "content='width=device-width, initial-scale=1'><style>";
+    chunk += getCommonCSS();
     chunk +=
-        "<style>:root { --bg: #000; --text: #ddd; --accent: #00ff88; --card: "
-        "#111; } body { font-family: sans-serif; line-height: 1.6; max-width: "
-        "800px; margin: 0 auto; padding: 20px; background: var(--bg); color: "
-        "var(--text); } h1, h2 { color: var(--accent); border-bottom: 1px "
-        "solid #333; padding-bottom: 10px; } h3 { color: #fff; margin-top: "
-        "25px; } .btn { display: inline-block; padding: 8px 15px; background: "
-        "var(--accent); color: #000; text-decoration: none; border-radius: "
-        "5px; font-weight: bold; margin: 5px; } code { background: #222; "
-        "padding: 2px 6px; border-radius: 4px; font-family: monospace; color: "
-        "#ff8800; } ul { padding-left: 20px; } li { margin-bottom: 8px; } "
-        "strong { color: #fff; } @media print { :root { --bg: #fff; --text: "
-        "#000; --accent: #000; --card: #fff; } body { color: #000; background: "
-        "#fff; padding: 0; } h1, h2, h3, strong { color: #000; border-color: "
-        "#000; } .no-print { display: none; } code { border: 1px solid #ccc; "
-        "background: #eee; color: #000; } }</style></head><body>";
+        ".manual-head{display:flex;align-items:flex-end;justify-content:space-"
+        "between;gap:18px}.manual-head button{width:auto;min-width:120px}.manual-"
+        "grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:"
+        "16px}.manual-section{margin:0}.manual-section h2{margin-bottom:14px}."
+        "manual-section h3{color:var(--accent);margin:16px 0 5px;font-size:14px}"
+        ".manual-section p{color:var(--sub);margin:7px 0}.manual-section ul{"
+        "padding-left:20px;color:var(--sub)}.manual-section li{margin:8px 0}."
+        "manual-section strong{color:var(--text)}code{padding:2px 6px;border-"
+        "radius:5px;background:rgba(4,13,24,.65);color:var(--accent);font-family:"
+        "ui-monospace,Consolas,monospace}@media(max-width:650px){.manual-grid{"
+        "grid-template-columns:1fr}.manual-head{align-items:flex-start;flex-"
+        "direction:column}.manual-head button{width:100%}}@media print{body{"
+        "max-width:none;background:#fff;color:#000;padding:0}.hero{padding:0 0 "
+        "16px}.card{box-shadow:none;border:1px solid #bbb;background:#fff;break-"
+        "inside:avoid}.manual-section p,.manual-section ul,.subtitle{color:#222}"
+        ".manual-section strong,h1,h2{color:#000}.no-print{display:none}}"
+        "</style></head><body>";
     server.sendContent(chunk);
-    chunk =
-        "<div style='display:flex; justify-content:space-between; "
-        "align-items:center;'><h1>Digital Librarian Manual v2.1</h1><button "
-        "class='btn no-print' onclick='window.print()'>🖨️ Print</button></div>";
-    chunk +=
-        "<h2>1. Getting Started</h2><p><strong>Power On:</strong> Connect to "
-        "USB-C power.</p><p><strong>WiFi:</strong> Connect specifically to "
-        "'My_Extender' if using default.</p>";
+    chunk = "<header class='hero manual-head'><div><div class='eyebrow'>Help "
+            "center</div><h1>Digital Librarian manual</h1><p class='subtitle'>"
+            "A quick guide to the touchscreen and web tools.</p></div><button "
+            "class='btn-secondary no-print' onclick='window.print()'>Print "
+            "guide</button></header><div class='manual-grid'>";
+    chunk += "<section class='card manual-section'><div class='section-kicker'>"
+             "01</div><h2>Getting started</h2><p><strong>Power:</strong> Connect "
+             "the device to a stable USB-C power source.</p><p><strong>WiFi:</"
+             "strong> Add or select a saved network in Device Settings. The "
+             "WiFi icon shows the current connection state.</p></section>";
     server.sendContent(chunk);
-    chunk = "<h2>2. Device Interface</h2><ul><li><strong>Search:</strong> Top "
-            "Left</li><li><strong>Add (+):</strong> New "
-            "Entry/Scan</li><li><strong>Tracklist (List):</strong> Tracks & "
-            "Lyrics</li><li><strong>Random:</strong> "
-            "Shuffle</li><li><strong>Filter:</strong> "
-            "Genre/Decade</li><li><strong>Sync:</strong> Refresh "
-            "SD</li><li><strong>Eye:</strong> Toggle LED</li></ul>";
+    chunk = "<section class='card manual-section'><div class='section-kicker'>"
+            "02</div><h2>Touchscreen controls</h2><ul><li><strong>Search:</"
+            "strong> Find records with the on-screen keyboard.</li><li><strong>"
+            "Add (+):</strong> Create a record or fetch its metadata.</li><li>"
+            "<strong>Track list:</strong> Open songs and lyrics.</li><li><strong>"
+            "Shuffle:</strong> Pick a random record.</li><li><strong>Filter:</"
+            "strong> Narrow by genre, decade, or favorites.</li><li><strong>"
+            "Sync:</strong> Complete missing online data.</li><li><strong>Eye:"
+            "</strong> Toggle the shelf locator LED.</li></ul></section>";
     server.sendContent(chunk);
-    chunk = "<h2>3. Web Features</h2><h3>📱 Remote (/browse)</h3><p>Full "
-            "control.</p><h3>📷 Scanner (/scan)</h3><p>Barcode "
-            "scanning.</p><h3>🎨 Covers (/link)</h3><p>Manual artwork.</p>";
+    chunk = "<section class='card manual-section'><div class='section-kicker'>"
+            "03</div><h2>Web tools</h2><h3>Remote library</h3><p>Search, filter, "
+            "select, and edit records from a phone or computer.</p><h3>Code "
+            "scanner</h3><p>Scan one or several barcodes to add records.</p><h3>"
+            "Cover manager</h3><p>Attach an image URL to a record when automatic "
+            "artwork is unavailable.</p></section>";
     server.sendContent(chunk);
-    chunk =
-        "<h2>4. Advanced</h2><ul><li><strong>Lyrics:</strong> "
-        "Synced lyrics from LRCLib.</li><li><strong>Favorites:</strong> "
-        "Magenta "
-        "LEDs.</li><li><strong>Backups:</strong> Full JSON Export/Import.</li>"
-        "<li><strong>Storage:</strong> Database stored in <code>/db/</code> "
-        "folder.</li></ul>";
+    chunk = "<section class='card manual-section'><div class='section-kicker'>"
+            "04</div><h2>Data and maintenance</h2><ul><li><strong>Lyrics:</"
+            "strong> Synced and cached from LRCLib when WiFi is available.</li>"
+            "<li><strong>Favorites:</strong> Highlight important records and "
+            "tracks.</li><li><strong>Backups:</strong> Export before major edits "
+            "and restore from a trusted <code>.jsonl</code> file.</li><li><strong>"
+            "Diagnostics:</strong> Review memory and error history on the Health "
+            "page.</li><li><strong>Storage:</strong> Library data is stored in "
+            "<code>/db/</code>.</li></ul></section></div>";
 
     chunk += "<div class='no-print'>";
     chunk += getWebFooter();
@@ -2217,63 +2251,60 @@ void setupWebHandlers() {
         "<meta name='viewport' content='width=device-width, initial-scale=1'>";
     html += "<title>Error Dashboard</title>";
     html += "<style>";
-    html += ":root{--bg:#000;--text:#ddd;--accent:#00ff88;--card:#111;--warn:#"
-            "ff8800;--error:#ff0044;}";
-    html += "body{margin:0;padding:20px;background:var(--bg);color:var(--text);"
-            "font-family:sans-serif;}";
-    html += "h1{color:var(--accent);margin:0 0 20px 0;}";
-    html += ".container{max-width:1200px;margin:0 auto;}";
-    html += ".stats{display:grid;grid-template-columns:repeat(auto-fit,minmax("
-            "200px,1fr));gap:15px;margin-bottom:30px;}";
-    html += ".stat-card{background:var(--card);padding:20px;border-radius:8px;"
-            "border:1px solid #333;}";
-    html += ".stat-card h3{margin:0 0 10px 0;font-size:14px;color:#888;}";
-    html += ".stat-card "
-            ".value{font-size:28px;font-weight:bold;color:var(--accent);}";
-    html += ".stat-card.warn .value{color:var(--warn);}";
-    html += ".stat-card.error .value{color:var(--error);}";
-    html += ".controls{margin-bottom:20px;display:flex;gap:10px;align-items:"
-            "center;}";
-    html += "button{background:var(--accent);color:#000;border:none;padding:"
-            "10px 20px;border-radius:5px;cursor:pointer;font-weight:bold;}";
-    html += "button:hover{opacity:0.8;}";
-    html += "button.danger{background:var(--error);}";
-    html += ".error-table{background:var(--card);border-radius:8px;overflow:"
-            "hidden;border:1px solid #333;}";
-    html += "table{width:100%;border-collapse:collapse;}";
-    html += "th{background:#222;padding:12px;text-align:left;font-size:12px;"
-            "color:#888;text-transform:uppercase;}";
-    html += "td{padding:12px;border-top:1px solid #333;}";
+    html += getCommonCSS();
+    html += "body{max-width:1040px}.health-stats{display:grid;grid-template-"
+            "columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:16px}.health-"
+            "stat{min-width:0;padding:16px;border:1px solid var(--line-soft);"
+            "border-radius:14px;background:rgba(4,13,24,.48)}.health-stat h3{"
+            "margin-bottom:8px;color:var(--sub);font-size:11px;letter-spacing:"
+            ".08em;text-transform:uppercase}.health-stat .value{overflow:hidden;"
+            "text-overflow:ellipsis;color:var(--accent);font-size:clamp(20px,4vw,"
+            "28px);font-weight:850}.controls{display:flex;align-items:center;gap:"
+            "10px;flex-wrap:wrap;margin-bottom:14px}.controls button{width:auto}."
+            "auto-refresh{display:flex;align-items:center;gap:8px;margin:0 0 0 "
+            "auto;color:var(--text)}.auto-refresh input{width:auto;min-height:0;"
+            "margin:0;accent-color:var(--accent)}.error-table{overflow:auto;"
+            "border:1px solid var(--line-soft);border-radius:14px;background:"
+            "rgba(4,13,24,.42)}table{width:100%;min-width:680px;border-collapse:"
+            "collapse}th{padding:12px;text-align:left;background:rgba(23,52,79,"
+            ".72);color:var(--sub);font-size:11px;letter-spacing:.07em;text-"
+            "transform:uppercase}td{padding:12px;border-top:1px solid var(--line-"
+            "soft);vertical-align:top;font-size:13px}";
     html += ".badge{display:inline-block;padding:4px "
-            "8px;border-radius:4px;font-size:11px;font-weight:bold;}";
-    html += ".badge.info{background:#0088ff;color:#fff;}";
-    html += ".badge.warn{background:var(--warn);color:#000;}";
-    html += ".badge.error{background:var(--error);color:#fff;}";
-    html += ".badge.fatal{background:#ff00ff;color:#fff;}";
-    html += ".empty{text-align:center;padding:40px;color:#666;}";
+            "8px;border-radius:999px;font-size:10px;font-weight:850;}";
+    html += ".badge.info{background:rgba(83,199,255,.2);color:var(--cyan)}";
+    html += ".badge.warn{background:rgba(255,173,66,.2);color:#ffc36f}";
+    html += ".badge.error,.badge.fatal{background:rgba(255,101,95,.2);color:"
+            "#ffaaa6}.empty{text-align:center;padding:40px;color:var(--sub)}.last-"
+            "updated{text-align:center;margin-top:14px;color:var(--sub);font-size:"
+            "12px}@media(max-width:720px){.health-stats{grid-template-columns:1fr "
+            "1fr}.auto-refresh{margin-left:0;width:100%}}";
     html += "</style>";
     html += "</head><body>";
-    html += "<div class='container'>";
-    html += "<h1>📊 Error Dashboard</h1>";
+    html += "<div class='container'><header class='hero'><div class='eyebrow'>"
+            "System health</div><h1>Diagnostics</h1><p class='subtitle'>Review "
+            "device memory, uptime, and recent error history.</p></header>";
 
-    html += "<div class='stats'>";
-    html += "<div class='stat-card'><h3>Free Heap</h3><div class='value' "
-            "id='freeHeap'>-</div></div>";
-    html += "<div class='stat-card'><h3>Min Free Heap</h3><div class='value' "
-            "id='minHeap'>-</div></div>";
-    html += "<div class='stat-card'><h3>Uptime</h3><div class='value' "
-            "id='uptime'>-</div></div>";
-    html += "<div class='stat-card'><h3>Error Count</h3><div class='value' "
-            "id='errorCount'>-</div></div>";
+    html += "<section class='card'><div class='health-stats'>";
+    html += "<div class='health-stat'><h3>Free heap</h3><div class='value' "
+             "id='freeHeap'>-</div></div>";
+    html += "<div class='health-stat'><h3>Lowest heap</h3><div class='value' "
+             "id='minHeap'>-</div></div>";
+    html += "<div class='health-stat'><h3>Uptime</h3><div class='value' "
+             "id='uptime'>-</div></div>";
+    html += "<div class='health-stat'><h3>Logged events</h3><div class='value' "
+             "id='errorCount'>-</div></div>";
     html += "</div>";
 
     html += "<div class='controls'>";
-    html += "<button onclick='refresh()'>🔄 Refresh</button>";
-    html += "<button onclick='clearErrors()' class='danger'>🗑️ Clear "
-            "Errors</button>";
-    html += "<label><input type='checkbox' id='autoRefresh'> Auto-refresh "
-            "(5s)</label>";
+    html += "<button onclick='refresh()'>Refresh now</button>";
+    html += "<button onclick='clearErrors()' class='btn-danger'>Clear "
+            "history</button>";
+    html += "<label class='auto-refresh'><input type='checkbox' id='autoRefresh'> Auto-refresh "
+             "(5s)</label>";
     html += "</div>";
+    html += "<div id='health-feedback' class='feedback' role='status' aria-"
+            "live='polite'></div>";
 
     html += "<div class='error-table'>";
     html += "<table><thead><tr>";
@@ -2282,10 +2313,8 @@ void setupWebHandlers() {
     html += "</tr></thead><tbody id='errorTable'></tbody></table>";
     html += "</div>";
 
-    html += "<p "
-            "style='text-align:center;margin-top:20px;color:#666;font-size:"
-            "12px;'>Last updated: <span id='lastUpdate'>-</span></p>";
-    html += "</div>";
+    html += "<p class='last-updated'>Last updated: <span id='lastUpdate'>-</"
+            "span></p></section></div>";
 
     html += "<script>";
     html += "const levels=['INFO','WARN','ERROR','FATAL'];";
@@ -2293,10 +2322,15 @@ void setupWebHandlers() {
             "categories=['NETWORK','STORAGE','API','PARSING','MEMORY','"
             "HARDWARE','SYSTEM'];";
     html += "let autoRefreshInterval=null;";
+    html += "const healthFeedback=document.getElementById('health-feedback');"
+            "function showHealthFeedback(message,type=''){healthFeedback."
+            "textContent=message;healthFeedback.className='feedback show '+type;}";
     html += "const esc=s=>String(s??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));";
 
-    html += "async function loadErrors(){";
-    html += "  const res=await fetch('/api/errors');";
+    html += "async function loadErrors(){try{";
+    html += "  const res=await fetch('/api/errors');if(res.status===401){"
+            "location.reload();return;}if(!res.ok)throw new Error(await res."
+            "text()||('Request failed: '+res.status));";
     html += "  const data=await res.json();";
     html += "  "
             "document.getElementById('freeHeap').textContent=(data.freeHeap/"
@@ -2328,12 +2362,16 @@ void setupWebHandlers() {
     html += "  }";
     html += "  document.getElementById('lastUpdate').textContent=new "
             "Date().toLocaleTimeString();";
-    html += "}";
+    html += "}catch(e){document.getElementById('lastUpdate').textContent="
+            "'Refresh failed';showHealthFeedback('Could not load diagnostics: '+"
+            "e.message,'error');}}";
 
     html += "async function clearErrors(){";
     html += "  if(!confirm('Clear all error logs?'))return;";
-    html += "  await fetch('/api/errors/clear',{method:'POST'});";
-    html += "  loadErrors();";
+    html += "  try{const res=await fetch('/api/errors/clear',{method:'POST'});"
+            "if(res.status===401){location.reload();return;}if(!res.ok)throw "
+            "new Error(await res.text()||'Clear failed');await loadErrors();}"
+            "catch(e){showHealthFeedback('Clear failed: '+e.message,'error');}";
     html += "}";
 
     html += "function refresh(){loadErrors();}";
@@ -2351,33 +2389,11 @@ void setupWebHandlers() {
     html += "loadErrors();";
     html += "</script>";
 
-    // Add global footer
-    html += "<div style='margin-top: 40px; border-top: 1px solid #333; "
-            "padding-top: 20px;'>";
-    html += "<h3 style='text-align:center; color:#fff; font-size: 14px; "
-            "margin-bottom: 15px; text-transform: uppercase; letter-spacing: "
-            "1px;'>Navigation</h3>";
-    html += "<div style='display: grid; grid-template-columns: repeat(7, 1fr); "
-            "gap: 10px;'>";
-    html += "<button onclick=\"location.href='/'\" style='font-size: 13px; "
-            "padding: 10px;'>&#127968; Dashboard</button>";
-    html += "<button onclick=\"location.href='/scan'\" style='font-size: 13px; "
-            "padding: 10px;'>&#128247; Scanner</button>";
-    html += "<button onclick=\"location.href='/browse'\" style='font-size: "
-            "13px; padding: 10px;'>&#128241; Browse</button>";
-    html += "<button onclick=\"location.href='/link'\" style='font-size: 13px; "
-            "padding: 10px;'>&#128444; Covers</button>";
-    html += "<button onclick=\"location.href='/backup'\" style='font-size: "
-            "13px; padding: 10px;'>&#128190; Backup</button>";
-    html += "<button onclick=\"location.href='/manual'\" style='font-size: "
-            "13px; padding: 10px;'>&#128214; Manuals</button>";
-    html += "<button onclick=\"location.href='/errors'\" style='font-size: "
-            "13px; padding: 10px;'>&#128681; Errors</button>";
-    html += "</div></div>";
+    html += getWebFooter();
 
     html += "</body></html>";
 
-    server.send(200, "text/html", html);
+    server.send(200, "text/html; charset=utf-8", html);
   });
 
   server.on("/restart", HTTP_POST, []() {

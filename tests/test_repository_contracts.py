@@ -16,6 +16,7 @@ CORE = (ROOT / "Core_Data.h").read_text(encoding="utf-8")
 NAVIGATION = (ROOT / "NavigationCache.h").read_text(encoding="utf-8")
 GLOBALS = (ROOT / "AppGlobals.cpp").read_text(encoding="utf-8")
 UTILS = (ROOT / "Utils.cpp").read_text(encoding="utf-8")
+WEB_INTERFACE = (ROOT / "WebInterface.h").read_text(encoding="utf-8")
 TOUCH_PORT = (ROOT / "Waveshare_ST7262_LVGL.cpp").read_text(encoding="utf-8")
 RUNTIME_DIAGNOSTICS = (ROOT / "RuntimeDiagnostics.cpp").read_text(
     encoding="utf-8"
@@ -84,10 +85,49 @@ class RepositoryContracts(unittest.TestCase):
         self.assertNotIn("?pin=", SKETCH)
         self.assertNotIn("searchParams.set('pin'", SKETCH)
 
+    def test_embedded_web_pages_have_responsive_and_checked_interactions(self):
+        for route in ("/scan", "/browse", "/link", "/backup", "/manual",
+                      "/errors", "/led-select"):
+            self.assertIn(f'server.on("{route}", HTTP_GET', SKETCH)
+        self.assertIn('<meta charset="UTF-8">', WEB_INTERFACE)
+        self.assertNotIn('server.send(200, "text/html", html)', SKETCH)
+        self.assertNotIn('server.send(401, "text/html", html)', SKETCH)
+        self.assertIn("repeat(auto-fit, minmax(92px, 1fr))", WEB_INTERFACE)
+        self.assertIn("class='site-nav'", SKETCH)
+        self.assertGreaterEqual(SKETCH.count("getCommonCSS()"), 8)
+        self.assertIn("No matching records. Try a broader search", SKETCH)
+        self.assertIn("validating your backup. Keep this page open", SKETCH)
+
+        led_page = SKETCH[SKETCH.index("// LED Selector Web UI"):]
+        led_page = led_page[:led_page.index("// 4. Scanner Tool")]
+        self.assertIn("led.onclick=()=>toggle(i,led)", led_page)
+        self.assertNotIn("event.target.classList", led_page)
+        self.assertIn("if(!r.ok)", led_page)
+
+        browser = SKETCH[SKETCH.index("// 6. Remote Browser"):]
+        browser = browser[:browser.index("// 4. Backup & Restore")]
+        self.assertIn("async function saveEdit()", browser)
+        self.assertIn("await doAction('edit'", browser)
+        self.assertIn("params});const message=await r.text()", browser)
+        local_filter = browser[browser.index('chunk += "function filter()'):]
+        local_filter = local_filter[:local_filter.index(
+            "function syncDeviceFilter")]
+        self.assertNotIn("doAction(", local_filter)
+        self.assertIn('"http://" + (mdns_name.length()', UI)
+        self.assertNotIn('lv_label_set_text(url_lbl, "http://mylibrary.local")',
+                         UI)
+
     def test_auth_cookie_does_not_contain_the_pin(self):
         self.assertIn('"DL_AUTH=" + webSessionToken', SKETCH)
         self.assertNotIn('"DL_AUTH=" + web_pin', SKETCH)
         self.assertIn("webRequestAuthorized(bool allowFormPin = false)", SKETCH)
+
+    def test_web_login_accepts_alphanumeric_pins_on_mobile(self):
+        login = SKETCH[SKETCH.index("void sendWebLoginPage"):]
+        login = login[:login.index("bool parseLedIndices")]
+        self.assertIn("type='password' inputmode='text'", login)
+        self.assertIn("autocapitalize='none' spellcheck='false'", login)
+        self.assertNotIn("inputmode='numeric'", login)
 
     def test_storage_writes_use_temporary_files(self):
         self.assertIn('String tmpPath = path + ".tmp";', STORAGE)
@@ -127,8 +167,18 @@ class RepositoryContracts(unittest.TestCase):
         self.assertIn("lvgl_port_unlock", random_action)
 
     def test_cover_reads_are_verified(self):
-        self.assertIn("bytesRead != jpg_size", UI)
-        self.assertIn("MALLOC_CAP_SPIRAM", UI)
+        cover_render = WORKER[WORKER.index("bool renderCoverFromStorage"):]
+        cover_render = cover_render[:cover_render.index("} // namespace")]
+        self.assertIn("offset != jpegSize", cover_render)
+        self.assertIn("MALLOC_CAP_SPIRAM", cover_render)
+        self.assertIn("MAX_RENDER_COVER_BYTES", cover_render)
+        self.assertIn("scaleCoverToViewport", cover_render)
+        cover_scaling = WORKER[WORKER.index("void scaleCoverToViewport"):]
+        cover_scaling = cover_scaling[:cover_scaling.index(
+            "bool renderCoverFromStorage")]
+        self.assertIn("targetWidth = 240", cover_scaling)
+        self.assertIn("targetHeight = 240", cover_scaling)
+        self.assertIn("JOB_COVER_RENDER", UI)
 
     def test_https_clients_verify_certificates(self):
         self.assertNotIn("setInsecure()", NETWORK)
@@ -404,11 +454,9 @@ class RepositoryContracts(unittest.TestCase):
         self.assertIn("String *errorDetail", cover_download)
         self.assertIn("Image transfer stopped at", cover_download)
         self.assertIn("SD write or file replacement failed", cover_download)
-        self.assertIn("millis() - startedAt < streamTimeoutMs", cover_download)
-        self.assertIn("millis() - lastDataAt < idleTimeoutMs", cover_download)
-        self.assertIn(
-            "http.connected() || stream->available() > 0", cover_download
-        )
+        self.assertIn("BoundedPsramBufferWriter", cover_download)
+        self.assertIn("http.writeToStream(&download)", cover_download)
+        self.assertIn("download.timedOut()", cover_download)
         self.assertIn(
             "downloadCoverImage(\n                  downloadUrl, savePath, true)",
             bulk_sync,
@@ -838,14 +886,45 @@ class RepositoryContracts(unittest.TestCase):
     def test_cache_and_favorite_failures_cannot_leave_stale_ui_state(self):
         self.assertIn("inline void invalidateNavigationCache", NAVIGATION)
         self.assertIn("libraryIndex < 0 || libraryIndex >= totalItems", NAVIGATION)
-        delete_handler = UI[UI.index("if (deleteItemAt(edit_item_index))"):]
-        delete_handler = delete_handler[:delete_handler.index("} else {")]
-        self.assertIn("invalidateNavigationCache", delete_handler)
+        self.assertIn("JOB_ITEM_DELETE", UI)
+        delete_job = WORKER[WORKER.index("case JOB_ITEM_DELETE"):]
+        delete_job = delete_job[:delete_job.index("case JOB_LIBRARY_WIPE")]
+        self.assertIn("invalidateNavigationCache", delete_job)
         favorite_job = WORKER[WORKER.index("case JOB_PERSIST_FAVORITE"):]
         favorite_job = favorite_job[:favorite_job.index("case JOB_PERSIST_TRACK_FAVORITE")]
         self.assertIn("item.favorite = !favorite", favorite_job)
         self.assertIn("_favoriteFailureReady = true", favorite_job)
         self.assertIn("takeFavoritePersistenceFailure", UI)
+        self.assertIn("_trackFavoriteFailureReady = true", WORKER)
+        self.assertIn("takeTrackFavoritePersistenceFailure", UI)
+
+    def test_audited_slow_paths_use_bounded_background_work(self):
+        for job in (
+            "JOB_COVER_RENDER",
+            "JOB_LIBRARY_RELOAD",
+            "JOB_ITEM_DELETE",
+            "JOB_LIBRARY_WIPE",
+        ):
+            self.assertIn(f"case {job}", WORKER)
+            self.assertIn(job, UI)
+
+        bulk_sync = WORKER[WORKER.index("case JOB_BULK_SYNC"):]
+        bulk_sync = bulk_sync[:bulk_sync.index("case JOB_COVER_DOWNLOAD")]
+        initial_read = bulk_sync[bulk_sync.index(
+            "Read detail JSON without holding libraryMutex"
+        ):bulk_sync.index("// 2. Hardware Check")]
+        self.assertIn("Storage.loadCDDetail", initial_read)
+        self.assertNotIn("ensureItemDetailsLoaded", initial_read)
+
+        self.assertIn("getStatusRevision", WORKER)
+        self.assertIn("revision != progress_status_revision", UI)
+
+    def test_large_records_and_backup_paths_are_bounded_and_canonical(self):
+        self.assertIn("MAX_INDEX_LINE_BYTES", STORAGE)
+        self.assertIn("BasicJsonDocument<SpiRamAllocator> doc(capacity)", STORAGE)
+        self.assertIn("if (doc.overflowed())", STORAGE)
+        self.assertIn("canonicalIdentity.toLowerCase()", STORAGE)
+        self.assertIn("recordKey += canonicalIdentity.c_str()", STORAGE)
 
     def test_backup_restore_is_batched_and_runs_off_the_web_callback(self):
         import_route = SKETCH[SKETCH.index('"/api/import_backup", HTTP_POST'):]
@@ -937,7 +1016,8 @@ class RepositoryContracts(unittest.TestCase):
         index_writer = STORAGE[STORAGE.index("bool writeIndexTemp"):]
         index_writer = index_writer[:index_writer.index("} // namespace")]
         self.assertIn("YieldingBufferedFileWriter writer", index_writer)
-        self.assertIn("serializeJson(doc, writer)", index_writer)
+        self.assertIn("writeEscapedJsonString", index_writer)
+        self.assertNotIn("StaticJsonDocument<1024>", index_writer)
 
         self.assertGreaterEqual(STORAGE.count("readFileYielding("), 4)
         yielding_reader = STORAGE[STORAGE.index("size_t readFileYielding"):]

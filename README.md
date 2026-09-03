@@ -183,7 +183,7 @@ sequenceDiagram
 ---
 
 ## 🌐 Web Interface & API
-The Digital Librarian features a robust web server for remote management. Access it via `http://digitallibrarian.local` or the device's IP address.
+The Digital Librarian features a robust web server for remote management. Access it via `http://<mDNS-name>.local` (the default is `http://mylibrary.local`) or the device's IP address. The current address is shown in the on-device Web Interface panel.
 
 ### 📱 User Pages
 | Route | Feature | Description |
@@ -202,8 +202,8 @@ The Digital Librarian features a robust web server for remote management. Access
 You can turn your phone into a professional barcode scanner that automatically registers media to your library.
 
 1.  **Install a Barcode Scanner app** (Any app that supports "Custom Search URL").
-2.  **Log in once** at `http://digitallibrarian.local/scan`, then set the scanner's custom URL to:
-    `http://digitallibrarian.local/scan?code={CODE}`
+2.  **Log in once** at `http://mylibrary.local/scan` (or your configured mDNS name), then set the scanner's custom URL to:
+    `http://mylibrary.local/scan?code={CODE}`
 3.  **Start Scanning**: Simply point your phone at your CD/Book collection. The app will open the link, the Web UI will automatically process the lookup, and the ESP32 will light up the designated LED.
 
 ### 🛠️ Core API Endpoints (POST/GET)

@@ -13,7 +13,6 @@
 #include <Arduino.h>
 #include <FastLED.h>
 #include <SD.h>
-#include <TJpg_Decoder.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <algorithm>
@@ -37,6 +36,7 @@ static lv_obj_t *progress_skip_label = NULL;
 static bool compact_tls_progress_active = false;
 static bool compact_metadata_progress_active = false;
 static bool compact_cancel_requested = false;
+static uint32_t progress_status_revision = 0;
 
 static void dismiss_progress_modal() {
   if (progress_modal)
@@ -50,24 +50,7 @@ static void dismiss_progress_modal() {
   compact_tls_progress_active = false;
   compact_metadata_progress_active = false;
   compact_cancel_requested = false;
-}
-
-// TJpg output callback
-bool tjpg_output(int16_t x, int16_t y, uint16_t w, uint16_t h,
-                 uint16_t *bitmap) {
-  if (y >= 240 || img_buffer == NULL)
-    return 0;
-  int16_t out_w = w;
-  if (x + w > 240)
-    out_w = 240 - x;
-  int16_t out_h = h;
-  if (y + h > 240)
-    out_h = 240 - y;
-
-  for (int16_t j = 0; j < out_h; j++) {
-    memcpy(&img_buffer[(y + j) * 240 + x], &bitmap[j * w], out_w * 2);
-  }
-  return 1;
+  progress_status_revision = 0;
 }
 
 // --- UI Objects Implementation ---
@@ -163,6 +146,8 @@ static bool open_editor_after_detail_load = false;
 static int pending_item_detail_index = -1;
 static MediaMode pending_item_detail_mode = MODE_CD;
 static String pending_item_detail_id = "";
+struct TracklistBuildState;
+static TracklistBuildState *active_tracklist_state = nullptr;
 
 static bool request_item_details(int index, bool openEditor) {
   if (index < 0 || index >= getItemCount())
@@ -539,13 +524,16 @@ void show_info_popup(const char *title, const char *message,
 
 // Helper functions
 // Helper functions
-void load_and_show_cover(String filename);
+static void apply_rendered_cover(uint16_t *pixels);
 void update_filtered_leds();
 bool is_item_match(int index);
 void selectRandomWithEffect();
 void forceUpdateWLED();
 static void apply_metadata_result(const ItemView &staged);
 static void show_metadata_not_found();
+static void handle_track_favorite_failure(const String &releaseMbid,
+                                          int trackIndex,
+                                          bool attemptedValue);
 
 void fetchAllLyrics(const char *releaseMbid);
 
@@ -673,8 +661,10 @@ static void schedule_cover_load(const String &filename) {
         String filename = pending_cover_file;
         if (filename.length() == 0)
           return;
-        load_and_show_cover(filename);
-        displayed_cover_file = filename;
+        if (!BackgroundWorker::addJob(
+                {JOB_COVER_RENDER, filename, -1, "", nullptr, false})) {
+          Serial.println("Cover render queue is busy; keeping placeholder");
+        }
       },
       20, NULL);
   lv_timer_set_repeat_count(cover_load_timer, 1);
@@ -819,6 +809,7 @@ void close_tracklist_ui() {
   lv_obj_t *panelToDelete = tracklist_panel;
   tracklist_panel = NULL;
   tracklist_feedback_label = NULL;
+  active_tracklist_state = nullptr;
   lv_obj_add_flag(panelToDelete, LV_OBJ_FLAG_HIDDEN);
   lv_obj_del_async(panelToDelete);
   lvgl_port_unlock();
@@ -1127,9 +1118,29 @@ static void append_tracklist_row(TracklistBuildState *state, int index) {
         cache_track_summary(favorite->releaseMbid, favorite->trackList);
         apply_track_summary_label(cached_track_summary_text,
                                   cached_track_summary_has_favorites);
-        BackgroundWorker::addJob(
+        const bool queued = BackgroundWorker::addJob(
             {JOB_PERSIST_TRACK_FAVORITE, favorite->releaseMbid, favorite->idx,
              selected.isFavoriteTrack ? "1" : "0", nullptr, false});
+        if (!queued) {
+          selected.isFavoriteTrack = !selected.isFavoriteTrack;
+          lv_obj_set_style_bg_color(
+              button, selected.isFavoriteTrack ? lv_color_hex(0xFFD700)
+                                               : lv_color_hex(0x555555),
+              0);
+          lv_obj_set_style_text_color(
+              label, selected.isFavoriteTrack ? lv_color_hex(0x000000)
+                                              : lv_color_hex(0xCCCCCC),
+              0);
+          cache_track_summary(favorite->releaseMbid, favorite->trackList);
+          apply_track_summary_label(cached_track_summary_text,
+                                    cached_track_summary_has_favorites);
+          if (tracklist_feedback_label) {
+            lv_label_set_text(tracklist_feedback_label,
+                              LV_SYMBOL_WARNING " Favorite was not queued");
+            lv_obj_set_style_text_color(tracklist_feedback_label,
+                                        lv_color_hex(0xFFB340), 0);
+          }
+        }
       },
       LV_EVENT_CLICKED, favoriteData);
   lv_obj_add_event_cb(
@@ -1190,6 +1201,30 @@ static void render_tracklist_page(TracklistBuildState *state) {
     lv_obj_add_state(state->nextButton, LV_STATE_DISABLED);
   else
     lv_obj_clear_state(state->nextButton, LV_STATE_DISABLED);
+}
+
+static void handle_track_favorite_failure(const String &releaseMbid,
+                                          int trackIndex,
+                                          bool attemptedValue) {
+  TracklistBuildState *state = active_tracklist_state;
+  if (state && state->releaseMbid == releaseMbid && trackIndex >= 0 &&
+      trackIndex < (int)state->trackList->tracks.size()) {
+    Track &track = state->trackList->tracks[trackIndex];
+    if (track.isFavoriteTrack == attemptedValue)
+      track.isFavoriteTrack = !attemptedValue;
+    cache_track_summary(state->releaseMbid, state->trackList);
+    apply_track_summary_label(cached_track_summary_text,
+                              cached_track_summary_has_favorites);
+    render_tracklist_page(state);
+    if (tracklist_feedback_label) {
+      lv_label_set_text(tracklist_feedback_label,
+                        LV_SYMBOL_WARNING " Favorite was not saved");
+      lv_obj_set_style_text_color(tracklist_feedback_label,
+                                  lv_color_hex(0xFFB340), 0);
+    }
+  } else {
+    cached_track_summary_mbid = "";
+  }
 }
 
 static void render_tracklist_ui(int idx, const String &releaseMbid,
@@ -1339,6 +1374,7 @@ static void render_tracklist_ui(int idx, const String &releaseMbid,
   TracklistBuildState *buildState = new TracklistBuildState{
       trackList, container, pageLabel, previousButton, nextButton,
       releaseMbid, {}, 0};
+  active_tracklist_state = buildState;
   buildState->visibleTrackIndices.reserve(trackList->tracks.size());
   for (int trackIndex = 0; trackIndex < (int)trackList->tracks.size();
        trackIndex++) {
@@ -1351,6 +1387,8 @@ static void render_tracklist_ui(int idx, const String &releaseMbid,
       [](lv_event_t *e) {
         TracklistBuildState *state =
             (TracklistBuildState *)lv_event_get_user_data(e);
+        if (active_tracklist_state == state)
+          active_tracklist_state = nullptr;
         Storage.deleteTracklist(state->trackList);
         delete state;
       },
@@ -1761,33 +1799,18 @@ void setupMainUI() {
         show_confirmation_popup(
             "Sync Library", "Reload index AND download missing covers?",
             [](lv_event_t *e) { // YES
-              Serial.println("UI: Sync YES clicked. Starting rebuild...");
-              MediaManager::syncFromStorage();
-              Serial.println(
-                  "UI: Library synced from storage. Updating display...");
-              update_item_display();
-              if (WiFi.status() == WL_CONNECTED) {
-                Serial.println(
-                    "UI: Display updated. Queueing bulk sync job...");
-                BackgroundWorker::addJob(
-                    {JOB_BULK_SYNC, "", -1, "", NULL});
-              } else {
-                show_info_popup(
-                    "Library Reloaded",
-                    "The local library is ready. Connect to WiFi before "
-                    "downloading missing covers.",
-                    NULL, NULL);
-              }
-              Serial.println("UI: Job queued. Closing popup...");
+              if (!BackgroundWorker::addJob(
+                      {JOB_LIBRARY_RELOAD, "", -1, "bulk", nullptr, true}))
+                show_info_popup("Busy",
+                                "The library reload could not be queued.",
+                                NULL, NULL);
             },
             [](lv_event_t *e) { // NO
-              Serial.println("UI: Sync NO clicked. Quick sync...");
-              MediaManager::syncFromStorage();
-              Serial.println("UI: Sync done. Updating display...");
-              update_item_display();
-              Serial.println("UI: Display updated. Showing popup...");
-              show_info_popup("Library reloaded from index.", "Success", NULL,
-                              NULL);
+              if (!BackgroundWorker::addJob(
+                      {JOB_LIBRARY_RELOAD, "", -1, "local", nullptr, true}))
+                show_info_popup("Busy",
+                                "The library reload could not be queued.",
+                                NULL, NULL);
             },
             NULL);
       },
@@ -2047,6 +2070,100 @@ void setupMainUI() {
           show_info_popup("Favorite Not Saved",
                           "The SD update failed, so the favorite change was reverted.",
                           NULL, NULL);
+          return;
+        }
+
+        String trackFavoriteMbid;
+        int trackFavoriteIndex = -1;
+        bool trackFavoriteAttemptedValue = false;
+        if (BackgroundWorker::takeTrackFavoritePersistenceFailure(
+                trackFavoriteMbid, trackFavoriteIndex,
+                trackFavoriteAttemptedValue)) {
+          handle_track_favorite_failure(trackFavoriteMbid,
+                                        trackFavoriteIndex,
+                                        trackFavoriteAttemptedValue);
+          return;
+        }
+
+        bool coverRenderSuccess = false;
+        String coverRenderMessage;
+        String coverRenderFilename;
+        uint16_t *coverPixels = nullptr;
+        if (BackgroundWorker::takeCoverRenderCompletion(
+                coverRenderSuccess, coverRenderMessage, coverRenderFilename,
+                coverPixels)) {
+          if (!BackgroundWorker::shouldShowProgress())
+            dismiss_progress_modal();
+          if (coverRenderSuccess && coverPixels &&
+              coverRenderFilename == pending_cover_file) {
+            apply_rendered_cover(coverPixels);
+            coverPixels = nullptr;
+            displayed_cover_file = coverRenderFilename;
+            pending_cover_file = "";
+          }
+          if (coverPixels)
+            heap_caps_free(coverPixels);
+          if (!coverRenderSuccess &&
+              coverRenderFilename == pending_cover_file) {
+            pending_cover_file = "";
+            displayed_cover_file = "";
+            Serial.printf("Cover render failed: %s\n",
+                          coverRenderMessage.c_str());
+          }
+          return;
+        }
+
+        JobType maintenanceType = JOB_NONE;
+        bool maintenanceSuccess = false;
+        String maintenanceMessage;
+        int maintenanceIndex = -1;
+        MediaMode maintenanceMode = MODE_CD;
+        String maintenanceData;
+        if (BackgroundWorker::takeMaintenanceCompletion(
+                maintenanceType, maintenanceSuccess, maintenanceMessage,
+                maintenanceIndex, maintenanceMode, maintenanceData)) {
+          dismiss_progress_modal();
+          if (!maintenanceSuccess) {
+            show_info_popup("Task Needs Attention",
+                            maintenanceMessage.c_str(), NULL, NULL);
+            return;
+          }
+
+          if (maintenanceType == JOB_LIBRARY_RELOAD) {
+            initNavigationCache();
+            update_item_display();
+            if (maintenanceData == "bulk") {
+              if (WiFi.status() == WL_CONNECTED) {
+                if (!BackgroundWorker::addJob(
+                        {JOB_BULK_SYNC, "", -1, "", nullptr, true}))
+                  show_info_popup("Busy",
+                                  "The cover sync could not be queued.",
+                                  NULL, NULL);
+              } else {
+                show_info_popup(
+                    "Library Reloaded",
+                    "The local library is ready. Connect to WiFi before "
+                    "downloading missing covers.",
+                    NULL, NULL);
+              }
+            } else {
+              show_info_popup("Library Reloaded", maintenanceMessage.c_str(),
+                              NULL, NULL);
+            }
+          } else if (maintenanceType == JOB_ITEM_DELETE) {
+            if (currentMode == maintenanceMode) {
+              const int count = getItemCount();
+              if (getCurrentItemIndex() >= count)
+                setCurrentItemIndex(std::max(0, count - 1));
+              initNavigationCache();
+              close_add_item_ui();
+              update_item_display();
+            }
+          } else if (maintenanceType == JOB_LIBRARY_WIPE) {
+            show_info_popup(
+                "Library Wiped", "The selected library was wiped. Rebooting...",
+                [](lv_event_t *e) { ESP.restart(); }, NULL);
+          }
           return;
         }
 
@@ -2367,12 +2484,18 @@ void setupMainUI() {
           // Keep the compact TLS dialog's text static. Updating LVGL label
           // buffers during a handshake competes for the same internal heap.
           if (progress_label && !compact_tls_progress_active) {
-            // Worker messages contain online catalogue metadata. Normalize at
-            // the final LVGL boundary so punctuation is transliterated and
-            // scripts absent from the compact font never render as boxes.
-            String status =
-                sanitizeLvglText(BackgroundWorker::getStatusMessage());
-            lv_label_set_text(progress_label, status.c_str());
+            const uint32_t revision = BackgroundWorker::getStatusRevision();
+            if (revision != 0 && revision != progress_status_revision) {
+              // Worker messages contain online catalogue metadata. Normalize
+              // only when the value changed; repeated String/LVGL allocation
+              // every 200 ms fragmented the small internal heap.
+              String status =
+                  sanitizeLvglText(BackgroundWorker::getStatusMessage());
+              if (strcmp(lv_label_get_text(progress_label), status.c_str()) !=
+                  0)
+                lv_label_set_text(progress_label, status.c_str());
+              progress_status_revision = revision;
+            }
           }
         }
 
@@ -3475,115 +3598,12 @@ void show_search_ui() {
   show_search_keyboard();
   lvgl_port_unlock();
 }
-void load_and_show_cover(String filename) {
-  if (img_buffer == NULL) {
-    // Try PSRAM first
-    img_buffer = (uint16_t *)heap_caps_malloc(240 * 240 * 2, MALLOC_CAP_SPIRAM);
-    if (img_buffer == NULL) {
-      Serial.println("Warning: Allocating image buffer in Internal RAM");
-      img_buffer = (uint16_t *)malloc(240 * 240 * 2);
-    }
-  }
-
-  if (img_buffer == NULL) {
-    Serial.println("CRITICAL: Failed to allocate image buffer!");
+static void apply_rendered_cover(uint16_t *pixels) {
+  if (!pixels || !img_cover)
     return;
-  }
 
-  // Clear buffer with container background color (0x333333 -> 0x3186 in RGB565)
-  for (int i = 0; i < 240 * 240; i++) {
-    img_buffer[i] = 0x3186;
-  }
-
-  TJpgDec.setJpgScale(1);
-  TJpgDec.setSwapBytes(false);
-  TJpgDec.setCallback(tjpg_output);
-
-  if (i2cMutex &&
-      xSemaphoreTakeRecursive(i2cMutex, pdMS_TO_TICKS(1000)) == pdPASS) {
-    if (sdExpander)
-      sdExpander->digitalWrite(SD_CS, LOW);
-
-    const String coverPath = "/covers/" + sanitizeFilename(filename);
-    if (!SD.exists(coverPath)) {
-      const String backupPath = coverPath + ".bak";
-      const String tmpPath = coverPath + ".tmp";
-      if (SD.exists(backupPath)) {
-        SD.rename(backupPath, coverPath);
-        if (SD.exists(tmpPath))
-          SD.remove(tmpPath);
-      } else if (SD.exists(tmpPath)) {
-        File candidate = SD.open(tmpPath, FILE_READ);
-        const bool usable = candidate && candidate.size() > 0;
-        if (candidate)
-          candidate.close();
-        if (usable)
-          SD.rename(tmpPath, coverPath);
-      }
-    }
-    File f = SD.open(coverPath, FILE_READ);
-    if (!f) {
-      Serial.printf("Failed to open file: %s\n", filename.c_str());
-      if (sdExpander)
-        sdExpander->digitalWrite(SD_CS, HIGH);
-      xSemaphoreGiveRecursive(i2cMutex);
-      return;
-    }
-
-    size_t jpg_size = f.size();
-    if (jpg_size == 0) {
-      Serial.println("Cover file is empty");
-      f.close();
-      if (sdExpander)
-        sdExpander->digitalWrite(SD_CS, HIGH);
-      xSemaphoreGiveRecursive(i2cMutex);
-      return;
-    }
-
-    uint8_t *jpg_data =
-        (uint8_t *)heap_caps_malloc(jpg_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!jpg_data)
-      jpg_data = (uint8_t *)heap_caps_malloc(jpg_size, MALLOC_CAP_8BIT);
-    if (jpg_data == NULL) {
-      Serial.println("Failed to allocate buffer for JPG file!");
-      f.close();
-      if (sdExpander)
-        sdExpander->digitalWrite(SD_CS, HIGH);
-      xSemaphoreGiveRecursive(i2cMutex);
-      return;
-    }
-
-    const size_t bytesRead = f.read(jpg_data, jpg_size);
-    f.close();
-
-    if (sdExpander)
-      sdExpander->digitalWrite(SD_CS, HIGH);
-    xSemaphoreGiveRecursive(i2cMutex);
-
-    if (bytesRead != jpg_size) {
-      Serial.printf("Incomplete cover read: %u of %u bytes\n",
-                    (unsigned)bytesRead, (unsigned)jpg_size);
-      heap_caps_free(jpg_data);
-      return;
-    }
-
-    // Get dimensions and center
-    uint16_t w = 0, h = 0;
-    TJpgDec.getJpgSize(&w, &h, jpg_data, jpg_size);
-    int off_x = (240 - w) / 2;
-    int off_y = (240 - h) / 2;
-    if (off_x < 0)
-      off_x = 0;
-    if (off_y < 0)
-      off_y = 0;
-
-    TJpgDec.drawJpg(off_x, off_y, jpg_data, jpg_size);
-    heap_caps_free(jpg_data);
-  } else {
-    Serial.println(
-        "load_and_show_cover: Failed to get I2C lock, skipping image load");
-  }
-
+  uint16_t *previous = img_buffer;
+  img_buffer = pixels;
   raw_img_dsc.header.always_zero = 0;
   raw_img_dsc.header.w = 240;
   raw_img_dsc.header.h = 240;
@@ -3593,6 +3613,10 @@ void load_and_show_cover(String filename) {
 
   lv_img_set_src(img_cover, &raw_img_dsc);
   lv_obj_clear_flag(img_cover, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_invalidate(img_cover);
+
+  if (previous)
+    heap_caps_free(previous);
 }
 
 void update_filtered_leds() {
@@ -4146,20 +4170,14 @@ void show_edit_item_ui(int index) {
               if (edit_item_index < 0 || edit_item_index >= getItemCount())
                 return;
 
-              if (deleteItemAt(edit_item_index)) {
-                Serial.println("Deleted successfully!");
-                invalidateNavigationCache();
-                if (currentCDIndex >= getItemCount())
-                  currentCDIndex = getItemCount() - 1;
-                if (currentCDIndex < 0)
-                  currentCDIndex = 0;
-                update_item_display();
-                close_add_item_ui();
-              } else {
-                Serial.println("Failed to delete!");
-                show_info_popup("DELETE FAILED",
-                                "The item could not be removed from storage.");
-              }
+              const ItemView item = getItemAtRAM(edit_item_index);
+              if (!item.isValid ||
+                  !BackgroundWorker::addJob(
+                      {JOB_ITEM_DELETE, item.uniqueID, edit_item_index,
+                       currentMode == MODE_BOOK ? "book" : "cd", nullptr,
+                       true}))
+                show_info_popup("Busy",
+                                "The delete request could not be queued.");
             });
       },
       LV_EVENT_CLICKED, NULL);
@@ -6403,12 +6421,9 @@ void show_settings_ui() {
         show_confirmation_popup(
             "Wipe CD Data", "Delete ALL CDs? Cannot be undone!",
             [](lv_event_t *e) {
-              if (Storage.wipeLibrary(MODE_CD)) {
-                show_info_popup("Success", "CD Data Wiped. Rebooting...",
-                                [](lv_event_t *e) { ESP.restart(); });
-              } else {
-                show_info_popup("Error", "Failed to wipe CD data.");
-              }
+              if (!BackgroundWorker::addJob(
+                      {JOB_LIBRARY_WIPE, "", -1, "cd", nullptr, true}))
+                show_info_popup("Busy", "The wipe request could not be queued.");
             });
       },
       LV_EVENT_CLICKED, NULL);
@@ -6430,12 +6445,9 @@ void show_settings_ui() {
         show_confirmation_popup(
             "Wipe Book Data", "Delete ALL Books? Cannot be undone!",
             [](lv_event_t *e) {
-              if (Storage.wipeLibrary(MODE_BOOK)) {
-                show_info_popup("Success", "Book Data Wiped. Rebooting...",
-                                [](lv_event_t *e) { ESP.restart(); });
-              } else {
-                show_info_popup("Error", "Failed to wipe Book data.");
-              }
+              if (!BackgroundWorker::addJob(
+                      {JOB_LIBRARY_WIPE, "", -1, "book", nullptr, true}))
+                show_info_popup("Busy", "The wipe request could not be queued.");
             });
       },
       LV_EVENT_CLICKED, NULL);
@@ -6686,7 +6698,10 @@ void show_qr_ui() {
   lv_obj_clear_flag(url_box, LV_OBJ_FLAG_SCROLLABLE);
 
   lv_obj_t *url_lbl = lv_label_create(url_box);
-  lv_label_set_text(url_lbl, "http://mylibrary.local");
+  const String webAddress =
+      "http://" + (mdns_name.length() > 0 ? mdns_name : "digitallibrarian") +
+      ".local";
+  lv_label_set_text(url_lbl, webAddress.c_str());
   lv_obj_center(url_lbl);
   lv_obj_set_style_text_color(url_lbl, lv_color_hex(getCurrentThemeColor()), 0);
 

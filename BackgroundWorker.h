@@ -26,7 +26,11 @@ enum JobType {
   JOB_COVER_DELETE,
   JOB_BACKUP_IMPORT,
   JOB_DIAGNOSTIC_LYRICS_STRESS,
-  JOB_ITEM_DETAIL_LOAD
+  JOB_ITEM_DETAIL_LOAD,
+  JOB_COVER_RENDER,
+  JOB_LIBRARY_RELOAD,
+  JOB_ITEM_DELETE,
+  JOB_LIBRARY_WIPE
 };
 
 struct ItemSavePayload {
@@ -58,6 +62,7 @@ public:
 
   // UI Helpers
   static String getStatusMessage();
+  static uint32_t getStatusRevision();
   static float getProgress(); // 0.0 to 1.0
   static void reportProgress(float progress);
   static void reportStatus(const String &message);
@@ -74,6 +79,15 @@ public:
                                       String *requestCode = nullptr);
   static bool takeFavoritePersistenceFailure(String &itemId,
                                              bool &attemptedValue);
+  static bool takeTrackFavoritePersistenceFailure(String &releaseMbid,
+                                                   int &trackIndex,
+                                                   bool &attemptedValue);
+  static bool takeCoverRenderCompletion(bool &success, String &message,
+                                        String &filename,
+                                        uint16_t *&pixelBuffer);
+  static bool takeMaintenanceCompletion(JobType &type, bool &success,
+                                        String &message, int &itemIndex,
+                                        MediaMode &mode, String &requestData);
   static bool takeMetadataResult(ItemView &result);
   static bool takeItemSaveCompletion(bool &success, String &message,
                                      ItemView &savedItem, MediaMode &mode,
@@ -100,6 +114,7 @@ private:
   static bool _showProgress;
   static JobType _currentJobType;
   static String _statusMsg;
+  static uint32_t _statusRevision;
   static float _progress;
   static std::atomic<bool> _cancelRequested;
   static std::atomic<bool> _skipRequested;
@@ -117,6 +132,22 @@ private:
   static bool _favoriteFailureReady;
   static String _favoriteFailureItemId;
   static bool _favoriteFailureAttemptedValue;
+  static bool _trackFavoriteFailureReady;
+  static String _trackFavoriteFailureMbid;
+  static int _trackFavoriteFailureIndex;
+  static bool _trackFavoriteFailureAttemptedValue;
+  static bool _coverRenderCompletionReady;
+  static bool _coverRenderCompletionSuccess;
+  static String _coverRenderCompletionMessage;
+  static String _coverRenderFilename;
+  static uint16_t *_coverRenderPixels;
+  static bool _maintenanceCompletionReady;
+  static JobType _maintenanceCompletionType;
+  static bool _maintenanceCompletionSuccess;
+  static String _maintenanceCompletionMessage;
+  static int _maintenanceCompletionIndex;
+  static MediaMode _maintenanceCompletionMode;
+  static String _maintenanceCompletionData;
   static ItemView _metadataResult;
   static bool _metadataResultReady;
   static ItemView _itemSaveResult;

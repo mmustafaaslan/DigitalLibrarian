@@ -21,6 +21,65 @@ bool networkReadyAnnounced = false;
 constexpr uint8_t WIFI_CREDENTIAL_SEED_VERSION = 3;
 constexpr unsigned long SAVED_NETWORK_ATTEMPT_TIMEOUT_MS = 30000;
 
+class BoundedPsramBufferWriter : public Stream {
+public:
+  BoundedPsramBufferWriter(size_t capacity, uint32_t timeoutMs)
+      : _capacity(capacity), _size(0), _overflowed(false),
+        _startedAt(millis()), _timeoutMs(timeoutMs), _timedOut(false) {
+    _data = static_cast<uint8_t *>(
+        heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  }
+
+  ~BoundedPsramBufferWriter() {
+    if (_data)
+      heap_caps_free(_data);
+  }
+
+  size_t write(uint8_t value) override { return write(&value, 1); }
+
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void flush() override {}
+
+  size_t write(const uint8_t *data, size_t length) override {
+    if (!_data || !data || BackgroundWorker::isCancellationRequested() ||
+        BackgroundWorker::isSkipRequested())
+      return 0;
+    if (millis() - _startedAt > _timeoutMs) {
+      _timedOut = true;
+      return 0;
+    }
+    if (length > _capacity - _size) {
+      _overflowed = true;
+      return 0;
+    }
+    memcpy(_data + _size, data, length);
+    _size += length;
+    delay(1);
+    return length;
+  }
+
+  bool valid() const { return _data != nullptr; }
+  bool overflowed() const { return _overflowed; }
+  bool timedOut() const { return _timedOut; }
+  size_t size() const { return _size; }
+  uint8_t *release() {
+    uint8_t *result = _data;
+    _data = nullptr;
+    return result;
+  }
+
+private:
+  uint8_t *_data = nullptr;
+  size_t _capacity;
+  size_t _size;
+  bool _overflowed;
+  uint32_t _startedAt;
+  uint32_t _timeoutMs;
+  bool _timedOut;
+};
+
 void beginNetworkAttempt(int index) {
   connectionNetworkIndex = index;
   connectionAttemptStarted = millis();
@@ -405,14 +464,12 @@ bool AppNetworkManager::downloadCoverImage(const String &url,
   int len = http.getSize();
   String contentType = http.header("Content-Type");
   contentType.toLowerCase();
-  if (len <= 0 || len > MAX_COVER_BYTES ||
+  if (len > MAX_COVER_BYTES ||
       (!contentType.isEmpty() && contentType.indexOf("image/jpeg") < 0 &&
        contentType.indexOf("image/jpg") < 0 &&
        contentType.indexOf("application/octet-stream") < 0)) {
     if (errorDetail) {
-      if (len <= 0)
-        *errorDetail = "Image response has no content length";
-      else if (len > MAX_COVER_BYTES)
+      if (len > MAX_COVER_BYTES)
         *errorDetail = "Image is larger than 2 MB";
       else
         *errorDetail = "Unexpected content type: " + contentType;
@@ -421,52 +478,46 @@ bool AppNetworkManager::downloadCoverImage(const String &url,
     return false;
   }
 
-  // 1. Download to PSRAM first (No I2C buffering needed)
-  uint8_t *downloadBuffer =
-      (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!downloadBuffer) {
+  // 1. Let HTTPClient decode fixed-length and chunked responses into a bounded
+  // PSRAM sink. Reading getStreamPtr() directly exposes chunk framing on some
+  // servers and previously rejected otherwise valid responses with no
+  // Content-Length header.
+  const size_t bufferCapacity = len > 0 ? static_cast<size_t>(len)
+                                        : static_cast<size_t>(MAX_COVER_BYTES);
+  BoundedPsramBufferWriter download(bufferCapacity, streamTimeoutMs);
+  if (!download.valid()) {
     if (errorDetail)
       *errorDetail = "Not enough PSRAM for image";
     http.end();
     return false;
   }
-
-  WiFiClient *stream = http.getStreamPtr();
-  int totalRead = 0;
-  unsigned long startedAt = millis();
-  unsigned long lastDataAt = startedAt;
-  // Servers commonly close a Connection: close response immediately after
-  // writing the body. Bytes can still be buffered in WiFiClient at that point,
-  // so drain available data instead of treating socket close as end-of-body.
-  while ((http.connected() || stream->available() > 0) && totalRead < len &&
-         millis() - startedAt < streamTimeoutMs &&
-         millis() - lastDataAt < idleTimeoutMs) {
-    if (BackgroundWorker::isCancellationRequested() ||
-        BackgroundWorker::isSkipRequested()) {
-      http.end();
-      heap_caps_free(downloadBuffer);
-      return false;
-    }
-    if (stream->available()) {
-      int readSize = stream->read(downloadBuffer + totalRead, len - totalRead);
-      if (readSize > 0) {
-        totalRead += readSize;
-        lastDataAt = millis();
-      }
-    }
-    delay(1);
-  }
+  http.setTimeout(std::min(streamTimeoutMs, idleTimeoutMs));
+  const int streamed = http.writeToStream(&download);
   http.end();
 
-  if (totalRead < len || totalRead < 4 || downloadBuffer[0] != 0xFF ||
-      downloadBuffer[1] != 0xD8) {
+  if (BackgroundWorker::isCancellationRequested() ||
+      BackgroundWorker::isSkipRequested())
+    return false;
+
+  const size_t totalRead = download.size();
+  if (download.overflowed() || download.timedOut() || streamed < 0 ||
+      (len > 0 && totalRead != static_cast<size_t>(len)) || totalRead < 4) {
     if (errorDetail) {
-      if (totalRead < len)
-        *errorDetail = "Image transfer stopped at " + String(totalRead) +
-                       "/" + String(len) + " bytes";
+      if (download.overflowed())
+        *errorDetail = "Image is larger than 2 MB";
+      else if (download.timedOut())
+        *errorDetail = "Image transfer timed out";
       else
-        *errorDetail = "Downloaded data is not a JPEG image";
+        *errorDetail = "Image transfer stopped at " + String(totalRead) +
+                       (len > 0 ? "/" + String(len) : " bytes");
     }
+    return false;
+  }
+
+  uint8_t *downloadBuffer = download.release();
+  if (downloadBuffer[0] != 0xFF || downloadBuffer[1] != 0xD8) {
+    if (errorDetail)
+      *errorDetail = "Downloaded data is not a JPEG image";
     heap_caps_free(downloadBuffer);
     return false;
   }

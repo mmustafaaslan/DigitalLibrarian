@@ -28,4 +28,5 @@ lyrics/
 
 # User Exclusions
 .agent/
+.codex-remote-attachments/
 Model 3D/
