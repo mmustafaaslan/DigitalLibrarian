@@ -158,6 +158,54 @@ static bool track_summary_result_ready = false;
 static String track_summary_result_mbid = "";
 static String track_summary_result_text = "";
 static bool track_summary_result_has_favorites = false;
+static bool item_detail_request_pending = false;
+static bool open_editor_after_detail_load = false;
+static int pending_item_detail_index = -1;
+static MediaMode pending_item_detail_mode = MODE_CD;
+static String pending_item_detail_id = "";
+
+static bool request_item_details(int index, bool openEditor) {
+  if (index < 0 || index >= getItemCount())
+    return false;
+
+  ItemView item = getItemAtRAM(index);
+  if (!item.isValid)
+    return false;
+  if (item.detailsLoaded)
+    return true;
+
+  if (item_detail_request_pending) {
+    if (pending_item_detail_index == index &&
+        pending_item_detail_mode == currentMode)
+      open_editor_after_detail_load |= openEditor;
+    return false;
+  }
+
+  const MediaMode requestedMode = currentMode;
+  const bool queued = BackgroundWorker::addJob(
+      {JOB_ITEM_DETAIL_LOAD, item.uniqueID, index,
+       requestedMode == MODE_BOOK ? "book" : "cd", nullptr, openEditor});
+  if (!queued)
+    return false;
+
+  item_detail_request_pending = true;
+  open_editor_after_detail_load = openEditor;
+  pending_item_detail_index = index;
+  pending_item_detail_mode = requestedMode;
+  pending_item_detail_id = item.uniqueID;
+  return false;
+}
+
+static void request_edit_item_ui(int index) {
+  ItemView item = getItemAtRAM(index);
+  if (!item.isValid)
+    return;
+  if (item.detailsLoaded) {
+    show_edit_item_ui(index);
+    return;
+  }
+  request_item_details(index, true);
+}
 
 static void refresh_debug_overlay() {
   if (!debug_overlay || !debug_overlay_label)
@@ -499,8 +547,6 @@ void forceUpdateWLED();
 static void apply_metadata_result(const ItemView &staged);
 static void show_metadata_not_found();
 
-// Forward declarations for lyrics/chapter fetching
-LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex);
 void fetchAllLyrics(const char *releaseMbid);
 
 // Implementation of missing functions
@@ -1962,7 +2008,8 @@ void setupMainUI() {
   lv_obj_set_size(btn_edit, 156, 60);
   lv_obj_set_pos(btn_edit, 322, 396);
   lv_obj_add_event_cb(
-      btn_edit, [](lv_event_t *e) { show_edit_item_ui(getCurrentItemIndex()); },
+      btn_edit,
+      [](lv_event_t *e) { request_edit_item_ui(getCurrentItemIndex()); },
       LV_EVENT_CLICKED, NULL);
 
   lv_obj_add_style(btn_edit, &style_primary_button, 0);
@@ -2000,6 +2047,44 @@ void setupMainUI() {
           show_info_popup("Favorite Not Saved",
                           "The SD update failed, so the favorite change was reverted.",
                           NULL, NULL);
+          return;
+        }
+
+        bool detailSuccess = false;
+        String detailMessage;
+        int detailIndex = -1;
+        MediaMode detailMode = MODE_CD;
+        String detailId;
+        if (BackgroundWorker::takeItemDetailCompletion(
+                detailSuccess, detailMessage, detailIndex, detailMode,
+                detailId)) {
+          const bool matchesPending =
+              item_detail_request_pending && detailIndex == pending_item_detail_index &&
+              detailMode == pending_item_detail_mode &&
+              detailId == pending_item_detail_id;
+          const bool openEditor =
+              matchesPending && open_editor_after_detail_load;
+          item_detail_request_pending = false;
+          open_editor_after_detail_load = false;
+          pending_item_detail_index = -1;
+          pending_item_detail_id = "";
+          dismiss_progress_modal();
+
+          if (!detailSuccess) {
+            if (openEditor)
+              show_info_popup("Details Unavailable", detailMessage.c_str(),
+                              NULL, NULL);
+            return;
+          }
+
+          invalidateNavigationCache();
+          if (currentMode == detailMode) {
+            const int currentIndex = getCurrentItemIndex();
+            rebuildNavigationCache(currentIndex);
+            update_item_display();
+            if (openEditor && currentIndex == detailIndex)
+              show_edit_item_ui(detailIndex);
+          }
           return;
         }
 
@@ -2282,7 +2367,11 @@ void setupMainUI() {
           // Keep the compact TLS dialog's text static. Updating LVGL label
           // buffers during a handshake competes for the same internal heap.
           if (progress_label && !compact_tls_progress_active) {
-            String status = BackgroundWorker::getStatusMessage();
+            // Worker messages contain online catalogue metadata. Normalize at
+            // the final LVGL boundary so punctuation is transliterated and
+            // scripts absent from the compact font never render as boxes.
+            String status =
+                sanitizeLvglText(BackgroundWorker::getStatusMessage());
             lv_label_set_text(progress_label, status.c_str());
           }
         }
@@ -2378,10 +2467,8 @@ bool is_item_match(int index) {
 }
 
 void update_item_display() {
-  // --- CACHED LOAD ---
-  // We no longer call ensureItemDetailsLoaded(idx) here because
-  // getItemAt(idx) uses the sliding window cache which pre-loads details.
-  // Fallen-back getItemAtSD(idx) will handle details if it's a cache miss.
+  // Paint immediately from the PSRAM cache/index. Optional detail fields are
+  // requested from the worker below and applied by the progress timer.
   int idx = getCurrentItemIndex();
 
   String d_title, d_artist_line, d_genre, d_year_line, d_led_text, d_notes;
@@ -2453,6 +2540,9 @@ void update_item_display() {
   if (btn_edit)
     lv_obj_clear_state(btn_edit, LV_STATE_DISABLED);
   lv_obj_clear_state(label_favorite, LV_STATE_DISABLED);
+
+  if (!item.detailsLoaded)
+    request_item_details(currentIdx, false);
 
   d_title = sanitizeLvglText(item.title);
   d_artist_line = "by " + sanitizeLvglText(item.artistOrAuthor);
@@ -3944,10 +4034,6 @@ void show_edit_item_ui(int index) {
   edit_item_index = index;
   if (index < 0 || index >= getItemCount())
     return;
-
-  // ESSENTIAL: Load full details (MBID, Tracks) before editing to prevent data
-  // loss!
-  ensureItemDetailsLoaded(index);
 
   // Local vars for UI pre-fill
   String e_uniqueID, e_barcode, e_title, e_artist, e_genre, e_notes;

@@ -109,7 +109,7 @@ const char *INDEX_HTML_TEMPLATE = R"rawliteral(
     <script>
         function runTests() {
             if(!confirm("Run storage unit tests? This may take a few seconds.")) return;
-            const pin = prompt("Enter Web PIN:", "cd1234");
+            const pin = prompt("Enter Web PIN:");
             if (!pin) return;
             
             fetch('/api/tests/run', {method: 'POST', headers: {'X-Auth-Pin': pin}})

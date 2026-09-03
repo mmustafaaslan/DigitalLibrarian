@@ -53,9 +53,11 @@ public:
   bool loadBookDetail(String uniqueID, Book &outBook);
 
   bool saveCD(const CD &cd, const char *oldUniqueID = nullptr,
-              bool skipIndexRewrite = false);
+              bool skipIndexRewrite = false,
+              bool keepDetailBackup = false);
   bool saveBook(const Book &book, const char *oldUniqueID = nullptr,
-                bool skipIndexRewrite = false);
+                bool skipIndexRewrite = false,
+                bool keepDetailBackup = false);
   bool updateFavorite(String uniqueID, MediaMode mode, bool favorite);
 
   bool deleteItem(String uniqueID, MediaMode mode);
@@ -63,7 +65,8 @@ public:
 
   // Tracklist Management
   TrackList *loadTracklist(const char *releaseMbid);
-  bool saveTracklist(const char *releaseMbid, TrackList *trackList);
+  bool saveTracklist(const char *releaseMbid, TrackList *trackList,
+                     bool keepBackup = false);
   void deleteTracklist(TrackList *trackList);
 
   // Chapter code removed
@@ -75,6 +78,7 @@ public:
   bool loadLyrics(const char *lyricsPath, PsramString &lyricsOut);
   bool saveLyrics(const char *lyricsPath, const PsramString &lyricsText,
                   String lang = "en");
+  bool lyricsFileExists(const char *lyricsPath);
 
   // Restore a web-exported JSONL backup without holding the SD/touch bus for
   // JSON parsing or rewriting the index once per imported item.

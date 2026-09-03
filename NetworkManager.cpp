@@ -6,6 +6,7 @@
 #include "AppGlobals.h"
 #include "ErrorHandler.h"
 #include <ESPmDNS.h>
+#include <algorithm>
 #include <esp_heap_caps.h>
 
 #if __has_include("secrets.h")
@@ -294,7 +295,7 @@ String AppNetworkManager::fetchURL(String url, int timeout) {
     return "";
 
   HTTPClient http;
-  WiFiClientSecure clientSecure;
+  RedirectSafeTlsClient clientSecure;
   WiFiClient clientInsecure;
 
   if (url.startsWith("https://")) {
@@ -347,7 +348,7 @@ bool AppNetworkManager::downloadCoverImage(const String &url,
   }
 
   HTTPClient http;
-  WiFiClientSecure clientSecure;
+  RedirectSafeTlsClient clientSecure;
   WiFiClient clientInsecure;
   const uint32_t requestTimeoutMs = quickMode ? 3000 : 20000;
   const unsigned long handshakeTimeoutSeconds = quickMode ? 3UL : 20UL;
@@ -483,7 +484,20 @@ bool AppNetworkManager::downloadCoverImage(const String &url,
       SD.remove(tmpPath);
     File file = SD.open(tmpPath.c_str(), FILE_WRITE);
     if (file) {
-      size_t written = file.write(downloadBuffer, totalRead);
+      size_t written = 0;
+      static constexpr size_t COVER_SD_CHUNK_BYTES = 4096;
+      while (written < (size_t)totalRead) {
+        const size_t amount = std::min(COVER_SD_CHUNK_BYTES,
+                                       (size_t)totalRead - written);
+        const size_t chunkWritten =
+            file.write(downloadBuffer + written, amount);
+        written += chunkWritten;
+        if (chunkWritten != amount || file.getWriteError() != 0)
+          break;
+        // Large covers can approach 2 MB. Let the core-0 idle and WiFi tasks
+        // run between SD chunks so this cannot trigger the task watchdog.
+        delay(1);
+      }
       file.flush();
       const bool writeOk = file.getWriteError() == 0;
       file.close();

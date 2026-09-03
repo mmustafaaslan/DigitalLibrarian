@@ -136,6 +136,13 @@ class RepositoryContracts(unittest.TestCase):
         trust = (ROOT / "TlsTrust.h").read_text(encoding="utf-8")
         self.assertIn("setCACertBundle", trust)
         self.assertIn("configTime", trust)
+        self.assertIn("class RedirectSafeTlsClient", trust)
+        self.assertIn("WiFiClientSecure::stop()", trust)
+        self.assertIn("attachArduinoCaBundle(*this)", trust)
+        cover_download = NETWORK[NETWORK.index(
+            "bool AppNetworkManager::downloadCoverImage"
+        ):NETWORK.index("void AppNetworkManager::forceUpdateWLED")]
+        self.assertIn("RedirectSafeTlsClient clientSecure", cover_download)
 
     def test_led_count_has_hard_bounds(self):
         globals_header = (ROOT / "AppGlobals.h").read_text(encoding="utf-8")
@@ -153,6 +160,10 @@ class RepositoryContracts(unittest.TestCase):
     def test_lvgl_text_is_normalized_without_changing_cached_source_data(self):
         self.assertIn("void sanitizeLvglTextInPlace(PsramString &text)", UTILS)
         self.assertIn("decodeUtf8(text.data(), text.size(), offset)", UTILS)
+        self.assertIn('appendAscii(output, "[non-Latin]")', UTILS)
+        self.assertIn(
+            "sanitizeLvglText(BackgroundWorker::getStatusMessage())", UI
+        )
         self.assertIn("sanitizeLvglTextInPlace(popupData->lyrics)", UI)
         self.assertIn("lv_label_set_text_static(chunkLabel", UI)
         self.assertNotIn('labelStr += "  —  "', UI)
@@ -844,16 +855,114 @@ class RepositoryContracts(unittest.TestCase):
         self.assertNotIn("Storage.saveCD", import_route)
         storage_import = STORAGE[STORAGE.index("LibrarianStorage::importBackup"):]
         self.assertIn("MALLOC_CAP_SPIRAM", storage_import)
-        self.assertIn("saveCD(cd, nullptr, true)", storage_import)
-        self.assertIn("saveBook(book, nullptr, true)", storage_import)
-        self.assertEqual(storage_import.count("rewriteIndex(MODE_CD)"), 1)
-        self.assertEqual(storage_import.count("rewriteIndex(MODE_BOOK)"), 1)
+        self.assertIn("saveCD(cd, nullptr, true, true)", storage_import)
+        self.assertIn("saveBook(book, nullptr, true, true)", storage_import)
+        self.assertIn("backupDocumentValid(doc)", storage_import)
+        self.assertLess(
+            storage_import.index("backupDocumentValid(doc)"),
+            storage_import.index("saveCD(cd, nullptr, true, true)"),
+        )
+        self.assertIn("rollbackReplacedFile", storage_import)
+        self.assertIn("originalCdIndex", storage_import)
+        self.assertIn("originalBookIndex", storage_import)
 
         bulk_sync = WORKER[WORKER.index("case JOB_BULK_SYNC"):]
         bulk_sync = bulk_sync[:bulk_sync.index("case JOB_COVER_DOWNLOAD")]
         self.assertIn("saveCD(cdLibrary[i], nullptr, true)", bulk_sync)
         self.assertIn("saveBook(bookLibrary[i], nullptr, true)", bulk_sync)
         self.assertEqual(bulk_sync.count("Storage.rewriteIndex(currentMode)"), 1)
+
+    def test_touch_navigation_never_loads_item_details_from_sd(self):
+        load_cache = NAVIGATION[NAVIGATION.index("inline bool loadItemIntoCache"):]
+        load_cache = load_cache[:load_cache.index("inline void rebuildNavigationCache")]
+        self.assertNotIn("Storage.load", load_cache)
+
+        get_cache = NAVIGATION[NAVIGATION.index("inline ItemView getItemFromCache"):]
+        get_cache = get_cache[:get_cache.index("extern bool filter_active")]
+        self.assertIn("getItemAtRAM", get_cache)
+        self.assertNotIn("getItemAtSD", get_cache)
+
+        editor = UI[UI.index("void show_edit_item_ui"):]
+        editor = editor[:editor.index("void close_add_item_ui")]
+        self.assertNotIn("ensureItemDetailsLoaded", editor)
+        self.assertIn("JOB_ITEM_DETAIL_LOAD", WORKER)
+        self.assertIn("takeItemDetailCompletion", UI)
+
+    def test_queued_job_dedup_preserves_payload_ownership_and_request_data(self):
+        add_job = WORKER[WORKER.index("bool BackgroundWorker::addJob"):]
+        add_job = add_job[:add_job.index("bool BackgroundWorker::isBusy")]
+        self.assertIn("queued.extraData == job.extraData", add_job)
+        self.assertIn("!queued.savePayload && !job.savePayload", add_job)
+        self.assertIn("!queued.onComplete", add_job)
+
+    def test_tracklist_strings_are_json_escaped(self):
+        save = STORAGE[STORAGE.index("LibrarianStorage::saveTracklist"):]
+        save = save[:save.index("void LibrarianStorage::deleteTracklist")]
+        self.assertIn("writeEscapedJsonString", save)
+        for field in (
+            "releaseMbid",
+            "fetchedAt",
+            "recordingMbid",
+            "status",
+            "lastTriedAt",
+            "lang",
+        ):
+            self.assertRegex(save, rf"writeEscapedJsonString\([^\n]*{field}")
+
+    def test_bulk_lyrics_defers_tracklist_rewrites_until_batch_commit(self):
+        bulk = WORKER[WORKER.index("case JOB_LYRICS_FETCH_ALL"):]
+        bulk = bulk[:bulk.index("case JOB_PERSIST_FAVORITE")]
+        self.assertIn("fetchLyricsIfNeeded(targetMbid.c_str(), i, false, false)",
+                      bulk)
+        self.assertIn("reconcileCachedLyrics", bulk)
+        self.assertIn('"lyrics/batch-commit"', bulk)
+
+        fetch = MEDIA[MEDIA.index("LyricsResult fetchLyricsIfNeeded"):]
+        fetch = fetch[:fetch.index("bool MediaManager::reconcileCachedLyrics")]
+        self.assertIn("if (!persistTracklist)", fetch)
+        self.assertIn("Storage.lyricsFileExists", fetch)
+
+        self.assertIn("class YieldingBufferedFileWriter", STORAGE)
+        buffered_writer = STORAGE[STORAGE.index(
+            "class YieldingBufferedFileWriter"
+        ):STORAGE.index("bool writeEscapedJsonString")]
+        self.assertIn("uint8_t _buffer[512]", buffered_writer)
+        self.assertIn("delay(1)", buffered_writer)
+        save_lyrics = STORAGE[STORAGE.index(
+            "bool LibrarianStorage::saveLyrics"
+        ):STORAGE.index("bool LibrarianStorage::lyricsFileExists")]
+        self.assertIn("serializeJson(doc, writer)", save_lyrics)
+
+    def test_large_storage_io_yields_to_the_task_watchdog(self):
+        index_writer = STORAGE[STORAGE.index("bool writeIndexTemp"):]
+        index_writer = index_writer[:index_writer.index("} // namespace")]
+        self.assertIn("YieldingBufferedFileWriter writer", index_writer)
+        self.assertIn("serializeJson(doc, writer)", index_writer)
+
+        self.assertGreaterEqual(STORAGE.count("readFileYielding("), 4)
+        yielding_reader = STORAGE[STORAGE.index("size_t readFileYielding"):]
+        yielding_reader = yielding_reader[:yielding_reader.index(
+            "bool writeEscapedJsonString"
+        )]
+        self.assertIn("SD_READ_CHUNK_BYTES = 4096", yielding_reader)
+        self.assertIn("delay(1)", yielding_reader)
+
+        cover_download = NETWORK[NETWORK.index(
+            "bool AppNetworkManager::downloadCoverImage"
+        ):NETWORK.index("void AppNetworkManager::forceUpdateWLED")]
+        self.assertIn("COVER_SD_CHUNK_BYTES = 4096", cover_download)
+        self.assertIn("delay(1)", cover_download)
+        self.assertNotIn("file.write(downloadBuffer, totalRead)", cover_download)
+
+    def test_web_pin_attempts_are_throttled_and_sessions_expire(self):
+        self.assertIn("WebAuthThrottleEntry", SKETCH)
+        self.assertIn("recordWebPinResult", SKETCH)
+        self.assertIn("server.send(429", SKETCH)
+        self.assertIn("WEB_SESSION_MAX_AGE_MS", SKETCH)
+        self.assertIn("webSessionClientIp == remoteIp", SKETCH)
+        self.assertIn("Max-Age=900", SKETCH)
+        self.assertNotIn('prompt("Enter Web PIN:", "cd1234")',
+                         (ROOT / "WebInterface.h").read_text(encoding="utf-8"))
 
     def test_dynamic_web_content_is_html_escaped(self):
         self.assertIn("${esc(cd.title)}", SKETCH)

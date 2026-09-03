@@ -134,6 +134,79 @@ bool mountLibrarySdCard() {
 
 String webSessionToken = "";
 String webSessionPinSnapshot = "";
+IPAddress webSessionClientIp;
+bool webSessionClientBound = false;
+uint32_t webSessionIssuedAt = 0;
+static constexpr uint32_t WEB_SESSION_MAX_AGE_MS = 15UL * 60UL * 1000UL;
+static bool webAuthRequestThrottled = false;
+
+static WebAuthThrottleEntry webAuthThrottle[4];
+
+static bool timeBefore(uint32_t now, uint32_t deadline) {
+  return deadline != 0 && (int32_t)(deadline - now) > 0;
+}
+
+static WebAuthThrottleEntry &webAuthEntryFor(const IPAddress &ip) {
+  int oldest = 0;
+  for (int i = 0; i < 4; i++) {
+    if (webAuthThrottle[i].used && webAuthThrottle[i].ip == ip)
+      return webAuthThrottle[i];
+    if (!webAuthThrottle[i].used)
+      return webAuthThrottle[i];
+    if (webAuthThrottle[i].lastSeen < webAuthThrottle[oldest].lastSeen)
+      oldest = i;
+  }
+  webAuthThrottle[oldest] = WebAuthThrottleEntry{};
+  return webAuthThrottle[oldest];
+}
+
+static bool constantTimePinEquals(const String &candidate,
+                                  const String &expected) {
+  const size_t maxLength = std::max(candidate.length(), expected.length());
+  size_t difference = candidate.length() ^ expected.length();
+  for (size_t i = 0; i < maxLength; i++) {
+    const uint8_t left = i < candidate.length() ? candidate[i] : 0;
+    const uint8_t right = i < expected.length() ? expected[i] : 0;
+    difference |= left ^ right;
+  }
+  return difference == 0;
+}
+
+static uint32_t webAuthRetryAfterSeconds() {
+  WebAuthThrottleEntry &entry = webAuthEntryFor(server.client().remoteIP());
+  const uint32_t now = millis();
+  if (!entry.used || !timeBefore(now, entry.blockedUntil))
+    return 0;
+  return ((entry.blockedUntil - now) + 999) / 1000;
+}
+
+static bool webPinAttemptAllowed(const IPAddress &ip) {
+  WebAuthThrottleEntry &entry = webAuthEntryFor(ip);
+  entry.ip = ip;
+  entry.used = true;
+  entry.lastSeen = millis();
+  return !timeBefore(entry.lastSeen, entry.blockedUntil);
+}
+
+static void recordWebPinResult(const IPAddress &ip, bool success) {
+  WebAuthThrottleEntry &entry = webAuthEntryFor(ip);
+  entry.ip = ip;
+  entry.used = true;
+  entry.lastSeen = millis();
+  if (success) {
+    entry.failures = 0;
+    entry.blockedUntil = 0;
+    return;
+  }
+  if (entry.failures < 255)
+    entry.failures++;
+  uint32_t delayMs = 0;
+  if (entry.failures >= 5)
+    delayMs = 30000;
+  else if (entry.failures >= 2)
+    delayMs = 1000UL << (entry.failures - 2);
+  entry.blockedUntil = delayMs ? entry.lastSeen + delayMs : 0;
+}
 
 void ensureWebSessionToken() {
   if (webSessionToken.length() == 32 && webSessionPinSnapshot == web_pin)
@@ -145,22 +218,41 @@ void ensureWebSessionToken() {
            (unsigned long)esp_random(), (unsigned long)esp_random());
   webSessionToken = token;
   webSessionPinSnapshot = web_pin;
+  webSessionClientBound = false;
+  webSessionIssuedAt = 0;
 }
 
 bool webRequestAuthorized(bool allowFormPin = false) {
   ensureWebSessionToken();
+  webAuthRequestThrottled = false;
+  const IPAddress remoteIp = server.client().remoteIP();
   String suppliedPin = server.header("X-Auth-Pin");
   if (allowFormPin && suppliedPin.length() == 0 && server.hasArg("pin"))
     suppliedPin = server.arg("pin");
 
   const String cookieToken =
       getCookieValue(server.header("Cookie"), "DL_AUTH");
-  const bool pinValid = suppliedPin.length() > 0 && suppliedPin == web_pin;
+  bool pinValid = false;
+  if (suppliedPin.length() > 0) {
+    if (!webPinAttemptAllowed(remoteIp)) {
+      webAuthRequestThrottled = true;
+      return false;
+    }
+    pinValid = constantTimePinEquals(suppliedPin, web_pin);
+    recordWebPinResult(remoteIp, pinValid);
+  }
+  const uint32_t now = millis();
   const bool sessionValid =
-      cookieToken.length() > 0 && cookieToken == webSessionToken;
-  if (pinValid && cookieToken != webSessionToken) {
+      cookieToken.length() > 0 && cookieToken == webSessionToken &&
+      webSessionClientBound && webSessionClientIp == remoteIp &&
+      timeBefore(now, webSessionIssuedAt + WEB_SESSION_MAX_AGE_MS);
+  if (pinValid) {
+    webSessionClientIp = remoteIp;
+    webSessionClientBound = true;
+    webSessionIssuedAt = now;
     server.sendHeader("Set-Cookie", "DL_AUTH=" + webSessionToken +
-                                       "; Path=/; HttpOnly; SameSite=Strict");
+                                       "; Path=/; Max-Age=900; HttpOnly; "
+                                       "SameSite=Strict");
   }
   return pinValid || sessionValid;
 }
@@ -169,7 +261,12 @@ bool requireWebAuth() {
   if (webRequestAuthorized())
     return true;
   server.sendHeader("Cache-Control", "no-store");
-  server.send(401, "text/plain", "Unauthorized");
+  if (webAuthRequestThrottled) {
+    server.sendHeader("Retry-After", String(webAuthRetryAfterSeconds()));
+    server.send(429, "text/plain", "Too many PIN attempts. Try again later.");
+  } else {
+    server.send(401, "text/plain", "Unauthorized");
+  }
   return false;
 }
 
@@ -199,8 +296,10 @@ void sendWebLoginPage(const String &destination, const String &feature) {
       "urlencoded'},body:'pin='+encodeURIComponent(p)});if(r.ok){location."
       "replace('" +
       safeDestination +
-      "');return;}document.getElementById('error').textContent='Incorrect "
-      "PIN';b.disabled=false;};</script></body></html>";
+      "');return;}const retry=r.headers.get('Retry-After');document."
+      "getElementById('error').textContent=r.status===429?'Too many attempts. "
+      "Try again in '+(retry||'a few')+' seconds.':'Incorrect PIN';b.disabled="
+      "false;};</script></body></html>";
   server.sendHeader("Cache-Control", "no-store");
   server.send(401, "text/html", html);
 }
@@ -392,7 +491,12 @@ void setupWebHandlers() {
   server.on("/api/auth", HTTP_POST, []() {
     if (!webRequestAuthorized(true)) {
       server.sendHeader("Cache-Control", "no-store");
-      server.send(401, "text/plain", "Unauthorized");
+      if (webAuthRequestThrottled) {
+        server.sendHeader("Retry-After", String(webAuthRetryAfterSeconds()));
+        server.send(429, "text/plain", "Too many attempts");
+      } else {
+        server.send(401, "text/plain", "Unauthorized");
+      }
       return;
     }
     server.sendHeader("Cache-Control", "no-store");
@@ -1899,6 +2003,7 @@ void setupWebHandlers() {
           }
         }
       }
+      delay(1); // Keep the HTTP/idle tasks serviced during large exports.
     }
 
     // Export Books
@@ -1929,6 +2034,7 @@ void setupWebHandlers() {
         serializeJson(doc, line);
         server.sendContent(line + "\n");
       }
+      delay(1);
     }
 
     server.sendContent("");
@@ -2469,6 +2575,12 @@ void setup() {
   Serial.println("Server Begin...");
   server.begin();
 
+  // The worker is started only after storage, network, and the web server are
+  // ready. Starting it just before the UI allows the first paint to queue an
+  // optional detail read without ever touching SD from the LVGL task.
+  Serial.println("Starting Background Worker...");
+  BackgroundWorker::begin();
+
   // 6. UI
   Serial.println("UI Setup...");
   lvgl_port_lock(-1);
@@ -2483,11 +2595,6 @@ void setup() {
   lvgl_port_unlock();
 
   logMemoryUsage("BOOT COMPLETE");
-
-  // 7. Start Background Worker (Last step to ensure no bus contention during
-  // boot)
-  Serial.println("Starting Background Worker...");
-  BackgroundWorker::begin();
 }
 
 // ========================================

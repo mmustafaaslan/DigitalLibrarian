@@ -77,7 +77,9 @@ void closeLyricsRequest(HTTPClient &http, WiFiClientSecure &client) {
   RuntimeDiagnostics::markPhase(
       "lyrics/socket-close", BackgroundWorker::getStackHighWaterMark());
   http.end();
-  client.stop();
+  // HTTPClient::end() already stops its client. A second stop repeats all
+  // MbedTLS cleanup and bundle reattachment and made repeated requests more
+  // fragile on this core version.
   // Let the TCP/IP task release its buffers before another TLS connection.
   delay(50);
 }
@@ -1402,7 +1404,7 @@ void MediaManager::sortByArtistOrAuthor() {
 
 // Improved fetchLyricsIfNeeded with better timeouts
 LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
-                                 bool force) {
+                                 bool force, bool persistTracklist) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("fetchLyricsIfNeeded: No WiFi");
     return LYRICS_ERROR;
@@ -1425,6 +1427,9 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
   }
 
   Track &track = tl->tracks[trackIndex];
+  const int trackNumber = track.trackNo;
+  const String filename = "/lyrics/" + String(releaseMbid) + "/" +
+                          padTrackNumber(trackNumber) + ".json";
 
   if (!force) {
     if (track.lyrics.status == "cached") {
@@ -1436,6 +1441,21 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
       Storage.deleteTracklist(tl);
       return LYRICS_NOT_FOUND; // Don't retry automatically
     }
+
+    // A previous bulk run may have saved the lyrics just before a reset or
+    // cancellation, before its one final track-list commit. Treat that
+    // transactional file as cached so retrying never downloads it again.
+    if (Storage.lyricsFileExists(filename.c_str())) {
+      bool metadataSaved = true;
+      if (persistTracklist) {
+        track.lyrics.status = "cached";
+        track.lyrics.path = filename.c_str();
+        track.lyrics.offset = 0;
+        metadataSaved = Storage.saveTracklist(releaseMbid, tl);
+      }
+      Storage.deleteTracklist(tl);
+      return metadataSaved ? LYRICS_ALREADY_CACHED : LYRICS_ERROR;
+    }
   }
 
   // Retain only the small request fields while TLS is active. Keeping a full
@@ -1444,7 +1464,6 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
   const String albumArtist = tl->cdArtist.c_str();
   const String albumTitle = tl->cdTitle.c_str();
   const String trackTitle = track.title.c_str();
-  const int trackNumber = track.trackNo;
   Storage.deleteTracklist(tl);
   tl = nullptr;
 
@@ -1459,7 +1478,7 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
   {
     Serial.println("Using Strategy 1: Lyrics.ovh...");
     HTTPClient http;
-    WiFiClientSecure client;
+    RedirectSafeTlsClient client;
     RuntimeDiagnostics::markPhase(
         "lyrics/ovh-config", BackgroundWorker::getStackHighWaterMark());
     if (!canStartLyricsTlsRequest() || !configureTrustedTlsClient(client)) {
@@ -1510,7 +1529,7 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
       return LYRICS_ERROR;
     Serial.println("  -> Lyrics.ovh failed, trying LRCLib...");
     HTTPClient http;
-    WiFiClientSecure client;
+    RedirectSafeTlsClient client;
     RuntimeDiagnostics::markPhase(
         "lyrics/lrclib-config", BackgroundWorker::getStackHighWaterMark());
     if (!canStartLyricsTlsRequest() || !configureTrustedTlsClient(client)) {
@@ -1563,8 +1582,6 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
   if (found) {
     RuntimeDiagnostics::markPhase(
         "lyrics/file-save", BackgroundWorker::getStackHighWaterMark());
-    String filename = "/lyrics/" + String(releaseMbid) + "/" +
-                      padTrackNumber(trackNumber) + ".json";
     Serial.printf("Saving lyrics to %s, length: %d\n", filename.c_str(),
                   (int)finalLyrics.length());
     if (!Storage.saveLyrics(filename.c_str(), finalLyrics)) {
@@ -1572,6 +1589,12 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
                              "fetchLyricsIfNeeded");
       return LYRICS_ERROR;
     }
+
+    // Bulk downloads commit their track metadata once after the request loop.
+    // The lyrics file itself is already transactional, and the next run also
+    // discovers it if power is lost before that final metadata commit.
+    if (!persistTracklist)
+      return LYRICS_FETCHED_NOW;
 
     tl = Storage.loadTracklist(releaseMbid);
     if (!tl || trackIndex < 0 || trackIndex >= (int)tl->tracks.size()) {
@@ -1596,16 +1619,53 @@ LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
       Serial.println("  -> Lyrics providers were not reachable; stopping");
       return LYRICS_ERROR;
     }
-    tl = Storage.loadTracklist(releaseMbid);
-    if (tl && trackIndex >= 0 && trackIndex < (int)tl->tracks.size()) {
-      tl->tracks[trackIndex].lyrics.status = "missing";
-      Storage.saveTracklist(releaseMbid, tl);
+    if (persistTracklist) {
+      tl = Storage.loadTracklist(releaseMbid);
+      if (tl && trackIndex >= 0 && trackIndex < (int)tl->tracks.size()) {
+        tl->tracks[trackIndex].lyrics.status = "missing";
+        Storage.saveTracklist(releaseMbid, tl);
+      }
+      if (tl)
+        Storage.deleteTracklist(tl);
     }
-    if (tl)
-      Storage.deleteTracklist(tl);
     Serial.println("  -> Not found in any provider");
     return LYRICS_NOT_FOUND;
   }
+}
+
+bool MediaManager::reconcileCachedLyrics(const char *releaseMbid,
+                                         int *cachedCount) {
+  if (cachedCount)
+    *cachedCount = 0;
+  TrackList *trackList = Storage.loadTracklist(releaseMbid);
+  if (!trackList)
+    return false;
+
+  bool changed = false;
+  int found = 0;
+  const String reconciledAt = getCurrentISO8601Timestamp();
+  for (Track &track : trackList->tracks) {
+    const String path = "/lyrics/" + String(releaseMbid) + "/" +
+                        padTrackNumber(track.trackNo) + ".json";
+    if (!Storage.lyricsFileExists(path.c_str()))
+      continue;
+    found++;
+    if (track.lyrics.status != "cached" || track.lyrics.path != path.c_str()) {
+      track.lyrics.status = "cached";
+      track.lyrics.path = path.c_str();
+      track.lyrics.fetchedAt = reconciledAt.c_str();
+      track.lyrics.lang = "en";
+      track.lyrics.error.clear();
+      track.lyrics.offset = 0;
+      changed = true;
+    }
+  }
+
+  const bool saved = !changed || Storage.saveTracklist(releaseMbid, trackList);
+  Storage.deleteTracklist(trackList);
+  if (cachedCount)
+    *cachedCount = found;
+  return saved;
 }
 
 namespace {

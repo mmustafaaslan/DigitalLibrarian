@@ -56,6 +56,20 @@ void appendAscii(PsramString &output, const char *value) {
   output.append(value);
 }
 
+bool isNonLatinScript(uint32_t codePoint) {
+  // The firmware uses LVGL's compact Montserrat font, which intentionally
+  // omits these large script ranges. Replace a whole run with readable ASCII
+  // instead of asking LVGL to draw one missing-glyph rectangle per letter.
+  return (codePoint >= 0x0370 && codePoint <= 0x052F) || // Greek/Cyrillic
+         (codePoint >= 0x0590 && codePoint <= 0x08FF) || // Hebrew/Arabic
+         (codePoint >= 0x0900 && codePoint <= 0x0DFF) || // Indic scripts
+         (codePoint >= 0x0E00 && codePoint <= 0x109F) || // SE Asian scripts
+         (codePoint >= 0x1100 && codePoint <= 0x11FF) || // Hangul Jamo
+         (codePoint >= 0x2E80 && codePoint <= 0x9FFF) || // CJK + ideographs
+         (codePoint >= 0xAC00 && codePoint <= 0xD7AF) || // Hangul syllables
+         (codePoint >= 0xF900 && codePoint <= 0xFAFF);   // CJK compatibility
+}
+
 void appendLvglCodePoint(PsramString &output, uint32_t codePoint) {
   if (codePoint < 0x80) {
     // Preserve useful whitespace, but discard control characters that can
@@ -69,6 +83,17 @@ void appendLvglCodePoint(PsramString &output, uint32_t codePoint) {
   // Combining accents follow an already rendered base letter.
   if (codePoint >= 0x0300 && codePoint <= 0x036F)
     return;
+
+  // Invisible formatting code points should not become visible boxes.
+  if ((codePoint >= 0x200B && codePoint <= 0x200D) || codePoint == 0x2060 ||
+      codePoint == 0xFEFF)
+    return;
+
+  // Full-width Latin punctuation and letters have direct ASCII equivalents.
+  if (codePoint >= 0xFF01 && codePoint <= 0xFF5E) {
+    output.push_back(static_cast<char>(codePoint - 0xFEE0));
+    return;
+  }
 
   switch (codePoint) {
   case 0x00A0:
@@ -141,7 +166,11 @@ void appendLvglCodePoint(PsramString &output, uint32_t codePoint) {
   case 0x2018:
   case 0x2019:
   case 0x201A:
+  case 0x02B9:
+  case 0x02BB:
   case 0x02BC:
+  case 0x02BE:
+  case 0x2032:
     output.push_back('\'');
     return;
   case 0x201C:
@@ -286,10 +315,18 @@ void appendLvglCodePoint(PsramString &output, uint32_t codePoint) {
 
 void sanitizeLvglTextInPlace(PsramString &text) {
   PsramString output;
-  output.reserve(text.size());
+  output.reserve(text.size() + 16);
   size_t offset = 0;
+  bool inUnsupportedScript = false;
   while (offset < text.size()) {
     const uint32_t codePoint = decodeUtf8(text.data(), text.size(), offset);
+    if (isNonLatinScript(codePoint)) {
+      if (!inUnsupportedScript)
+        appendAscii(output, "[non-Latin]");
+      inUnsupportedScript = true;
+      continue;
+    }
+    inUnsupportedScript = false;
     appendLvglCodePoint(output, codePoint);
   }
   text.swap(output);

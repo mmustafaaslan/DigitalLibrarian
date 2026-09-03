@@ -2,8 +2,7 @@
 #define NAVIGATION_CACHE_H
 
 #include "Core_Data.h"
-#include "Storage.h"
-#include "mode_abstraction.h" // Needed for ensureItemDetailsLoaded and getItemCount
+#include "mode_abstraction.h"
 #include <Arduino.h>
 #include <esp_heap_caps.h>
 #include <new>
@@ -69,7 +68,9 @@ inline void invalidateNavigationCache() {
     xSemaphoreGiveRecursive(libraryMutex);
 }
 
-// Load an item from SD into cache at specific cache index
+// Copy an already-loaded item into the cache. Navigation and rendering call
+// this code from the LVGL task, so it must never wait on the SD card. Missing
+// details are loaded separately by BackgroundWorker.
 inline bool loadItemIntoCache(int libraryIndex, int cacheIndex) {
   if (!ensureNavigationCacheAllocated())
     return false;
@@ -97,32 +98,24 @@ inline bool loadItemIntoCache(int libraryIndex, int cacheIndex) {
   case MODE_CD:
     if (libraryIndex >= 0 && libraryIndex < (int)cdLibrary.size()) {
       const CD &libraryItem = cdLibrary[libraryIndex];
-      bool success = false;
       if (libraryItem.detailsLoaded) {
         navCache.cdCache[cacheIndex] = libraryItem;
-        success = true;
-      } else {
-        success = Storage.loadCDDetail(libraryItem.uniqueID.c_str(),
-                                       navCache.cdCache[cacheIndex]);
+        navCache.cdCacheValid[cacheIndex] = true;
+        return true;
       }
-      navCache.cdCacheValid[cacheIndex] = success;
-      return success;
+      return false;
     }
     break;
 
   case MODE_BOOK:
     if (libraryIndex >= 0 && libraryIndex < (int)bookLibrary.size()) {
       const Book &libraryItem = bookLibrary[libraryIndex];
-      bool success = false;
       if (libraryItem.detailsLoaded) {
         navCache.bookCache[cacheIndex] = libraryItem;
-        success = true;
-      } else {
-        success = Storage.loadBookDetail(libraryItem.uniqueID.c_str(),
-                                         navCache.bookCache[cacheIndex]);
+        navCache.bookCacheValid[cacheIndex] = true;
+        return true;
       }
-      navCache.bookCacheValid[cacheIndex] = success;
-      return success;
+      return false;
     }
     break;
 
@@ -236,12 +229,14 @@ inline ItemView buildCachedBookView(const Book &detail, int libraryIndex) {
   return view;
 }
 
-// Get item from cache if available, otherwise load from SD
+// Get item from cache if available, otherwise return the lightweight RAM index
+// entry. This function is used by touch/render callbacks and must remain
+// bounded even when the SD card is slow or temporarily busy.
 inline ItemView getItemFromCache(int libraryIndex) {
   ItemView result{};
   result.isValid = false;
   if (!ensureNavigationCacheAllocated())
-    return getItemAtSD(libraryIndex);
+    return getItemAtRAM(libraryIndex);
   if (libraryMutex)
     xSemaphoreTakeRecursive(libraryMutex, portMAX_DELAY);
 
@@ -281,8 +276,9 @@ inline ItemView getItemFromCache(int libraryIndex) {
     }
   }
 
-  // Cache MISS
-  result = getItemAtSD(libraryIndex);
+  // Cache miss: index fields are enough for the first paint. A worker job will
+  // populate optional detail fields and refresh this item later.
+  result = getItemAtRAM(libraryIndex);
   if (libraryMutex)
     xSemaphoreGiveRecursive(libraryMutex);
   return result;

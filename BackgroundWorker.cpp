@@ -66,6 +66,12 @@ bool BackgroundWorker::_tracklistCompletionSuccess = false;
 String BackgroundWorker::_tracklistCompletionMessage = "";
 int BackgroundWorker::_tracklistResultIndex = -1;
 String BackgroundWorker::_tracklistResultMbid = "";
+bool BackgroundWorker::_itemDetailCompletionReady = false;
+bool BackgroundWorker::_itemDetailCompletionSuccess = false;
+String BackgroundWorker::_itemDetailCompletionMessage = "";
+int BackgroundWorker::_itemDetailResultIndex = -1;
+MediaMode BackgroundWorker::_itemDetailResultMode = MODE_CD;
+String BackgroundWorker::_itemDetailResultId = "";
 
 void BackgroundWorker::begin() {
   if (_taskHandle)
@@ -120,9 +126,13 @@ bool BackgroundWorker::addJob(const BackgroundJob &job) {
   while (!copy.empty()) {
     const BackgroundJob &queued = copy.front();
     if (queued.type == job.type && queued.id == job.id &&
-        queued.index == job.index) {
+        queued.index == job.index && queued.extraData == job.extraData) {
       xSemaphoreGive(_queueMutex);
-      return true;
+      // A heap-owned payload or completion callback cannot safely be merged:
+      // its ownership/notification would be lost. Stateless identical jobs
+      // are idempotent and can share the already queued request.
+      return !queued.savePayload && !job.savePayload && !queued.onComplete &&
+             !job.onComplete;
     }
     copy.pop();
   }
@@ -136,7 +146,8 @@ bool BackgroundWorker::addJob(const BackgroundJob &job) {
       job.type == JOB_TRACKLIST_LOAD || job.type == JOB_LYRICS_LOAD_CACHED ||
       job.type == JOB_LYRICS_FETCH_ONE || job.type == JOB_METADATA_LOOKUP ||
       job.type == JOB_ITEM_SAVE || job.type == JOB_COVER_DOWNLOAD ||
-      job.type == JOB_WEB_METADATA_ADD || job.type == JOB_COVER_DELETE;
+      job.type == JOB_WEB_METADATA_ADD || job.type == JOB_COVER_DELETE ||
+      job.type == JOB_ITEM_DETAIL_LOAD;
   if (interactiveJob && !_jobQueue.empty()) {
     // Touch-driven work should not wait behind maintenance tasks such as track
     // summaries, favorites, or WLED persistence.
@@ -393,6 +404,29 @@ bool BackgroundWorker::takeTracklistCompletion(bool &success, String &message,
   return ready;
 }
 
+bool BackgroundWorker::takeItemDetailCompletion(bool &success,
+                                                String &message,
+                                                int &itemIndex,
+                                                MediaMode &mode,
+                                                String &itemId) {
+  if (!_queueMutex || xSemaphoreTake(_queueMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    return false;
+  const bool ready = _itemDetailCompletionReady;
+  if (ready) {
+    success = _itemDetailCompletionSuccess;
+    message = _itemDetailCompletionMessage;
+    itemIndex = _itemDetailResultIndex;
+    mode = _itemDetailResultMode;
+    itemId = _itemDetailResultId;
+    _itemDetailCompletionReady = false;
+    _itemDetailCompletionMessage = "";
+    _itemDetailResultIndex = -1;
+    _itemDetailResultId = "";
+  }
+  xSemaphoreGive(_queueMutex);
+  return ready;
+}
+
 void BackgroundWorker::setStatus(const String &message) {
   if (_queueMutex && xSemaphoreTake(_queueMutex, portMAX_DELAY) == pdTRUE) {
     _statusMsg = message;
@@ -445,6 +479,58 @@ void BackgroundWorker::workerTask(void *pvParameters) {
       bool restartAfterCompletion = false;
 
       switch (currentJob.type) {
+      case JOB_ITEM_DETAIL_LOAD: {
+        const MediaMode requestedMode =
+            currentJob.extraData == "book" ? MODE_BOOK : MODE_CD;
+        setStatus(requestedMode == MODE_BOOK ? "Loading book details..."
+                                             : "Loading CD details...");
+        setProgress(0.20f);
+
+        // Read into a temporary object without holding libraryMutex. SD access
+        // can take seconds on a marginal card, but the LVGL task remains free
+        // to paint and process touch throughout that delay.
+        if (requestedMode == MODE_BOOK) {
+          Book loaded;
+          success = Storage.loadBookDetail(currentJob.id.c_str(), loaded);
+          if (success && libraryMutex &&
+              xSemaphoreTakeRecursive(libraryMutex, pdMS_TO_TICKS(1000)) ==
+                  pdPASS) {
+            if (currentJob.index >= 0 &&
+                currentJob.index < (int)bookLibrary.size() &&
+                bookLibrary[currentJob.index].uniqueID ==
+                    currentJob.id.c_str()) {
+              bookLibrary[currentJob.index] = std::move(loaded);
+            } else {
+              success = false;
+            }
+            xSemaphoreGiveRecursive(libraryMutex);
+          } else if (success) {
+            success = false;
+          }
+        } else {
+          CD loaded;
+          success = Storage.loadCDDetail(currentJob.id.c_str(), loaded);
+          if (success && libraryMutex &&
+              xSemaphoreTakeRecursive(libraryMutex, pdMS_TO_TICKS(1000)) ==
+                  pdPASS) {
+            if (currentJob.index >= 0 &&
+                currentJob.index < (int)cdLibrary.size() &&
+                cdLibrary[currentJob.index].uniqueID == currentJob.id.c_str()) {
+              cdLibrary[currentJob.index] = std::move(loaded);
+            } else {
+              success = false;
+            }
+            xSemaphoreGiveRecursive(libraryMutex);
+          } else if (success) {
+            success = false;
+          }
+        }
+
+        setProgress(success ? 1.0f : 0.0f);
+        resultMsg = success ? "Item details loaded"
+                            : "Item details could not be loaded from SD";
+      } break;
+
       case JOB_METADATA_LOOKUP: {
         if (WiFi.status() != WL_CONNECTED) {
           resultMsg = "No WiFi connection. Connect and try again.";
@@ -1191,7 +1277,7 @@ void BackgroundWorker::workerTask(void *pvParameters) {
                   JOB_LYRICS_FETCH_ALL, i + 1, trackCount,
                   targetMbid.c_str());
               LyricsResult res =
-                  fetchLyricsIfNeeded(targetMbid.c_str(), i, false);
+                  fetchLyricsIfNeeded(targetMbid.c_str(), i, false, false);
               RuntimeDiagnostics::clearOperation();
               if (res == LYRICS_FETCHED_NOW || res == LYRICS_ALREADY_CACHED) {
                 fetched++;
@@ -1205,6 +1291,22 @@ void BackgroundWorker::workerTask(void *pvParameters) {
               // small internal heap very quickly.
               delay(WiFi.RSSI() <= -75 ? 2500 : 750);
             }
+            // Commit all newly discovered lyrics paths in one track-list
+            // rewrite. Rewriting the complete JSON after every track
+            // fragmented internal RAM immediately before the next TLS
+            // handshake and was the remaining bulk-download reset path.
+            RuntimeDiagnostics::markPhase(
+                "lyrics/batch-commit", getStackHighWaterMark());
+            int cachedAfterCommit = 0;
+            if (!MediaManager::reconcileCachedLyrics(
+                    targetMbid.c_str(), &cachedAfterCommit)) {
+              stoppedForSafety = true;
+              if (stoppedAt == 0)
+                stoppedAt = std::min(trackCount, 1);
+            } else {
+              fetched = cachedAfterCommit;
+            }
+            RuntimeDiagnostics::clearOperation();
             if (stoppedForSafety) {
               resultMsg = "Stopped safely at track " + String(stoppedAt) +
                           "/" + String(trackCount) +
@@ -1252,7 +1354,7 @@ void BackgroundWorker::workerTask(void *pvParameters) {
                     JOB_LYRICS_FETCH_ALL, t + 1,
                     std::min(trackCount, 5), mbid.c_str());
                 const LyricsResult result =
-                    fetchLyricsIfNeeded(mbid.c_str(), t, false);
+                    fetchLyricsIfNeeded(mbid.c_str(), t, false, false);
                 RuntimeDiagnostics::clearOperation();
                 if (result == LYRICS_ERROR ||
                     WiFi.status() != WL_CONNECTED) {
@@ -1261,6 +1363,11 @@ void BackgroundWorker::workerTask(void *pvParameters) {
                 }
                 delay(WiFi.RSSI() <= -75 ? 2500 : 750);
               }
+              RuntimeDiagnostics::markPhase(
+                  "lyrics/batch-commit", getStackHighWaterMark());
+              if (!MediaManager::reconcileCachedLyrics(mbid.c_str()))
+                is_sync_stopping = true;
+              RuntimeDiagnostics::clearOperation();
             }
             if (is_sync_stopping)
               break;
@@ -1408,6 +1515,14 @@ void BackgroundWorker::workerTask(void *pvParameters) {
           _itemSaveCompletionReady = true;
           _itemSaveCompletionSuccess = success;
           _itemSaveCompletionMessage = resultMsg;
+        } else if (currentJob.type == JOB_ITEM_DETAIL_LOAD) {
+          _itemDetailCompletionReady = true;
+          _itemDetailCompletionSuccess = success;
+          _itemDetailCompletionMessage = resultMsg;
+          _itemDetailResultIndex = currentJob.index;
+          _itemDetailResultMode = currentJob.extraData == "book" ? MODE_BOOK
+                                                                  : MODE_CD;
+          _itemDetailResultId = currentJob.id;
         }
         xSemaphoreGive(_queueMutex);
       }

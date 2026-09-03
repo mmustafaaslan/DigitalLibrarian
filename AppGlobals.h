@@ -3,6 +3,7 @@
 
 #include "mode_abstraction.h"
 #include <Arduino.h>
+#include <WiFi.h>
 #include <ESP_IOExpander_Library.h>
 #include <FastLED.h>
 #include <Preferences.h>
@@ -109,5 +110,15 @@ bool tjpg_output(int16_t x, int16_t y, uint16_t w, uint16_t h,
 void loadSettings();
 void saveSettings();
 void normalizeBrandSettings();
+
+// Fixed-size per-client state for protecting the local management PIN without
+// allocating from the heap during a login attempt.
+struct WebAuthThrottleEntry {
+  IPAddress ip;
+  uint8_t failures = 0;
+  uint32_t blockedUntil = 0;
+  uint32_t lastSeen = 0;
+  bool used = false;
+};
 
 #endif

@@ -25,7 +25,8 @@ enum JobType {
   JOB_WEB_METADATA_ADD,
   JOB_COVER_DELETE,
   JOB_BACKUP_IMPORT,
-  JOB_DIAGNOSTIC_LYRICS_STRESS
+  JOB_DIAGNOSTIC_LYRICS_STRESS,
+  JOB_ITEM_DETAIL_LOAD
 };
 
 struct ItemSavePayload {
@@ -84,6 +85,9 @@ public:
   static bool takeTracklistCompletion(bool &success, String &message,
                                       int &itemIndex, String &releaseMbid,
                                       TrackList *&trackList);
+  static bool takeItemDetailCompletion(bool &success, String &message,
+                                       int &itemIndex, MediaMode &mode,
+                                       String &itemId);
 
 private:
   static void workerTask(void *pvParameters);
@@ -133,6 +137,12 @@ private:
   static String _tracklistCompletionMessage;
   static int _tracklistResultIndex;
   static String _tracklistResultMbid;
+  static bool _itemDetailCompletionReady;
+  static bool _itemDetailCompletionSuccess;
+  static String _itemDetailCompletionMessage;
+  static int _itemDetailResultIndex;
+  static MediaMode _itemDetailResultMode;
+  static String _itemDetailResultId;
   static void setStatus(const String &message);
   static void setProgress(float progress);
   static void setBusyState(bool busy, bool showProgress);

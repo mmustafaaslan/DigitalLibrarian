@@ -17,7 +17,8 @@ extern const int SEARCH_PAGE_SIZE;
 
 // Exposed helper
 LyricsResult fetchLyricsIfNeeded(const char *releaseMbid, int trackIndex,
-                                 bool force = false);
+                                 bool force = false,
+                                 bool persistTracklist = true);
 
 class MediaManager {
 public:
@@ -51,6 +52,8 @@ public:
                                    bool quickMode = false,
                                    bool *requestFailed = nullptr,
                                    String *errorDetail = nullptr);
+  static bool reconcileCachedLyrics(const char *releaseMbid,
+                                    int *cachedCount = nullptr);
   static bool stressTestLyricsTransport(int cycles, String &resultMessage);
 
 private:

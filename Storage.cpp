@@ -4,9 +4,11 @@
 #include "Utils.h"
 #include "waveshare_sd_card.h" // For SD_CS and sdExpander
 #include <SD.h>
+#include <algorithm>
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <utility>
 
 LibrarianStorage Storage;
 
@@ -145,6 +147,118 @@ bool finishJsonWrite(File &file, size_t bytesWritten) {
   return ok;
 }
 
+// ArduinoJson and escaped-string writers may otherwise call File::write() one
+// byte at a time. A large lyrics body or full track-list rewrite can then keep
+// core 0 inside SD/SPI code long enough for the idle-task watchdog to fire.
+// Buffer writes and yield after each physical SD chunk.
+class YieldingBufferedFileWriter : public Print {
+public:
+  explicit YieldingBufferedFileWriter(File &file)
+      : _file(file), _used(0), _ok(true), _bytesAccepted(0) {}
+
+  size_t write(uint8_t value) override { return write(&value, 1); }
+
+  size_t write(const uint8_t *data, size_t length) override {
+    if (!_ok || !data)
+      return 0;
+    size_t accepted = 0;
+    while (accepted < length) {
+      const size_t available = sizeof(_buffer) - _used;
+      const size_t amount = std::min(available, length - accepted);
+      memcpy(_buffer + _used, data + accepted, amount);
+      _used += amount;
+      accepted += amount;
+      _bytesAccepted += amount;
+      if (_used == sizeof(_buffer) && !flushBuffer())
+        break;
+    }
+    return accepted;
+  }
+
+  bool finish() { return flushBuffer() && _ok; }
+  size_t bytesAccepted() const { return _bytesAccepted; }
+
+private:
+  bool flushBuffer() {
+    if (!_ok || _used == 0)
+      return _ok;
+    const size_t written = _file.write(_buffer, _used);
+    _ok = written == _used && _file.getWriteError() == 0;
+    _used = 0;
+    delay(1);
+    return _ok;
+  }
+
+  File &_file;
+  uint8_t _buffer[512];
+  size_t _used;
+  bool _ok;
+  size_t _bytesAccepted;
+};
+
+size_t readFileYielding(File &file, uint8_t *destination, size_t length) {
+  if (!destination)
+    return 0;
+  size_t total = 0;
+  static constexpr size_t SD_READ_CHUNK_BYTES = 4096;
+  while (total < length) {
+    const size_t amount =
+        std::min(SD_READ_CHUNK_BYTES, length - total);
+    const int bytesRead = file.read(destination + total, amount);
+    if (bytesRead <= 0)
+      break;
+    total += static_cast<size_t>(bytesRead);
+    delay(1);
+  }
+  return total;
+}
+
+// Stream JSON strings directly to the SD file. Repeatedly assembling escaped
+// Arduino Strings here fragments the small internal heap that the next TLS
+// handshake needs during a bulk lyrics download.
+bool writeEscapedJsonString(Print &file, const char *value) {
+  if (!value)
+    value = "";
+  static const char hex[] = "0123456789abcdef";
+  bool ok = file.write((uint8_t)'"') == 1;
+  for (const uint8_t *p = reinterpret_cast<const uint8_t *>(value); ok && *p;
+       ++p) {
+    switch (*p) {
+    case '"':
+      ok = file.print("\\\"") == 2;
+      break;
+    case '\\':
+      ok = file.print("\\\\") == 2;
+      break;
+    case '\b':
+      ok = file.print("\\b") == 2;
+      break;
+    case '\f':
+      ok = file.print("\\f") == 2;
+      break;
+    case '\n':
+      ok = file.print("\\n") == 2;
+      break;
+    case '\r':
+      ok = file.print("\\r") == 2;
+      break;
+    case '\t':
+      ok = file.print("\\t") == 2;
+      break;
+    default:
+      if (*p < 0x20) {
+        char escaped[] = {'\\', 'u', '0', '0', hex[*p >> 4], hex[*p & 0x0f]};
+        ok = file.write(reinterpret_cast<const uint8_t *>(escaped),
+                        sizeof(escaped)) == sizeof(escaped);
+      } else {
+        ok = file.write(*p) == 1;
+      }
+      break;
+    }
+  }
+  return ok && file.write((uint8_t)'"') == 1;
+}
+
 bool writeIndexTemp(const IndexVector &items, const String &tmpPath) {
   if (SD.exists(tmpPath) && !SD.remove(tmpPath))
     return false;
@@ -152,6 +266,7 @@ bool writeIndexTemp(const IndexVector &items, const String &tmpPath) {
   File file = SD.open(tmpPath, FILE_WRITE);
   if (!file)
     return false;
+  YieldingBufferedFileWriter writer(file);
 
   bool writeOk = true;
   for (const auto &item : items) {
@@ -170,9 +285,10 @@ bool writeIndexTemp(const IndexVector &items, const String &tmpPath) {
     for (int val : item.ledIndices)
       leds.add(val);
 
-    writeOk = serializeJson(doc, file) > 0 && file.println() > 0 && writeOk;
+    writeOk = serializeJson(doc, writer) > 0 && writer.println() > 0 && writeOk;
   }
 
+  writeOk = writer.finish() && writeOk;
   file.flush();
   writeOk = writeOk && file.getWriteError() == 0;
   file.close();
@@ -244,7 +360,8 @@ IndexVector &LibrarianStorage::getIndex() {
 
 // --- SAVE (Core Function) ---
 bool LibrarianStorage::saveCD(const CD &cd, const char *oldUniqueID,
-                              bool skipIndexRewrite) {
+                              bool skipIndexRewrite,
+                              bool keepDetailBackup) {
   ScopedLibraryAccess library(5000);
   if (!library) {
     ErrorHandler::logError(ERR_CAT_STORAGE, "Library busy", "Storage::saveCD");
@@ -295,7 +412,9 @@ bool LibrarianStorage::saveCD(const CD &cd, const char *oldUniqueID,
     leds.add(led);
   }
 
-  if (!finishJsonWrite(file, serializeJson(doc, file))) {
+  YieldingBufferedFileWriter writer(file);
+  const size_t detailBytes = serializeJson(doc, writer);
+  if (!writer.finish() || !finishJsonWrite(file, detailBytes)) {
     SD.remove(tmpPath);
     ErrorHandler::logError(ERR_CAT_STORAGE,
                            String("Failed while writing: ") + tmpPath,
@@ -363,7 +482,8 @@ bool LibrarianStorage::saveCD(const CD &cd, const char *oldUniqueID,
     return false;
   }
 
-  finalizeReplacedFile(path);
+  if (!keepDetailBackup)
+    finalizeReplacedFile(path);
   if (oldUniqueID && strlen(oldUniqueID) > 0 && cd.uniqueID != oldUniqueID) {
     const String oldPath = getFilePath(oldUniqueID, MODE_CD);
     if (oldPath != path && SD.exists(oldPath) && !SD.remove(oldPath)) {
@@ -407,7 +527,9 @@ bool LibrarianStorage::updateFavorite(String uniqueID, MediaMode mode,
   File target = SD.open(tmpPath, FILE_WRITE);
   if (!target)
     return false;
-  if (!finishJsonWrite(target, serializeJson(doc, target))) {
+  YieldingBufferedFileWriter writer(target);
+  const size_t detailBytes = serializeJson(doc, writer);
+  if (!writer.finish() || !finishJsonWrite(target, detailBytes)) {
     SD.remove(tmpPath);
     return false;
   }
@@ -495,6 +617,7 @@ bool LibrarianStorage::loadIndex(MediaMode mode) {
                              String("Skipping invalid index row: ") + error.c_str(),
                              "Storage::loadIndex");
     }
+    delay(1);
   }
 
   file.close();
@@ -604,7 +727,8 @@ bool LibrarianStorage::loadCDDetail(String uniqueID, CD &outCD) {
 // focus) Stub for compilation
 // --- SAVE BOOK ---
 bool LibrarianStorage::saveBook(const Book &book, const char *oldUniqueID,
-                                bool skipIndexRewrite) {
+                                bool skipIndexRewrite,
+                                bool keepDetailBackup) {
   ScopedLibraryAccess library(5000);
   if (!library) {
     ErrorHandler::logError(ERR_CAT_STORAGE, "Library busy", "Storage::saveBook");
@@ -647,7 +771,9 @@ bool LibrarianStorage::saveBook(const Book &book, const char *oldUniqueID,
     leds.add(led);
   }
 
-  if (!finishJsonWrite(file, serializeJson(doc, file))) {
+  YieldingBufferedFileWriter writer(file);
+  const size_t detailBytes = serializeJson(doc, writer);
+  if (!writer.finish() || !finishJsonWrite(file, detailBytes)) {
     SD.remove(tmpPath);
     ErrorHandler::logError(ERR_CAT_STORAGE, "Book transaction failed",
                            "Storage::saveBook");
@@ -710,7 +836,8 @@ bool LibrarianStorage::saveBook(const Book &book, const char *oldUniqueID,
     return false;
   }
 
-  finalizeReplacedFile(path);
+  if (!keepDetailBackup)
+    finalizeReplacedFile(path);
   if (oldUniqueID && strlen(oldUniqueID) > 0 && book.uniqueID != oldUniqueID) {
     const String oldPath = getFilePath(oldUniqueID, MODE_BOOK);
     if (oldPath != path && SD.exists(oldPath) && !SD.remove(oldPath)) {
@@ -928,7 +1055,8 @@ TrackList *LibrarianStorage::loadTracklist(const char *releaseMbid) {
       file.close();
       return nullptr;
     }
-    const size_t bytesRead = file.readBytes(jsonBuffer, jsonSize);
+    const size_t bytesRead = readFileYielding(
+        file, reinterpret_cast<uint8_t *>(jsonBuffer), jsonSize);
     file.close();
     if (bytesRead != jsonSize) {
       heap_caps_free(jsonBuffer);
@@ -986,7 +1114,8 @@ TrackList *LibrarianStorage::loadTracklist(const char *releaseMbid) {
 }
 
 bool LibrarianStorage::saveTracklist(const char *releaseMbid,
-                                     TrackList *trackList) {
+                                     TrackList *trackList,
+                                     bool keepBackup) {
   if (!trackList || !releaseMbid)
     return false;
 
@@ -1006,54 +1135,62 @@ bool LibrarianStorage::saveTracklist(const char *releaseMbid,
   File file = SD.open(tmpPath, FILE_WRITE);
   if (!file)
     return false;
+  YieldingBufferedFileWriter writer(file);
 
-  // Stream JSON directly to file to save Heap
-  file.print("{");
-  file.printf("\"releaseMbid\":\"%s\",", releaseMbid);
-  file.print("\"cdTitle\":\"" + escapeJSON(trackList->cdTitle.c_str()) + "\",");
-  file.print("\"cdArtist\":\"" + escapeJSON(trackList->cdArtist.c_str()) +
-             "\",");
-  file.printf("\"fetchedAt\":\"%s\",", trackList->fetchedAt.c_str());
-  file.print("\"tracks\":[");
+  // Stream JSON directly to file without allocating temporary Arduino Strings.
+  bool streamOk = writer.print("{\"releaseMbid\":") > 0;
+  streamOk = writeEscapedJsonString(writer, releaseMbid) && streamOk;
+  streamOk = writer.print(",\"cdTitle\":") > 0 && streamOk;
+  streamOk = writeEscapedJsonString(writer, trackList->cdTitle.c_str()) && streamOk;
+  streamOk = writer.print(",\"cdArtist\":") > 0 && streamOk;
+  streamOk = writeEscapedJsonString(writer, trackList->cdArtist.c_str()) && streamOk;
+  streamOk = writer.print(",\"fetchedAt\":") > 0 && streamOk;
+  streamOk = writeEscapedJsonString(writer, trackList->fetchedAt.c_str()) && streamOk;
+  streamOk = writer.print(",\"tracks\":[") > 0 && streamOk;
 
   for (size_t i = 0; i < trackList->tracks.size(); i++) {
     Track &track = trackList->tracks[i];
     if (i > 0)
-      file.print(",");
+      streamOk = writer.print(",") > 0 && streamOk;
 
-    file.print("{");
-    file.printf("\"trackNo\":%d,", track.trackNo);
-    file.print("\"title\":\"" + escapeJSON(track.title.c_str()) + "\",");
-    file.printf("\"durationMs\":%lu,", track.durationMs);
-    file.print("\"recordingMbid\":\"" + String(track.recordingMbid.c_str()) +
-               "\",");
+    streamOk = writer.print("{") > 0 && streamOk;
+    streamOk = writer.printf("\"trackNo\":%d,", track.trackNo) > 0 && streamOk;
+    streamOk = writer.print("\"title\":") > 0 && streamOk;
+    streamOk = writeEscapedJsonString(writer, track.title.c_str()) && streamOk;
+    streamOk = writer.printf(",\"durationMs\":%lu,", track.durationMs) > 0 && streamOk;
+    streamOk = writer.print("\"recordingMbid\":") > 0 && streamOk;
+    streamOk = writeEscapedJsonString(writer, track.recordingMbid.c_str()) && streamOk;
+    streamOk = writer.print(",") > 0 && streamOk;
 
-    file.print("\"lyrics\":{");
-    file.print("\"status\":\"" + String(track.lyrics.status.c_str()) + "\"");
+    streamOk = writer.print("\"lyrics\":{\"status\":") > 0 && streamOk;
+    streamOk = writeEscapedJsonString(writer, track.lyrics.status.c_str()) && streamOk;
 
     // String comparisons with PsramString work if PsramString is std::string
     if (track.lyrics.status == "cached") {
-      file.print(",\"path\":\"" + escapeJSON(track.lyrics.path.c_str()) + "\"");
-      file.print(",\"fetchedAt\":\"" + String(track.lyrics.fetchedAt.c_str()) +
-                 "\"");
-      file.print(",\"lang\":\"" + String(track.lyrics.lang.c_str()) + "\"");
+      streamOk = writer.print(",\"path\":") > 0 && streamOk;
+      streamOk = writeEscapedJsonString(writer, track.lyrics.path.c_str()) && streamOk;
+      streamOk = writer.print(",\"fetchedAt\":") > 0 && streamOk;
+      streamOk = writeEscapedJsonString(writer, track.lyrics.fetchedAt.c_str()) && streamOk;
+      streamOk = writer.print(",\"lang\":") > 0 && streamOk;
+      streamOk = writeEscapedJsonString(writer, track.lyrics.lang.c_str()) && streamOk;
     } else if (track.lyrics.status == "missing") {
-      file.print(",\"lastTriedAt\":\"" +
-                 String(track.lyrics.lastTriedAt.c_str()) + "\"");
-      file.print(",\"error\":\"" + escapeJSON(track.lyrics.error.c_str()) +
-                 "\"");
+      streamOk = writer.print(",\"lastTriedAt\":") > 0 && streamOk;
+      streamOk = writeEscapedJsonString(writer, track.lyrics.lastTriedAt.c_str()) && streamOk;
+      streamOk = writer.print(",\"error\":") > 0 && streamOk;
+      streamOk = writeEscapedJsonString(writer, track.lyrics.error.c_str()) && streamOk;
     }
-    file.print("},");
-    file.printf("\"isFavoriteTrack\":%s",
-                track.isFavoriteTrack ? "true" : "false");
-    file.print("}");
+    streamOk = writer.print("},") > 0 && streamOk;
+    streamOk = writer.printf("\"isFavoriteTrack\":%s",
+                             track.isFavoriteTrack ? "true" : "false") > 0 && streamOk;
+    streamOk = writer.print("}") > 0 && streamOk;
   }
-  file.print("]}");
+  streamOk = writer.print("]}") > 0 && streamOk;
+  streamOk = writer.finish() && streamOk;
   file.flush();
-  const bool writeOk = file.getWriteError() == 0 && file.size() > 0;
+  const bool writeOk = streamOk && file.getWriteError() == 0 && file.size() > 0;
   file.close();
 
-  if (!writeOk || !replaceFileWithRollback(tmpPath, filename)) {
+  if (!writeOk || !replaceFileWithRollback(tmpPath, filename, keepBackup)) {
     SD.remove(tmpPath);
     ErrorHandler::logError(ERR_CAT_STORAGE, "Tracklist transaction failed",
                            "Storage::saveTracklist");
@@ -1125,7 +1262,8 @@ bool LibrarianStorage::loadLyrics(const char *lyricsPath,
       file.close();
       return false;
     }
-    const size_t bytesRead = file.readBytes(jsonBuffer, jsonSize);
+    const size_t bytesRead = readFileYielding(
+        file, reinterpret_cast<uint8_t *>(jsonBuffer), jsonSize);
     file.close();
     if (bytesRead != jsonSize) {
       heap_caps_free(jsonBuffer);
@@ -1196,12 +1334,144 @@ bool LibrarianStorage::saveLyrics(const char *lyricsPath,
     return false;
   }
 
-  if (!finishJsonWrite(file, serializeJson(doc, file)) ||
+  YieldingBufferedFileWriter writer(file);
+  const size_t bytesWritten = serializeJson(doc, writer);
+  const bool bufferedWriteOk = writer.finish();
+  if (!bufferedWriteOk || !finishJsonWrite(file, bytesWritten) ||
       !replaceFileWithRollback(tmpPath, path)) {
     SD.remove(tmpPath);
     ErrorHandler::logError(ERR_CAT_STORAGE, "Lyrics transaction failed",
                            "Storage::saveLyrics");
     return false;
+  }
+  return true;
+}
+
+bool LibrarianStorage::lyricsFileExists(const char *lyricsPath) {
+  if (!lyricsPath || lyricsPath[0] == '\0')
+    return false;
+
+  String path(lyricsPath);
+  if (!path.startsWith("/"))
+    path = "/lyrics/" + path;
+
+  ScopedSdAccess sd(2000);
+  if (!sd)
+    return false;
+  recoverInterruptedReplace(path);
+  File file = SD.open(path, FILE_READ);
+  if (!file)
+    return false;
+  const size_t size = file.size();
+  file.close();
+  return size > 0 && size <= 512 * 1024;
+}
+
+static bool backupStringValid(JsonVariantConst value, size_t maxLength,
+                              bool required = false) {
+  if (value.isNull())
+    return !required;
+  if (!value.is<const char *>())
+    return false;
+  const char *text = value.as<const char *>();
+  if (!text)
+    return !required;
+  const size_t length = strlen(text);
+  return length <= maxLength && (!required || length > 0);
+}
+
+static bool backupLedArrayValid(JsonVariantConst value) {
+  if (!value.is<JsonArrayConst>())
+    return false;
+  JsonArrayConst values = value.as<JsonArrayConst>();
+  if (values.size() > 128)
+    return false;
+  for (JsonVariantConst entry : values) {
+    if (!entry.is<int>())
+      return false;
+    const int led = entry.as<int>();
+    if (led < 0 || led >= led_count)
+      return false;
+  }
+  return true;
+}
+
+static bool backupLyricsPathValid(JsonVariantConst value) {
+  if (!backupStringValid(value, 255))
+    return false;
+  const String path = value.isNull() ? "" : String(value.as<const char *>());
+  if (path.isEmpty())
+    return true;
+  return path.indexOf("..") < 0 && path.indexOf('\\') < 0 &&
+         (!path.startsWith("/") || path.startsWith("/lyrics/"));
+}
+
+static bool backupDocumentValid(JsonDocument &doc) {
+  if (!doc["type"].is<const char *>() || !doc["data"].is<JsonObject>())
+    return false;
+
+  const char *type = doc["type"].as<const char *>();
+  JsonObjectConst data = doc["data"].as<JsonObjectConst>();
+  if (strcmp(type, "cd") == 0 || strcmp(type, "book") == 0) {
+    if (!backupStringValid(data["uniqueID"], 128, true) ||
+        !backupStringValid(data["title"], 512, true) ||
+        !backupStringValid(data["genre"], 128) ||
+        !backupStringValid(data["coverUrl"], 2048) ||
+        !backupStringValid(data["coverFile"], 255) ||
+        !backupStringValid(data["notes"], 4096) ||
+        !backupLedArrayValid(data["ledIndices"]))
+      return false;
+
+    const int year = data["year"] | 0;
+    if (year != 0 && (year < 1000 || year > 2100))
+      return false;
+    const String id = data["uniqueID"].as<const char *>();
+    if (sanitizeFilename(id).isEmpty())
+      return false;
+
+    if (strcmp(type, "cd") == 0) {
+      const int trackCount = data["trackCount"] | 0;
+      return backupStringValid(data["artist"], 512) &&
+             backupStringValid(data["barcode"], 128) &&
+             backupStringValid(data["releaseMbid"], 128) && trackCount >= 0 &&
+             trackCount <= 1000;
+    }
+
+    const int pageCount = data["pageCount"] | 0;
+    const int currentPage = data["currentPage"] | 0;
+    return backupStringValid(data["author"], 512) &&
+           backupStringValid(data["isbn"], 128) &&
+           backupStringValid(data["publisher"], 512) && pageCount >= 0 &&
+           pageCount <= 100000 && currentPage >= 0 &&
+           currentPage <= pageCount;
+  }
+
+  if (strcmp(type, "tracklist") != 0 ||
+      !backupStringValid(doc["mbid"], 128, true) ||
+      !backupStringValid(data["cdTitle"], 512) ||
+      !backupStringValid(data["cdArtist"], 512) ||
+      !backupStringValid(data["fetchedAt"], 64) ||
+      !data["tracks"].is<JsonArrayConst>())
+    return false;
+
+  JsonArrayConst tracks = data["tracks"].as<JsonArrayConst>();
+  if (tracks.size() > 1000)
+    return false;
+  for (JsonObjectConst track : tracks) {
+    const int trackNo = track["trackNo"] | 0;
+    if (trackNo < 0 || trackNo > 1000 ||
+        !backupStringValid(track["title"], 512, true) ||
+        !backupStringValid(track["recordingMbid"], 128) ||
+        !track["lyrics"].is<JsonObjectConst>())
+      return false;
+    JsonObjectConst lyrics = track["lyrics"].as<JsonObjectConst>();
+    if (!backupStringValid(lyrics["status"], 32) ||
+        !backupLyricsPathValid(lyrics["path"]) ||
+        !backupStringValid(lyrics["fetchedAt"], 64) ||
+        !backupStringValid(lyrics["lastTriedAt"], 64) ||
+        !backupStringValid(lyrics["lang"], 32) ||
+        !backupStringValid(lyrics["error"], 1024))
+      return false;
   }
   return true;
 }
@@ -1235,7 +1505,8 @@ bool LibrarianStorage::importBackup(const char *path, int &itemCount,
       file.close();
       return false;
     }
-    const size_t bytesRead = file.readBytes(contents, contentSize);
+    const size_t bytesRead = readFileYielding(
+        file, reinterpret_cast<uint8_t *>(contents), contentSize);
     file.close();
     if (bytesRead != contentSize) {
       heap_caps_free(contents);
@@ -1243,6 +1514,75 @@ bool LibrarianStorage::importBackup(const char *path, int &itemCount,
     }
     contents[contentSize] = '\0';
   }
+
+  // Preflight every record before the first live write. A malformed line near
+  // the end of an upload must never leave earlier records partially imported.
+  bool preflightValid = false;
+  size_t preflightOffset = 0;
+  size_t validatedRecords = 0;
+  std::vector<PsramString, PsramAllocator<PsramString>> recordKeys;
+  while (preflightOffset < contentSize) {
+    size_t end = preflightOffset;
+    while (end < contentSize && contents[end] != '\n' &&
+           contents[end] != '\r')
+      end++;
+    const size_t lineLength = end - preflightOffset;
+    while (end < contentSize &&
+           (contents[end] == '\n' || contents[end] == '\r'))
+      end++;
+
+    if (lineLength > 0) {
+      if (lineLength > 65536) {
+        heap_caps_free(contents);
+        return false;
+      }
+      BasicJsonDocument<SpiRamAllocator> doc(65536);
+      if (deserializeJson(doc, contents + preflightOffset, lineLength) ||
+          !backupDocumentValid(doc)) {
+        heap_caps_free(contents);
+        return false;
+      }
+      const char *type = doc["type"] | "";
+      const char *identity = strcmp(type, "tracklist") == 0
+                                 ? (const char *)(doc["mbid"] | "")
+                                 : (const char *)(doc["data"]["uniqueID"] | "");
+      PsramString recordKey(type);
+      recordKey += ':';
+      recordKey += identity;
+      if (std::find(recordKeys.begin(), recordKeys.end(), recordKey) !=
+          recordKeys.end()) {
+        heap_caps_free(contents);
+        return false;
+      }
+      recordKeys.push_back(std::move(recordKey));
+      validatedRecords++;
+    }
+    preflightOffset = end;
+    yield();
+  }
+  preflightValid = validatedRecords > 0;
+  if (!preflightValid) {
+    heap_caps_free(contents);
+    return false;
+  }
+
+  struct ImportReplacement {
+    PsramString path;
+    bool hadOriginal = false;
+  };
+  std::vector<ImportReplacement, PsramAllocator<ImportReplacement>>
+      replacements;
+  const IndexVector originalCdIndex = _cdIndex;
+  const IndexVector originalBookIndex = _bookIndex;
+
+  auto readImportFileState = [](const String &filePath, bool &exists) {
+    ScopedSdAccess sd(2000);
+    if (!sd)
+      return false;
+    recoverInterruptedReplace(filePath);
+    exists = SD.exists(filePath);
+    return true;
+  };
 
   bool allValid = true;
   bool importedCD = false;
@@ -1297,7 +1637,13 @@ bool LibrarianStorage::importBackup(const char *path, int &itemCount,
       for (int led : data["ledIndices"].as<JsonArray>())
         cd.ledIndices.push_back(led);
       if (!cd.uniqueID.empty() && !cd.title.empty()) {
-        saved = saveCD(cd, nullptr, true);
+        const String detailPath = getFilePath(cd.uniqueID.c_str(), MODE_CD);
+        bool hadOriginal = false;
+        saved = readImportFileState(detailPath, hadOriginal) &&
+                saveCD(cd, nullptr, true, true);
+        if (saved)
+          replacements.push_back(
+              {PsramString(detailPath.c_str()), hadOriginal});
         importedCD = importedCD || saved;
       }
     } else if (strcmp(type, "book") == 0) {
@@ -1318,7 +1664,13 @@ bool LibrarianStorage::importBackup(const char *path, int &itemCount,
       for (int led : data["ledIndices"].as<JsonArray>())
         book.ledIndices.push_back(led);
       if (!book.uniqueID.empty() && !book.title.empty()) {
-        saved = saveBook(book, nullptr, true);
+        const String detailPath = getFilePath(book.uniqueID.c_str(), MODE_BOOK);
+        bool hadOriginal = false;
+        saved = readImportFileState(detailPath, hadOriginal) &&
+                saveBook(book, nullptr, true, true);
+        if (saved)
+          replacements.push_back(
+              {PsramString(detailPath.c_str()), hadOriginal});
         importedBook = importedBook || saved;
       }
     } else if (strcmp(type, "tracklist") == 0) {
@@ -1349,12 +1701,21 @@ bool LibrarianStorage::importBackup(const char *path, int &itemCount,
           track.lyrics.error = (const char *)(lyrics["error"] | "");
           trackList.tracks.push_back(track);
         }
-        saved = saveTracklist(mbid, &trackList);
-        if (saved)
+        const String trackPath =
+            "/tracks/" + sanitizeFilename(String(mbid)) + ".json";
+        bool hadOriginal = false;
+        saved = readImportFileState(trackPath, hadOriginal) &&
+                saveTracklist(mbid, &trackList, true);
+        if (saved) {
+          replacements.push_back(
+              {PsramString(trackPath.c_str()), hadOriginal});
           tracklistCount++;
+        }
       }
-      if (!saved)
+      if (!saved) {
         allValid = false;
+        break;
+      }
       yield();
       continue;
     } else {
@@ -1365,18 +1726,50 @@ bool LibrarianStorage::importBackup(const char *path, int &itemCount,
 
     if (saved)
       itemCount++;
-    else
+    else {
       allValid = false;
+      break;
+    }
     yield();
   }
   heap_caps_free(contents);
 
   // Each imported detail transaction updates its in-memory index. Commit each
   // affected index once, rather than once per record.
-  if (importedCD && !rewriteIndex(MODE_CD))
+  if (allValid && importedCD && !rewriteIndex(MODE_CD))
     allValid = false;
-  if (importedBook && !rewriteIndex(MODE_BOOK))
+  if (allValid && importedBook && !rewriteIndex(MODE_BOOK))
     allValid = false;
+
+  if (!allValid) {
+    // Restore every detail/track file in reverse order, then restore the
+    // in-memory and durable indexes. Backups are intentionally retained by
+    // the import-only save calls until this point.
+    {
+      ScopedSdAccess sd(5000);
+      if (sd) {
+        for (auto it = replacements.rbegin(); it != replacements.rend(); ++it)
+          rollbackReplacedFile(String(it->path.c_str()), it->hadOriginal);
+      }
+    }
+    _cdIndex = originalCdIndex;
+    _bookIndex = originalBookIndex;
+    if (importedCD)
+      rewriteIndex(MODE_CD);
+    if (importedBook)
+      rewriteIndex(MODE_BOOK);
+    itemCount = 0;
+    tracklistCount = 0;
+    return false;
+  }
+
+  {
+    ScopedSdAccess sd(5000);
+    if (sd) {
+      for (const ImportReplacement &replacement : replacements)
+        finalizeReplacedFile(String(replacement.path.c_str()));
+    }
+  }
 
   {
     ScopedSdAccess sd(2000);

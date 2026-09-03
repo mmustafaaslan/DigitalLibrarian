@@ -14,6 +14,25 @@ extern const uint8_t arduino_crt_bundle_start[]
 extern const uint8_t arduino_crt_bundle_end[]
     asm("_binary_x509_crt_bundle_end");
 
+inline void attachArduinoCaBundle(WiFiClientSecure &client) {
+  client.setCACertBundle(
+      arduino_crt_bundle_start,
+      static_cast<size_t>(arduino_crt_bundle_end - arduino_crt_bundle_start));
+}
+
+// HTTPClient stops and reuses its Client object when following a redirect.
+// Arduino-ESP32 3.3.5 resets the internal TLS context in stop(), including the
+// certificate-bundle attach callback, while leaving the outer "use bundle"
+// flag set. The next redirected handshake then has no CA chain. Restore the
+// same trusted bundle whenever HTTPClient resets this redirect-capable client.
+class RedirectSafeTlsClient : public WiFiClientSecure {
+public:
+  void stop() override {
+    WiFiClientSecure::stop();
+    attachArduinoCaBundle(*this);
+  }
+};
+
 inline bool ensureTlsClock(uint32_t timeoutMs = 5000) {
   time_t now = time(nullptr);
   if (now >= 1700000000)
@@ -38,9 +57,7 @@ inline bool ensureTlsClock(uint32_t timeoutMs = 5000) {
 inline bool configureTrustedTlsClient(WiFiClientSecure &client) {
   if (!ensureTlsClock())
     return false;
-  client.setCACertBundle(
-      arduino_crt_bundle_start,
-      static_cast<size_t>(arduino_crt_bundle_end - arduino_crt_bundle_start));
+  attachArduinoCaBundle(client);
   return true;
 }
 
